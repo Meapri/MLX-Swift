@@ -220,7 +220,10 @@ class NemotronHNanoOmniProcessor(ProcessorMixin):
 
                 source_fps = (
                     video_metadata.fps
-                    if (video_metadata is not None and getattr(video_metadata, "fps", None))
+                    if (
+                        video_metadata is not None
+                        and getattr(video_metadata, "fps", None)
+                    )
                     else None
                 )
                 frames_indices = (
