@@ -25,6 +25,9 @@ class NemotronHNanoOmniProcessor(ProcessorMixin):
     video_processor_class = "AutoVideoProcessor"
     tokenizer_class = "AutoTokenizer"
 
+    def check_argument_for_proper_class(self, argument_name, argument):
+        return type(argument)
+
     def __init__(
         self,
         image_processor=None,
@@ -92,30 +95,57 @@ class NemotronHNanoOmniProcessor(ProcessorMixin):
         import json
         from pathlib import Path
 
-        from transformers import AutoImageProcessor, AutoTokenizer
+        from huggingface_hub import hf_hub_download
+        from transformers import AutoTokenizer
+
+        from .image_processing_nemotron_h_nano_omni import (
+            NemotronHNanoOmniImageProcessor,
+        )
 
         kwargs.pop("use_fast", None)
-        kwargs.setdefault("trust_remote_code", True)
 
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, **kwargs
         )
         load_chat_template(tokenizer, pretrained_model_name_or_path)
 
-        try:
-            image_processor = AutoImageProcessor.from_pretrained(
-                pretrained_model_name_or_path, use_fast=False, **kwargs
-            )
-        except ValueError:
-            image_processor = AutoImageProcessor.from_pretrained(
-                pretrained_model_name_or_path, **kwargs
-            )
+        def _read_json(name: str):
+            local = Path(pretrained_model_name_or_path) / name
+            if local.exists():
+                with open(local) as f:
+                    return json.load(f)
+            try:
+                path = hf_hub_download(str(pretrained_model_name_or_path), name)
+                with open(path) as f:
+                    return json.load(f)
+            except Exception:
+                return {}
 
-        proc_kwargs = {}
-        proc_cfg_path = Path(pretrained_model_name_or_path) / "processor_config.json"
-        if proc_cfg_path.exists():
-            with open(proc_cfg_path) as f:
-                proc_cfg = json.load(f)
+        proc_cfg = _read_json("processor_config.json")
+        pre_cfg = _read_json("preprocessor_config.json")
+
+        # Image-processor kwargs come from preprocessor_config.json (or the nested
+        # `image_processor` block in processor_config.json on older exports).
+        ip_cfg = pre_cfg or proc_cfg.get("image_processor", {})
+        ip_kwargs = {
+            k: ip_cfg[k]
+            for k in (
+                "norm_mean",
+                "norm_std",
+                "patch_size",
+                "downsample_ratio",
+                "min_num_patches",
+                "max_num_patches",
+                "max_model_len",
+                "video_target_num_patches",
+                "video_maintain_aspect_ratio",
+            )
+            if k in ip_cfg
+        }
+        image_processor = NemotronHNanoOmniImageProcessor(**ip_kwargs)
+
+        proc_kwargs = {
+            k: proc_cfg[k]
             for k in (
                 "audio_sampling_rate",
                 "audio_subsampling_factor",
@@ -123,9 +153,9 @@ class NemotronHNanoOmniProcessor(ProcessorMixin):
                 "audio_subsampling_conv_kernel_size",
                 "audio_subsampling_conv_stride",
                 "video_temporal_patch_dim",
-            ):
-                if k in proc_cfg:
-                    proc_kwargs[k] = proc_cfg[k]
+            )
+            if k in proc_cfg
+        }
 
         return cls(
             image_processor=image_processor,
