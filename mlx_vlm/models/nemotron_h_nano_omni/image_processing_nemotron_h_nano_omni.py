@@ -9,7 +9,6 @@ import math
 from typing import Optional, Union
 
 import numpy as np
-import torch
 from PIL import Image
 from transformers.image_processing_base import BatchFeature
 from transformers.image_processing_utils_fast import BaseImageProcessorFast
@@ -95,8 +94,8 @@ class NemotronHNanoOmniImageProcessor(BaseImageProcessorFast):
                 )
                 target_sizes.append((target_w_patches, target_h_patches))
 
-        norm_mean = torch.tensor(self.norm_mean).view(1, 3, 1, 1)
-        norm_std = torch.tensor(self.norm_std).view(1, 3, 1, 1)
+        norm_mean = np.asarray(self.norm_mean, dtype=np.float32).reshape(3, 1, 1)
+        norm_std = np.asarray(self.norm_std, dtype=np.float32).reshape(3, 1, 1)
 
         pixel_values_list = []
         num_tokens_per_image = []
@@ -104,23 +103,18 @@ class NemotronHNanoOmniImageProcessor(BaseImageProcessorFast):
         for img, (wp, hp) in zip(images, target_sizes):
             target_w = wp * self.patch_size
             target_h = hp * self.patch_size
-            arr = np.asarray(img, dtype=np.uint8)
-            t = (
-                torch.from_numpy(arr)
-                .permute(2, 0, 1)
-                .unsqueeze(0)
-                .to(dtype=torch.float32)
-            )
-            if t.shape[-2] != target_h or t.shape[-1] != target_w:
-                t = torch.nn.functional.interpolate(
-                    t,
-                    size=(target_h, target_w),
-                    mode="bicubic",
-                    align_corners=False,
-                    antialias=True,
+            if img.size != (target_w, target_h):
+                # PIL's BICUBIC isn't antialiased like torch's, but with reducing_gap
+                # it pre-filters during downsample — close to the reference for
+                # typical token-bounded sizes.
+                img = img.resize(
+                    (target_w, target_h),
+                    resample=Image.Resampling.BICUBIC,
+                    reducing_gap=3.0,
                 )
-            t = (t / 255.0 - norm_mean) / norm_std
-            pixel_values_list.append(t.squeeze(0))
+            arr = np.asarray(img, dtype=np.float32).transpose(2, 0, 1)  # (3, H, W)
+            arr = (arr / 255.0 - norm_mean) / norm_std
+            pixel_values_list.append(arr)
             num_tokens_per_image.append((wp * hp) // (self._downsample_factor**2))
             imgs_sizes.append((target_h, target_w))
 
@@ -128,7 +122,7 @@ class NemotronHNanoOmniImageProcessor(BaseImageProcessorFast):
             t.shape == pixel_values_list[0].shape for t in pixel_values_list
         )
         if all_same_shape:
-            pixel_values = torch.stack(pixel_values_list, dim=0)
+            pixel_values = np.stack(pixel_values_list, axis=0)
         else:
             pixel_values = pixel_values_list
 
