@@ -73,7 +73,9 @@ class NemotronHNanoOmniImageProcessor(BaseImageProcessorFast):
         target_sizes = []
         if is_video:
             for img in images:
-                target_w_patches, target_h_patches = self._compute_target_patches_video(img)
+                target_w_patches, target_h_patches = self._compute_target_patches_video(
+                    img
+                )
                 target_sizes.append((target_w_patches, target_h_patches))
         else:
             num_tokens_available = self.max_model_len - 4
