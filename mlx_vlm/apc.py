@@ -17,14 +17,23 @@ Eviction is LRU with reference counting: blocks are kept alive while
 ``APCBlock`` for O(1) move-to-tail. All blocks are pre-allocated as a pool
 to avoid Python object churn. Pure in-memory; no persistence across restarts.
 
-Numerical note: APC is *approximately* equivalent to a fresh prefill, not
-bit-exact. Cached K/V values are byte-identical, but MLX's flash-attention
-kernel uses different tile shapes when the query length changes (long Q for
-cold prefill vs short Q for warm-start). The resulting per-layer attention
-output drifts by ~0.1-0.3 in bf16, which can occasionally flip the
-greedy-decoded argmax at near-tied tokens. vLLM and sglang have the same
-property. Warm-start runs are self-consistent: identical prompts repeated
-under APC produce identical text.
+Numerical note: APC itself is *exact*. The K/V tensors stored in the block
+pool are byte-identical to what a fresh prefill would produce — the cache
+introduces no approximation, it just retains tensors. However, cold-vs-warm
+runs of the same prompt can produce slightly different logits because of
+**batch non-invariance** in the attention kernel: a long Q (cold prefill,
+e.g. 60 tokens) and a short Q (warm-start suffix, e.g. 13 tokens against
+47 cached tokens) trigger different tile shapes / reduction orders inside
+flash-attention, and floating-point matmul is non-associative. The
+Thinking Machines analysis (2025) and Microsoft Research's LLM-42 paper
+give the formal treatment. The same drift happens without prefix caching
+any time dynamic batching changes the batch composition between two
+identical requests — APC just makes it visible by giving a clean
+cold/warm contrast. Warm-to-warm runs *are* deterministic: identical
+prompts repeated under APC always produce identical text. For
+bit-equivalent cold==warm, you need batch-invariant RMSNorm / matmul /
+attention kernels (vLLM's ``--enable-batch-invariance``, SGLang with
+FlashInfer/FA3), not a different cache design.
 """
 
 from __future__ import annotations
@@ -287,11 +296,11 @@ class APCManager:
                     break
                 start = i * self.block_size
                 end = start + self.block_size
-                # Deep-copy the slice so the block tensor is fully independent of
-                # the caller's evolving cache buffers. mx.contiguous copies when
-                # the source isn't already row-contiguous, but we always want a
-                # fresh buffer here, so add a zero to force the copy through the
-                # graph.
+                # Deep-copy each slice into its own buffer so the block tensor
+                # is decoupled from the caller's cache, which mlx.clear_cache
+                # may release after generation. mx.contiguous alone returns a
+                # view when the source is already row-contiguous, so we add a
+                # zero to force a fresh allocation through the graph.
                 k_slabs = [
                     mx.contiguous(k[..., start:end, :] + mx.array(0, dtype=k.dtype))
                     for k in layer_keys

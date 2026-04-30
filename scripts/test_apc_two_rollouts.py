@@ -144,14 +144,18 @@ def main():
         if b3_delta["matched_tokens"] <= 0:
             failures.append("B3 should still hit after A intervened")
 
-        # Note: cold-vs-warm outputs are NOT guaranteed bit-equivalent because
-        # MLX's flash-attention kernel uses different tile shapes when the
-        # query length changes (long Q for cold prefill vs short Q for warm).
-        # K/V values at cached positions are byte-identical (verified in
-        # scripts/debug_apc_drift.py) but the per-layer attention output
-        # drifts ~0.1-0.3 in bf16, which can occasionally flip argmax at
-        # near-tied tokens. vLLM and sglang have the same property. We
-        # instead assert warm-to-warm self-consistency.
+        # Cold-vs-warm outputs are NOT guaranteed bit-equivalent. The cache
+        # itself is exact — K/V tensors stored by APC are byte-identical to
+        # a fresh prefill (verified in scripts/debug_apc_drift.py). The drift
+        # comes from batch non-invariance in the attention kernel: long Q
+        # (cold) and short Q (warm) trigger different reduction strategies
+        # inside flash-attention, and fp matmul is non-associative. The same
+        # effect occurs without prefix caching any time dynamic batching
+        # shifts batch composition. See Thinking Machines (2025) and the
+        # LLM-42 paper for the formal treatment. We therefore assert
+        # warm-to-warm self-consistency, which IS the invariant APC promises;
+        # bit-equivalent cold==warm requires batch-invariant kernels (vLLM
+        # --enable-batch-invariance, SGLang with FlashInfer/FA3).
         if a2_text != a3_text:
             failures.append(
                 f"A: warm-to-warm non-deterministic\n  a2={a2_text!r}\n  a3={a3_text!r}"
