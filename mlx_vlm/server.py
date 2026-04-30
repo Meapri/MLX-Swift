@@ -48,6 +48,7 @@ from .prompt_utils import apply_chat_template
 from .sample_utils import top_p_sampling
 from .structured import build_json_schema_logits_processor
 from .tool_parsers import _infer_tool_parser, load_tool_module
+from . import apc as _apc
 from .utils import load, prepare_inputs
 from .version import __version__
 from .vision_cache import VisionFeatureCache
@@ -970,6 +971,10 @@ def _make_logprob_content(
 # Global response generator for continuous batching
 response_generator: Optional[ResponseGenerator] = None
 
+# Global APC manager (shared across requests for the loaded model)
+apc_manager: Optional[_apc.APCManager] = None
+
+
 # Loading/unloading utilities
 model_cache = {}
 
@@ -1046,7 +1051,7 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
     Factory function to get or load the appropriate model resources from cache or by loading.
     Also creates/updates the ResponseGenerator for continuous batching.
     """
-    global model_cache, response_generator
+    global model_cache, response_generator, apc_manager
 
     if adapter_path is _INHERIT_ADAPTER:
         cached = model_cache.get("cache_key")
@@ -1067,29 +1072,45 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
     vision_cache_size = int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20"))
     vision_cache = VisionFeatureCache(max_size=vision_cache_size)
 
+    # APC: build a shared block pool if opted in via env var.
+    apc_manager = _apc.from_env()
+
     # KV cache quantization (uniform or TurboQuant)
     kv_bits = get_quantized_kv_bits(model_path)
     kv_group_size = get_kv_group_size()
     quantized_kv_start = get_quantized_kv_start()
     kv_quant_scheme = get_kv_quant_scheme()
 
-    response_generator = ResponseGenerator(
-        model_path=model_path,
-        adapter_path=adapter_path,
-        vision_cache=vision_cache,
-        kv_bits=kv_bits,
-        kv_group_size=kv_group_size,
-        kv_quant_scheme=kv_quant_scheme,
-        quantized_kv_start=quantized_kv_start,
-        top_logprobs_k=get_top_logprobs_k(),
-    )
-    try:
-        model, processor, config = response_generator.wait_until_ready()
-    except Exception:
-        response_generator.stop_and_join()
+    if apc_manager is not None:
+        # Continuous batching has its own per-sequence cache layout that doesn't
+        # plumb through APC; use the single-stream stream_generate path instead.
+        logger.info(
+            "APC enabled — disabling continuous batching for this model load."
+        )
+        from .utils import load as _load
+        model, processor = _load(
+            model_path, adapter_path=adapter_path, lazy=False
+        )
+        config = model.config
         response_generator = None
-        vision_cache.clear()
-        raise
+    else:
+        response_generator = ResponseGenerator(
+            model_path=model_path,
+            adapter_path=adapter_path,
+            vision_cache=vision_cache,
+            kv_bits=kv_bits,
+            kv_group_size=kv_group_size,
+            kv_quant_scheme=kv_quant_scheme,
+            quantized_kv_start=quantized_kv_start,
+            top_logprobs_k=get_top_logprobs_k(),
+        )
+        try:
+            model, processor, config = response_generator.wait_until_ready()
+        except Exception:
+            response_generator.stop_and_join()
+            response_generator = None
+            vision_cache.clear()
+            raise
 
     model_cache = {
         "cache_key": cache_key,
@@ -1106,7 +1127,7 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
 
 # Synchronous unload function for internal use
 def unload_model_sync():
-    global model_cache, response_generator
+    global model_cache, response_generator, apc_manager
     if not model_cache:
         return False
 
@@ -1119,6 +1140,11 @@ def unload_model_sync():
         print("Stopping ResponseGenerator...")
         response_generator.stop_and_join()
         response_generator = None
+
+    # Drop APC blocks for the previous model
+    if apc_manager is not None:
+        apc_manager.clear()
+        apc_manager = None
 
     # Clear vision cache before dropping references
     if "vision_cache" in model_cache:
@@ -1816,6 +1842,7 @@ async def responses_endpoint(request: Request):
                             top_p=openai_request.top_p,
                             vision_cache=model_cache.get("vision_cache"),
                             logits_processors=gen_args.logits_processors,
+                            apc_manager=apc_manager,
                             **kwargs,
                         )
 
@@ -1927,6 +1954,7 @@ async def responses_endpoint(request: Request):
                         image=images,
                         verbose=logger.isEnabledFor(logging.DEBUG),
                         vision_cache=model_cache.get("vision_cache"),
+                        apc_manager=apc_manager,
                         **gen_args.to_generate_kwargs(),
                         **kwargs,
                     )
@@ -2285,6 +2313,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                             top_p=request.top_p,
                             vision_cache=model_cache.get("vision_cache"),
                             logits_processors=gen_args.logits_processors,
+                            apc_manager=apc_manager,
                             **kwargs,
                         )
 
@@ -2409,6 +2438,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                         audio=audio,
                         verbose=logger.isEnabledFor(logging.DEBUG),
                         vision_cache=model_cache.get("vision_cache"),
+                        apc_manager=apc_manager,
                         **gen_args.to_generate_kwargs(),
                         **kwargs,
                     )
@@ -2585,7 +2615,28 @@ async def health_check():
         "loaded_model": model_cache.get("model_path", None),
         "loaded_adapter": model_cache.get("adapter_path", None),
         "continuous_batching_enabled": response_generator is not None,
+        "apc_enabled": apc_manager is not None,
     }
+
+
+@app.get("/v1/cache/stats")
+@app.get("/cache/stats", include_in_schema=False)
+async def apc_cache_stats():
+    """Return Automatic Prefix Cache statistics (or ``enabled=false``)."""
+    if apc_manager is None:
+        return {"enabled": False}
+    snap = apc_manager.stats_snapshot()
+    snap["enabled"] = True
+    return snap
+
+
+@app.post("/v1/cache/reset")
+@app.post("/cache/reset", include_in_schema=False)
+async def apc_cache_reset():
+    if apc_manager is None:
+        return {"enabled": False}
+    apc_manager.clear()
+    return {"enabled": True, "status": "cleared"}
 
 
 @app.post("/unload")

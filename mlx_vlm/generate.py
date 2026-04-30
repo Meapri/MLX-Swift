@@ -3,6 +3,7 @@ import codecs
 import contextlib
 import functools
 import json
+import logging
 import time
 import warnings
 from collections.abc import Sequence
@@ -17,6 +18,7 @@ from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
+from . import apc as _apc
 from .models import cache
 from .prompt_utils import apply_chat_template
 from .turboquant import BatchTurboQuantKVCache, TurboQuantKVCache, turboquant_enabled
@@ -27,6 +29,8 @@ from .utils import (
     load,
     prepare_inputs,
 )
+
+logger = logging.getLogger("mlx_vlm.generate")
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = None
@@ -1058,8 +1062,15 @@ def stream_generate(
 
     # Prompt cache reuse: skip common prefix from previous turn
     prompt_cache_state = kwargs.pop("prompt_cache_state", None)
+    apc_manager: Optional[_apc.APCManager] = kwargs.pop("apc_manager", None)
     reused_prefix_len = 0
     full_input_ids_list = input_ids.flatten().tolist()
+    apc_blocks_in_use: List[_apc.APCBlock] = []
+    apc_extra_hash = 0
+
+    # Disable APC for models with custom (non-KVCache) layouts
+    if apc_manager is not None and not _apc.model_supports_apc(model.language_model):
+        apc_manager = None
 
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
@@ -1088,6 +1099,31 @@ def stream_generate(
                         if hasattr(c, "offset"):
                             c.offset = prefix_len
             kwargs["prompt_cache"] = kv_cache
+
+    # APC: cross-request, hash-based prefix lookup. Only consulted if a per-turn
+    # PromptCacheState didn't already produce a hit.
+    if apc_manager is not None and reused_prefix_len == 0:
+        apc_extra_hash = _apc.hash_image_payload(
+            pixel_values=pixel_values, image_ref=image
+        )
+        matched_blocks, prefix_len = apc_manager.lookup_prefix(
+            full_input_ids_list, extra_hash=apc_extra_hash
+        )
+        if prefix_len > 0 and prefix_len < input_ids.shape[1]:
+            apc_blocks_in_use = matched_blocks
+            reused_prefix_len = prefix_len
+            input_ids = input_ids[:, prefix_len:]
+            image_token_id = getattr(model.config, "image_token_id", None) or getattr(
+                model.config, "image_token_index", None
+            )
+            new_ids = input_ids.flatten().tolist()
+            if image_token_id is None or image_token_id not in new_ids:
+                pixel_values = None
+                kwargs.pop("cached_image_features", None)
+            kwargs["prompt_cache"] = _apc.make_warm_kv_cache(matched_blocks)
+        elif matched_blocks:
+            # Full match (no new tokens to compute) — release; fall through to normal path
+            apc_manager.release(matched_blocks)
 
     if thinking_budget is not None:
         thinking_start_token_id = tokenizer.encode(
@@ -1170,11 +1206,48 @@ def stream_generate(
         )
 
         # Save cache state for potential reuse on next turn
+        all_ids: Optional[List[int]] = None
         if prompt_cache_state is not None:
             all_ids = full_input_ids_list + [
                 t.item() if hasattr(t, "item") else t for t in generated_tokens
             ]
             prompt_cache_state.update(all_ids, tracked_cache)
+
+        # APC: harvest new blocks from the post-generation KV state.
+        if apc_manager is not None:
+            try:
+                if all_ids is None:
+                    all_ids = full_input_ids_list + [
+                        t.item() if hasattr(t, "item") else t
+                        for t in generated_tokens
+                    ]
+                # Snapshot keys/values up to the live offset for each layer.
+                layer_keys: List[mx.array] = []
+                layer_values: List[mx.array] = []
+                ok = True
+                for c in tracked_cache:
+                    k = getattr(c, "keys", None)
+                    v = getattr(c, "values", None)
+                    off = getattr(c, "offset", None)
+                    if k is None or v is None or off is None:
+                        ok = False
+                        break
+                    layer_keys.append(k[..., :off, :])
+                    layer_values.append(v[..., :off, :])
+                if ok and layer_keys:
+                    new_blocks = apc_manager.store_kv_blocks(
+                        all_ids,
+                        layer_keys,
+                        layer_values,
+                        extra_hash=apc_extra_hash,
+                        skip_first_n_tokens=reused_prefix_len,
+                    )
+                    apc_manager.release(apc_blocks_in_use + new_blocks)
+                else:
+                    apc_manager.release(apc_blocks_in_use)
+            except Exception as e:
+                logger.warning("APC store failed: %s", e)
+                apc_manager.release(apc_blocks_in_use)
 
         # Cleanup after generation
         mx.clear_cache()
