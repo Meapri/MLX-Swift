@@ -16,6 +16,15 @@ Eviction is LRU with reference counting: blocks are kept alive while
 ``ref_cnt > 0`` and the free queue is a doubly-linked list embedded in
 ``APCBlock`` for O(1) move-to-tail. All blocks are pre-allocated as a pool
 to avoid Python object churn. Pure in-memory; no persistence across restarts.
+
+Numerical note: APC is *approximately* equivalent to a fresh prefill, not
+bit-exact. Cached K/V values are byte-identical, but MLX's flash-attention
+kernel uses different tile shapes when the query length changes (long Q for
+cold prefill vs short Q for warm-start). The resulting per-layer attention
+output drifts by ~0.1-0.3 in bf16, which can occasionally flip the
+greedy-decoded argmax at near-tied tokens. vLLM and sglang have the same
+property. Warm-start runs are self-consistent: identical prompts repeated
+under APC produce identical text.
 """
 
 from __future__ import annotations
@@ -278,10 +287,19 @@ class APCManager:
                     break
                 start = i * self.block_size
                 end = start + self.block_size
-                k_slabs = [k[..., start:end, :] for k in layer_keys]
-                v_slabs = [v[..., start:end, :] for v in layer_values]
-                # Force materialization so the block tensor is independent of the
-                # caller's evolving cache buffers.
+                # Deep-copy the slice so the block tensor is fully independent of
+                # the caller's evolving cache buffers. mx.contiguous copies when
+                # the source isn't already row-contiguous, but we always want a
+                # fresh buffer here, so add a zero to force the copy through the
+                # graph.
+                k_slabs = [
+                    mx.contiguous(k[..., start:end, :] + mx.array(0, dtype=k.dtype))
+                    for k in layer_keys
+                ]
+                v_slabs = [
+                    mx.contiguous(v[..., start:end, :] + mx.array(0, dtype=v.dtype))
+                    for v in layer_values
+                ]
                 mx.eval(k_slabs + v_slabs)
                 b.block_hash = h
                 b.parent_hash = parent
