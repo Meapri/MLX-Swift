@@ -356,7 +356,8 @@ def make_warm_kv_cache(
     matched_blocks: List[APCBlock],
 ) -> List[Any]:
     """Stitch matched blocks into per-layer ``KVCache`` instances pre-filled
-    with the cached prefix's K/V state.
+    with the cached prefix's K/V state. Used by the single-stream
+    ``stream_generate`` path.
     """
     from mlx_lm.models.cache import KVCache
 
@@ -376,6 +377,81 @@ def make_warm_kv_cache(
         c.offset = prefix_len
         out.append(c)
     return out
+
+
+def make_warm_batch_kv_cache(
+    matched_blocks: List[APCBlock],
+) -> List[Any]:
+    """Stitch matched blocks into per-layer single-row ``BatchKVCache``
+    instances pre-filled with the cached prefix's K/V state. Used by the
+    batched continuous-batching path; the resulting cache list can be
+    ``extend()``-ed into a running batch.
+    """
+    from mlx_lm.models.cache import BatchKVCache
+
+    if not matched_blocks:
+        return []
+    num_layers = len(matched_blocks[0].keys)
+    prefix_len = sum(b.keys[0].shape[-2] for b in matched_blocks)
+    out: List[Any] = []
+    for layer_idx in range(num_layers):
+        ks = [b.keys[layer_idx] for b in matched_blocks]
+        vs = [b.values[layer_idx] for b in matched_blocks]
+        merged_k = mx.concatenate(ks, axis=2)  # [1, H, prefix_len, D]
+        merged_v = mx.concatenate(vs, axis=2)
+        c = BatchKVCache(left_padding=[0])
+        # state setter: (keys, values, offset, left_padding) → also sets _idx
+        c.state = (
+            merged_k,
+            merged_v,
+            mx.array([prefix_len]),
+            mx.array([0]),
+        )
+        out.append(c)
+    return out
+
+
+def harvest_blocks_from_batch_cache(
+    apc_manager: "APCManager",
+    batch_caches: List[Any],
+    batch_idx: int,
+    full_token_ids: Sequence[int],
+    *,
+    extra_hash: int = 0,
+    skip_first_n_tokens: int = 0,
+) -> List[APCBlock]:
+    """Slice one row out of a batched KV cache and store its full blocks.
+
+    Used at the end of prompt prefill in continuous-batching mode to add
+    the new prefix to APC.
+    """
+    layer_keys: List[mx.array] = []
+    layer_values: List[mx.array] = []
+    for c in batch_caches:
+        keys = getattr(c, "keys", None)
+        values = getattr(c, "values", None)
+        idx = getattr(c, "_idx", None)
+        left_padding = getattr(c, "left_padding", None)
+        if keys is None or values is None or idx is None:
+            return []
+        # Pull this batch row, dropping any left-padding for this seq.
+        if left_padding is not None:
+            try:
+                lp = int(left_padding[batch_idx].item())
+            except Exception:
+                lp = 0
+        else:
+            lp = 0
+        # shape after slicing: [1, H, idx-lp, D]
+        layer_keys.append(keys[batch_idx : batch_idx + 1, :, lp:idx, :])
+        layer_values.append(values[batch_idx : batch_idx + 1, :, lp:idx, :])
+    return apc_manager.store_kv_blocks(
+        full_token_ids,
+        layer_keys,
+        layer_values,
+        extra_hash=extra_hash,
+        skip_first_n_tokens=skip_first_n_tokens,
+    )
 
 
 def model_supports_apc(language_model: Any) -> bool:

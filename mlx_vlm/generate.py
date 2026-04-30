@@ -1855,6 +1855,9 @@ class PromptProcessingBatch:
         kv_bits=None,
         kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
         kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
+        warm_cache: Optional[List[Any]] = None,
+        apc_meta: Optional[List[dict]] = None,
+        apc_manager: Optional["_apc.APCManager"] = None,
     ):
         self.model = model
         self.uids = uids
@@ -1876,13 +1879,20 @@ class PromptProcessingBatch:
         self._inputs_embeds = inputs_embeds
         self._prompt_kwargs = prompt_kwargs
 
-        self.prompt_cache = _make_cache(
-            model,
-            left_padding,
-            kv_bits=kv_bits,
-            kv_group_size=kv_group_size,
-            kv_quant_scheme=kv_quant_scheme,
-        )
+        # APC metadata used for post-prefill block harvest (per-row).
+        self._apc_meta = apc_meta or []
+        self._apc_manager = apc_manager
+
+        if warm_cache is not None:
+            self.prompt_cache = warm_cache
+        else:
+            self.prompt_cache = _make_cache(
+                model,
+                left_padding,
+                kv_bits=kv_bits,
+                kv_group_size=kv_group_size,
+                kv_quant_scheme=kv_quant_scheme,
+            )
 
     def __len__(self):
         return len(self.uids)
@@ -1977,10 +1987,37 @@ class PromptProcessingBatch:
                 rope_deltas = rope_deltas[:, None]
             gen_batch._rope_deltas = rope_deltas
 
+        # APC: harvest the post-prefill K/V into hashed blocks. Done after the
+        # final prefill forward but before the cache references are released
+        # so the block tensors snapshot the prompt prefix.
+        if self._apc_manager is not None and self._apc_meta:
+            try:
+                for batch_idx, meta in enumerate(self._apc_meta):
+                    if meta is None:
+                        continue
+                    new_blocks = _apc.harvest_blocks_from_batch_cache(
+                        self._apc_manager,
+                        self.prompt_cache,
+                        batch_idx,
+                        meta["full_input_ids"],
+                        extra_hash=meta.get("extra_hash", 0),
+                        skip_first_n_tokens=meta.get("prefix_len", 0),
+                    )
+                    self._apc_manager.release(
+                        meta.get("apc_blocks", []) + new_blocks
+                    )
+            except Exception as e:
+                logger.warning("APC harvest failed during batched prefill: %s", e)
+                # Best effort — release any acquired prefix blocks.
+                for meta in self._apc_meta:
+                    if meta is not None:
+                        self._apc_manager.release(meta.get("apc_blocks", []))
+
         self.uids = []
         self.prompt_cache = []
         self._token_context = []
         self.logits_processors = []
+        self._apc_meta = []
         return gen_batch
 
     @property
@@ -2019,6 +2056,7 @@ class BatchGenerator:
             List[Callable[[mx.array, mx.array], mx.array]]
         ] = None,
         stream=None,
+        apc_manager: Optional["_apc.APCManager"] = None,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -2030,6 +2068,13 @@ class BatchGenerator:
         self.compute_logprobs = compute_logprobs
         self.top_logprobs_k = top_logprobs_k
         self.logits_processors = logits_processors or []
+        # APC: opt-out for KV-quantized caches and models with custom layouts
+        # (those are handled in stream_generate path or skipped entirely).
+        if apc_manager is not None and kv_bits is not None:
+            apc_manager = None
+        if apc_manager is not None and not _apc.model_supports_apc(model):
+            apc_manager = None
+        self.apc_manager = apc_manager
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -2060,6 +2105,123 @@ class BatchGenerator:
 
         self._wire_stack = contextlib.ExitStack()
         self._wire_stack.enter_context(wired_limit(model, [self._stream]))
+
+    # ---------------- APC integration helpers ----------------
+    def _apc_extra_hash(self, prompt_kwargs: dict) -> int:
+        """Image content hash for an admitted prompt (or 0 when text-only)."""
+        if self.apc_manager is None:
+            return 0
+        pixel_values = prompt_kwargs.get("pixel_values") if prompt_kwargs else None
+        return _apc.hash_image_payload(pixel_values=pixel_values, image_ref=None)
+
+    def _try_pick_apc(self, sequence) -> Optional[dict]:
+        """Look up an APC prefix for ``sequence``. Returns dict with matched
+        blocks + suffix metadata if there is a usable hit, else None.
+        """
+        if self.apc_manager is None:
+            return None
+        uid, ids_list, max_toks, prompt_kwargs, lps = sequence
+        if not ids_list or len(ids_list) < 2:
+            return None
+        # v1: don't trim a prefix that contains image tokens — re-running
+        # vision merging on the suffix is the cheap path here.
+        image_token_id = getattr(
+            self.model.config, "image_token_id", None
+        ) or getattr(self.model.config, "image_token_index", None)
+        extra_hash = self._apc_extra_hash(prompt_kwargs or {})
+        matched, prefix_len = self.apc_manager.lookup_prefix(
+            ids_list, extra_hash=extra_hash
+        )
+        if prefix_len <= 0 or prefix_len >= len(ids_list):
+            if matched:
+                self.apc_manager.release(matched)
+            return None
+        if image_token_id is not None and image_token_id in ids_list[:prefix_len]:
+            # Cached prefix references image tokens — bail out for v1 so we
+            # don't have to reconcile cached image features with a suffix
+            # that doesn't include them.
+            self.apc_manager.release(matched)
+            return None
+        return {
+            "matched_blocks": matched,
+            "prefix_len": prefix_len,
+            "extra_hash": extra_hash,
+            "full_input_ids": list(ids_list),
+        }
+
+    def _build_warm_prompt_batch(
+        self, sequence, apc_pick: dict
+    ) -> "PromptProcessingBatch":
+        """Construct a 1-row PromptProcessingBatch starting from the warm KV
+        cache built from ``apc_pick['matched_blocks']``.
+        """
+        uid, ids_list, max_toks, prompt_kwargs, lps = sequence
+        prefix_len = apc_pick["prefix_len"]
+        suffix_ids = ids_list[prefix_len:]
+
+        inputs_embeds = (prompt_kwargs or {}).get("inputs_embeds")
+        if inputs_embeds is None:
+            raise ValueError("APC warm-start requires precomputed inputs_embeds")
+        # Trim embeddings to the suffix (positions ≥ prefix_len).
+        suffix_embeds = inputs_embeds[:, prefix_len:, :]
+
+        merged_kwargs = {
+            k: v for k, v in (prompt_kwargs or {}).items() if k != "inputs_embeds"
+        }
+        # Row-1 slice of any per-batch tensors (defensive — most kwargs are
+        # scalars; only mRoPE arrays are batch-shaped here).
+        for key, value in list(merged_kwargs.items()):
+            if isinstance(value, mx.array) and value.ndim > 0:
+                merged_kwargs[key] = value[:1]
+
+        warm = _apc.make_warm_batch_kv_cache(apc_pick["matched_blocks"])
+        meta = [
+            {
+                "full_input_ids": apc_pick["full_input_ids"],
+                "prefix_len": prefix_len,
+                "extra_hash": apc_pick["extra_hash"],
+                "apc_blocks": apc_pick["matched_blocks"],
+            }
+        ]
+        return PromptProcessingBatch(
+            model=self.model,
+            uids=[uid],
+            input_ids=[suffix_ids],
+            max_tokens=[max_toks],
+            inputs_embeds=suffix_embeds,
+            prompt_kwargs=merged_kwargs,
+            logits_processors=[lps],
+            prefill_step_size=self.prefill_step_size,
+            kv_bits=self.kv_bits,
+            kv_group_size=self.kv_group_size,
+            kv_quant_scheme=self.kv_quant_scheme,
+            warm_cache=warm,
+            apc_meta=meta,
+            apc_manager=self.apc_manager,
+        )
+
+    def _build_apc_meta_for_cold(
+        self,
+        input_ids_list: List[List[int]],
+        prompt_kwargs_list: List[Optional[dict]],
+    ) -> Optional[List[Optional[dict]]]:
+        """Build per-row harvest metadata for a cold-prefill batch so the
+        produced K/V are added to APC after prefill.
+        """
+        if self.apc_manager is None:
+            return None
+        meta: List[Optional[dict]] = []
+        for ids_list, kw in zip(input_ids_list, prompt_kwargs_list):
+            extra_hash = self._apc_extra_hash(kw or {})
+            meta.append(
+                {
+                    "full_input_ids": list(ids_list),
+                    "prefix_len": 0,
+                    "extra_hash": extra_hash,
+                    "apc_blocks": [],
+                }
+            )
+        return meta
 
     @property
     def stream(self):
@@ -2203,6 +2365,34 @@ class BatchGenerator:
         num_active = len(self._generation_batch)
         num_to_add = self.completion_batch_size - num_active
         if self._unprocessed_sequences and num_to_add >= self.prefill_batch_size:
+            # APC peel-off: if the next pending sequence has an APC prefix
+            # hit, prefill it alone with a warm cache. Mixing warm-start and
+            # cold-start sequences in a single PromptProcessingBatch would
+            # require aligning per-row offsets/left-padding manually; for v1
+            # we keep dispatch simple and serialise warm prefills.
+            apc_pick = self._try_pick_apc(self._unprocessed_sequences[0])
+            if apc_pick is not None:
+                seq = self._unprocessed_sequences.pop(0)
+                self._prompt_batch = self._build_warm_prompt_batch(seq, apc_pick)
+                self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
+                if self._prompt_batch.needs_processing():
+                    tic = time.perf_counter()
+                    n = self._prompt_batch.prompt_step()
+                    self._prompt_time_counter += time.perf_counter() - tic
+                else:
+                    tic = time.perf_counter()
+                    gen_batch = self._prompt_batch.generate(
+                        self.sampler,
+                        self.tokenizer.stopping_criteria,
+                        compute_logprobs=self.compute_logprobs,
+                        top_logprobs_k=self.top_logprobs_k,
+                    )
+                    self._prompt_time_counter += time.perf_counter() - tic
+                    self._generation_batch.extend(gen_batch)
+                    self._prompt_batch = None
+                    mx.clear_cache()
+                return prompt_responses, generation_responses
+
             n = min(self.prefill_batch_size, len(self._unprocessed_sequences))
             sequences = self._unprocessed_sequences[:n]
             self._unprocessed_sequences = self._unprocessed_sequences[n:]
@@ -2231,6 +2421,9 @@ class BatchGenerator:
                 if isinstance(value, mx.array) and value.ndim > 0:
                     merged_kwargs[key] = value[:batch_size]
 
+            # APC: also harvest cold-prefill prefixes so future requests hit.
+            apc_meta = self._build_apc_meta_for_cold(input_ids, prompt_kwargs_list)
+
             self._prompt_batch = PromptProcessingBatch(
                 model=self.model,
                 uids=uids,
@@ -2243,6 +2436,8 @@ class BatchGenerator:
                 kv_bits=self.kv_bits,
                 kv_group_size=self.kv_group_size,
                 kv_quant_scheme=self.kv_quant_scheme,
+                apc_meta=apc_meta,
+                apc_manager=self.apc_manager,
             )
             self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
 

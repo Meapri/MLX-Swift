@@ -197,6 +197,7 @@ class ResponseGenerator:
         kv_quant_scheme=DEFAULT_KV_QUANT_SCHEME,
         quantized_kv_start=DEFAULT_QUANTIZED_KV_START,
         top_logprobs_k=0,
+        apc_manager: Optional["_apc.APCManager"] = None,
     ):
         self.model_path = model_path
         self.adapter_path = adapter_path
@@ -211,6 +212,7 @@ class ResponseGenerator:
         self.kv_quant_scheme = kv_quant_scheme
         self.quantized_kv_start = quantized_kv_start
         self.top_logprobs_k = top_logprobs_k
+        self.apc_manager = apc_manager
         self.tokenizer = None
         self.requests: Queue = Queue()
         self._stop = False
@@ -473,6 +475,7 @@ class ResponseGenerator:
                             quantized_kv_start=self.quantized_kv_start,
                             top_logprobs_k=self.top_logprobs_k,
                             stream=generation_stream,
+                            apc_manager=self.apc_manager,
                         )
 
                     # Vision encoder runs on the GPU thread; text tokenization
@@ -1081,36 +1084,24 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
     quantized_kv_start = get_quantized_kv_start()
     kv_quant_scheme = get_kv_quant_scheme()
 
-    if apc_manager is not None:
-        # Continuous batching has its own per-sequence cache layout that doesn't
-        # plumb through APC; use the single-stream stream_generate path instead.
-        logger.info(
-            "APC enabled — disabling continuous batching for this model load."
-        )
-        from .utils import load as _load
-        model, processor = _load(
-            model_path, adapter_path=adapter_path, lazy=False
-        )
-        config = model.config
+    response_generator = ResponseGenerator(
+        model_path=model_path,
+        adapter_path=adapter_path,
+        vision_cache=vision_cache,
+        kv_bits=kv_bits,
+        kv_group_size=kv_group_size,
+        kv_quant_scheme=kv_quant_scheme,
+        quantized_kv_start=quantized_kv_start,
+        top_logprobs_k=get_top_logprobs_k(),
+        apc_manager=apc_manager,
+    )
+    try:
+        model, processor, config = response_generator.wait_until_ready()
+    except Exception:
+        response_generator.stop_and_join()
         response_generator = None
-    else:
-        response_generator = ResponseGenerator(
-            model_path=model_path,
-            adapter_path=adapter_path,
-            vision_cache=vision_cache,
-            kv_bits=kv_bits,
-            kv_group_size=kv_group_size,
-            kv_quant_scheme=kv_quant_scheme,
-            quantized_kv_start=quantized_kv_start,
-            top_logprobs_k=get_top_logprobs_k(),
-        )
-        try:
-            model, processor, config = response_generator.wait_until_ready()
-        except Exception:
-            response_generator.stop_and_join()
-            response_generator = None
-            vision_cache.clear()
-            raise
+        vision_cache.clear()
+        raise
 
     model_cache = {
         "cache_key": cache_key,
