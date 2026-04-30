@@ -507,9 +507,6 @@ class ResponseGenerator:
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                     }
 
-                    if has_embeds:
-                        self._step(batch_gen, active)
-
                 if not active or batch_gen is None:
                     continue
 

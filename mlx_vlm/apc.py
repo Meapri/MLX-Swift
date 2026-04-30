@@ -411,6 +411,83 @@ def make_warm_batch_kv_cache(
     return out
 
 
+def make_warm_batch_kv_cache_multi(
+    picks: List[Optional[dict]],
+    num_layers: int,
+) -> Tuple[List[Any], int]:
+    """Build a multi-row ``BatchKVCache`` list for mixed warm / cold prefill.
+
+    ``picks`` is per-row, with each entry being ``None`` (cold) or a dict
+    with key ``matched_blocks`` (list of APCBlock) and ``prefix_len``.
+
+    Returns ``(cache_list, max_prefix)`` where ``max_prefix`` is the cache's
+    ``_idx`` after warm-init (= max prefix_len across rows).
+
+    For row ``i``:
+      * left_padding[i] = max_prefix - prefix_len[i]
+      * keys[i, :, left_padding[i]:max_prefix, :] = concatenated block K
+      * keys[i, :, :left_padding[i], :] = zeros (will be hidden by mask)
+    """
+    from mlx_lm.models.cache import BatchKVCache
+
+    B = len(picks)
+    prefix_lens = [p["prefix_len"] if p else 0 for p in picks]
+    max_prefix = max(prefix_lens) if prefix_lens else 0
+    if max_prefix == 0:
+        return [], 0
+
+    # Discover dtype / head dims from the first non-empty pick.
+    sample = next(p for p in picks if p)
+    sample_k = sample["matched_blocks"][0].keys[0]  # [1, H, bs, D]
+    n_kv_heads = sample_k.shape[1]
+    head_dim = sample_k.shape[-1]
+    dtype = sample_k.dtype
+
+    out: List[Any] = []
+    for layer_idx in range(num_layers):
+        # Build per-row warm K/V tensors of shape [1, H, max_prefix, D]; rows
+        # without a hit get zeros, rows with a shorter prefix get zero left-pad.
+        row_keys: List[mx.array] = []
+        row_values: List[mx.array] = []
+        for i, pick in enumerate(picks):
+            if pick is None:
+                # Cold row: full pre-warm zone is left padding (zeros).
+                row_keys.append(
+                    mx.zeros((1, n_kv_heads, max_prefix, head_dim), dtype=dtype)
+                )
+                row_values.append(
+                    mx.zeros((1, n_kv_heads, max_prefix, head_dim), dtype=dtype)
+                )
+                continue
+            blocks = pick["matched_blocks"]
+            ks = [b.keys[layer_idx] for b in blocks]
+            vs = [b.values[layer_idx] for b in blocks]
+            warm_k = mx.concatenate(ks, axis=2)  # [1, H, prefix_len, D]
+            warm_v = mx.concatenate(vs, axis=2)
+            lp = max_prefix - pick["prefix_len"]
+            if lp > 0:
+                pad_k = mx.zeros((1, n_kv_heads, lp, head_dim), dtype=dtype)
+                pad_v = mx.zeros((1, n_kv_heads, lp, head_dim), dtype=dtype)
+                warm_k = mx.concatenate([pad_k, warm_k], axis=2)
+                warm_v = mx.concatenate([pad_v, warm_v], axis=2)
+            row_keys.append(warm_k)
+            row_values.append(warm_v)
+        merged_k = mx.concatenate(row_keys, axis=0)  # [B, H, max_prefix, D]
+        merged_v = mx.concatenate(row_values, axis=0)
+
+        left_padding = [max_prefix - pl for pl in prefix_lens]
+        offset = [pl for pl in prefix_lens]
+        c = BatchKVCache(left_padding=[0] * B)  # placeholder; state setter overrides
+        c.state = (
+            merged_k,
+            merged_v,
+            mx.array(offset),
+            mx.array(left_padding),
+        )
+        out.append(c)
+    return out, max_prefix
+
+
 def harvest_blocks_from_batch_cache(
     apc_manager: "APCManager",
     batch_caches: List[Any],

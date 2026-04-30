@@ -1403,6 +1403,13 @@ def _left_pad_prompts(prompts, max_length=None):
     return mx.array([[0] * (max_length - len(p)) + p for p in prompts])
 
 
+def _right_pad_prompts(prompts, max_length=None):
+    if max_length is None:
+        max_length = max(len(p) for p in prompts)
+
+    return mx.array([list(p) + [0] * (max_length - len(p)) for p in prompts])
+
+
 def _extend_cache(cache_a, cache_b):
     """Extend cache_a with cache_b along the batch dimension."""
     if not cache_a:
@@ -1858,6 +1865,8 @@ class PromptProcessingBatch:
         warm_cache: Optional[List[Any]] = None,
         apc_meta: Optional[List[dict]] = None,
         apc_manager: Optional["_apc.APCManager"] = None,
+        right_pad_per_row: Optional[List[int]] = None,
+        suffix_lens: Optional[List[int]] = None,
     ):
         self.model = model
         self.uids = uids
@@ -1866,10 +1875,24 @@ class PromptProcessingBatch:
 
         lengths = [len(ids) for ids in input_ids]
         max_length = max(lengths)
-        left_padding = [max_length - l for l in lengths]
+        # ``input_ids`` here are the per-row prefill inputs — for warm-start
+        # rows this is the suffix, for cold rows the full prompt. When
+        # ``right_pad_per_row`` is set the rows are right-padded (used in
+        # mixed warm/cold prefill so suffix RoPE positions align). Otherwise
+        # we left-pad as before.
+        self._right_pad_per_row = right_pad_per_row
+        self._suffix_lens = suffix_lens or lengths
+
+        if right_pad_per_row is not None:
+            # Right-pad each row to max_length (so the last `pad[i]` cells are
+            # right-pad and need to be rolled into left-pad by finalize()).
+            left_padding = [0] * len(input_ids)
+            self._input_ids = _right_pad_prompts(input_ids, max_length=max_length)
+        else:
+            left_padding = [max_length - l for l in lengths]
+            self._input_ids = _left_pad_prompts(input_ids, max_length=max_length)
         self._total_prompt_tokens = sum(lengths)
 
-        self._input_ids = _left_pad_prompts(input_ids, max_length=max_length)
         self.logits_processors = logits_processors or []
         self._token_context = (
             [list(ids) for ids in input_ids]
@@ -1893,6 +1916,13 @@ class PromptProcessingBatch:
                 kv_group_size=kv_group_size,
                 kv_quant_scheme=kv_quant_scheme,
             )
+
+        # Declare per-row right-padding on each cache so finalize() can roll
+        # it into left-padding once the prefill forward pass is complete.
+        if right_pad_per_row is not None and any(right_pad_per_row):
+            for c in self.prompt_cache:
+                if hasattr(c, "prepare"):
+                    c.prepare(right_padding=right_pad_per_row)
 
     def __len__(self):
         return len(self.uids)
@@ -1933,7 +1963,16 @@ class PromptProcessingBatch:
             **self._prompt_kwargs,
         )
         logits = output.logits if hasattr(output, "logits") else output
-        logits = logits[:, -1, :]
+        if self._right_pad_per_row is not None and any(self._right_pad_per_row):
+            # Per-row last *real* token sits at index (seq - 1 - right_pad[i]).
+            seq = logits.shape[1]
+            last_idx = mx.array(
+                [seq - 1 - p for p in self._right_pad_per_row], dtype=mx.int32
+            )[:, None, None]
+            last_idx = mx.broadcast_to(last_idx, (logits.shape[0], 1, logits.shape[-1]))
+            logits = mx.take_along_axis(logits, last_idx, axis=1).squeeze(1)
+        else:
+            logits = logits[:, -1, :]
         if self.logits_processors and any(self.logits_processors):
             processed_logits = []
             for i in range(logits.shape[0]):
@@ -1948,6 +1987,13 @@ class PromptProcessingBatch:
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         first_tokens = sampler(logprobs)
+
+        # Roll any right-padding into left-padding so the cache decoded by
+        # GenerationBatch sees a canonical layout.
+        if self._right_pad_per_row is not None and any(self._right_pad_per_row):
+            for c in self.prompt_cache:
+                if hasattr(c, "finalize"):
+                    c.finalize()
 
         gen_batch = GenerationBatch(
             model=self.model,
@@ -2114,16 +2160,16 @@ class BatchGenerator:
         pixel_values = prompt_kwargs.get("pixel_values") if prompt_kwargs else None
         return _apc.hash_image_payload(pixel_values=pixel_values, image_ref=None)
 
-    def _try_pick_apc(self, sequence) -> Optional[dict]:
+    def _apc_pick_for(self, sequence) -> Optional[dict]:
         """Look up an APC prefix for ``sequence``. Returns dict with matched
-        blocks + suffix metadata if there is a usable hit, else None.
+        blocks + suffix metadata when there is a usable hit, else None.
         """
         if self.apc_manager is None:
             return None
         uid, ids_list, max_toks, prompt_kwargs, lps = sequence
         if not ids_list or len(ids_list) < 2:
             return None
-        # v1: don't trim a prefix that contains image tokens — re-running
+        # v1/v2: don't trim a prefix that contains image tokens — re-running
         # vision merging on the suffix is the cheap path here.
         image_token_id = getattr(
             self.model.config, "image_token_id", None
@@ -2137,9 +2183,6 @@ class BatchGenerator:
                 self.apc_manager.release(matched)
             return None
         if image_token_id is not None and image_token_id in ids_list[:prefix_len]:
-            # Cached prefix references image tokens — bail out for v1 so we
-            # don't have to reconcile cached image features with a suffix
-            # that doesn't include them.
             self.apc_manager.release(matched)
             return None
         return {
@@ -2149,55 +2192,117 @@ class BatchGenerator:
             "full_input_ids": list(ids_list),
         }
 
-    def _build_warm_prompt_batch(
-        self, sequence, apc_pick: dict
-    ) -> "PromptProcessingBatch":
-        """Construct a 1-row PromptProcessingBatch starting from the warm KV
-        cache built from ``apc_pick['matched_blocks']``.
+    def _build_mixed_prompt_batch(
+        self, sequences: List[tuple]
+    ) -> Optional["PromptProcessingBatch"]:
+        """Build a multi-row PromptProcessingBatch admitting ``sequences``.
+
+        Each row is independently looked up in APC. Warm rows have their
+        suffixes prefilled against pre-populated K/V; cold rows prefill from
+        scratch in the same batch. Right-padding aligns RoPE positions
+        across rows with different prefix/suffix lengths.
+
+        Returns ``None`` if APC is disabled (in which case the caller should
+        use the cold-only path).
         """
-        uid, ids_list, max_toks, prompt_kwargs, lps = sequence
-        prefix_len = apc_pick["prefix_len"]
-        suffix_ids = ids_list[prefix_len:]
+        if self.apc_manager is None:
+            return None
 
-        inputs_embeds = (prompt_kwargs or {}).get("inputs_embeds")
-        if inputs_embeds is None:
-            raise ValueError("APC warm-start requires precomputed inputs_embeds")
-        # Trim embeddings to the suffix (positions ≥ prefix_len).
-        suffix_embeds = inputs_embeds[:, prefix_len:, :]
+        picks: List[Optional[dict]] = [self._apc_pick_for(s) for s in sequences]
+        any_warm = any(p is not None for p in picks)
+        if not any_warm:
+            return None  # caller falls back to cold-only path
 
-        merged_kwargs = {
-            k: v for k, v in (prompt_kwargs or {}).items() if k != "inputs_embeds"
-        }
-        # Row-1 slice of any per-batch tensors (defensive — most kwargs are
-        # scalars; only mRoPE arrays are batch-shaped here).
-        for key, value in list(merged_kwargs.items()):
-            if isinstance(value, mx.array) and value.ndim > 0:
-                merged_kwargs[key] = value[:1]
+        uids = [s[0] for s in sequences]
+        full_ids = [list(s[1]) for s in sequences]
+        max_tokens_list = [s[2] for s in sequences]
+        prompt_kwargs_list = [s[3] for s in sequences]
+        logits_processors = [s[4] for s in sequences]
 
-        warm = _apc.make_warm_batch_kv_cache(apc_pick["matched_blocks"])
-        meta = [
-            {
-                "full_input_ids": apc_pick["full_input_ids"],
-                "prefix_len": prefix_len,
-                "extra_hash": apc_pick["extra_hash"],
-                "apc_blocks": apc_pick["matched_blocks"],
-            }
+        # Per-row prefix length and suffix tokens
+        prefix_lens = [p["prefix_len"] if p else 0 for p in picks]
+        suffix_ids_list = [
+            full_ids[i][prefix_lens[i]:] for i in range(len(sequences))
         ]
+        suffix_lens = [len(s) for s in suffix_ids_list]
+
+        max_suffix_len = max(suffix_lens)
+        right_pad_per_row = [max_suffix_len - s for s in suffix_lens]
+
+        # Source inputs_embeds: every row's prompt_kwargs holds the full-prompt
+        # embeddings. Slice to suffix per-row, right-pad to max_suffix_len, stack.
+        suffix_embeds_per_row: List[mx.array] = []
+        for i, kw in enumerate(prompt_kwargs_list):
+            if kw is None or kw.get("inputs_embeds") is None:
+                raise ValueError("APC mixed prefill requires precomputed inputs_embeds")
+            full = kw["inputs_embeds"]  # [1, full_len, D]
+            suff = full[:, prefix_lens[i]:, :]
+            pad = right_pad_per_row[i]
+            if pad > 0:
+                pad_emb = mx.zeros(
+                    (suff.shape[0], pad, suff.shape[-1]), dtype=suff.dtype
+                )
+                suff = mx.concatenate([suff, pad_emb], axis=1)
+            suffix_embeds_per_row.append(suff)
+        inputs_embeds = mx.concatenate(suffix_embeds_per_row, axis=0)
+
+        # Merge prompt-side kwargs (excluding inputs_embeds, which we've just
+        # rebuilt). Per-batch tensors get concatenated across rows; scalars
+        # take the first row's value (matches the existing cold-only path).
+        merged_kwargs: dict = {}
+        per_row_keys: dict = {}
+        for kw in prompt_kwargs_list:
+            if not kw:
+                continue
+            for k, v in kw.items():
+                if k == "inputs_embeds":
+                    continue
+                if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
+                    per_row_keys.setdefault(k, []).append(v[:1])
+                elif k not in merged_kwargs:
+                    merged_kwargs[k] = v
+        for k, vs in per_row_keys.items():
+            merged_kwargs[k] = mx.concatenate(vs, axis=0)
+
+        # Build the multi-row warm cache (zeros for cold rows, K/V for warm).
+        num_layers = (
+            len(self.model.make_cache())
+            if hasattr(self.model, "make_cache")
+            else len(self.model.layers)
+        )
+        warm_cache, _ = _apc.make_warm_batch_kv_cache_multi(
+            picks, num_layers=num_layers
+        )
+
+        apc_meta = [
+            {
+                "full_input_ids": full_ids[i],
+                "prefix_len": prefix_lens[i],
+                "extra_hash": picks[i]["extra_hash"]
+                if picks[i]
+                else self._apc_extra_hash(prompt_kwargs_list[i] or {}),
+                "apc_blocks": picks[i]["matched_blocks"] if picks[i] else [],
+            }
+            for i in range(len(sequences))
+        ]
+
         return PromptProcessingBatch(
             model=self.model,
-            uids=[uid],
-            input_ids=[suffix_ids],
-            max_tokens=[max_toks],
-            inputs_embeds=suffix_embeds,
+            uids=uids,
+            input_ids=suffix_ids_list,
+            max_tokens=max_tokens_list,
+            inputs_embeds=inputs_embeds,
             prompt_kwargs=merged_kwargs,
-            logits_processors=[lps],
+            logits_processors=logits_processors,
             prefill_step_size=self.prefill_step_size,
             kv_bits=self.kv_bits,
             kv_group_size=self.kv_group_size,
             kv_quant_scheme=self.kv_quant_scheme,
-            warm_cache=warm,
-            apc_meta=meta,
+            warm_cache=warm_cache,
+            apc_meta=apc_meta,
             apc_manager=self.apc_manager,
+            right_pad_per_row=right_pad_per_row,
+            suffix_lens=suffix_lens,
         )
 
     def _build_apc_meta_for_cold(
@@ -2365,19 +2470,20 @@ class BatchGenerator:
         num_active = len(self._generation_batch)
         num_to_add = self.completion_batch_size - num_active
         if self._unprocessed_sequences and num_to_add >= self.prefill_batch_size:
-            # APC peel-off: if the next pending sequence has an APC prefix
-            # hit, prefill it alone with a warm cache. Mixing warm-start and
-            # cold-start sequences in a single PromptProcessingBatch would
-            # require aligning per-row offsets/left-padding manually; for v1
-            # we keep dispatch simple and serialise warm prefills.
-            apc_pick = self._try_pick_apc(self._unprocessed_sequences[0])
-            if apc_pick is not None:
-                seq = self._unprocessed_sequences.pop(0)
-                self._prompt_batch = self._build_warm_prompt_batch(seq, apc_pick)
+            # Take up to prefill_batch_size pending sequences. If APC is on
+            # and at least one of them has a prefix hit, build a mixed
+            # warm/cold PromptProcessingBatch with right-padded suffixes so
+            # warm and cold rows prefill in a single forward pass.
+            n = min(self.prefill_batch_size, len(self._unprocessed_sequences))
+            sequences = self._unprocessed_sequences[:n]
+            mixed = self._build_mixed_prompt_batch(sequences)
+            if mixed is not None:
+                self._unprocessed_sequences = self._unprocessed_sequences[n:]
+                self._prompt_batch = mixed
                 self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
                 if self._prompt_batch.needs_processing():
                     tic = time.perf_counter()
-                    n = self._prompt_batch.prompt_step()
+                    nstep = self._prompt_batch.prompt_step()
                     self._prompt_time_counter += time.perf_counter() - tic
                 else:
                     tic = time.perf_counter()
@@ -2393,8 +2499,6 @@ class BatchGenerator:
                     mx.clear_cache()
                 return prompt_responses, generation_responses
 
-            n = min(self.prefill_batch_size, len(self._unprocessed_sequences))
-            sequences = self._unprocessed_sequences[:n]
             self._unprocessed_sequences = self._unprocessed_sequences[n:]
 
             uids = [s[0] for s in sequences]
@@ -2403,23 +2507,42 @@ class BatchGenerator:
             prompt_kwargs_list = [s[3] for s in sequences]
             logits_processors = [s[4] for s in sequences]
 
-            inputs_embeds = None
-            merged_kwargs = {}
+            # Concatenate per-row inputs_embeds (left-padded to max length so
+            # all rows end at the same cache index). Other tensor kwargs get
+            # concatenated along the batch dim too; scalars take row 0.
+            lengths = [len(ids) for ids in input_ids]
+            max_length = max(lengths)
+            row_embeds: List[mx.array] = []
+            embed_dtype = None
+            embed_dim = None
+            for kw, l in zip(prompt_kwargs_list, lengths):
+                if not kw or kw.get("inputs_embeds") is None:
+                    raise ValueError("inputs_embeds is required")
+                e = kw["inputs_embeds"]  # [1, l, D]
+                embed_dtype = e.dtype
+                embed_dim = e.shape[-1]
+                if l < max_length:
+                    pad = mx.zeros(
+                        (e.shape[0], max_length - l, embed_dim), dtype=embed_dtype
+                    )
+                    e = mx.concatenate([pad, e], axis=1)  # left-pad
+                row_embeds.append(e)
+            inputs_embeds = mx.concatenate(row_embeds, axis=0)
+
+            merged_kwargs: dict = {}
+            per_row_keys: dict = {}
             for kw in prompt_kwargs_list:
-                if kw:
-                    inputs_embeds = kw.get("inputs_embeds", inputs_embeds)
-                    merged_kwargs = {
-                        k: v for k, v in kw.items() if k != "inputs_embeds"
-                    }
-                    break
-
-            if inputs_embeds is None:
-                raise ValueError("inputs_embeds is required")
-
-            batch_size = len(uids)
-            for key, value in merged_kwargs.items():
-                if isinstance(value, mx.array) and value.ndim > 0:
-                    merged_kwargs[key] = value[:batch_size]
+                if not kw:
+                    continue
+                for k, v in kw.items():
+                    if k == "inputs_embeds":
+                        continue
+                    if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
+                        per_row_keys.setdefault(k, []).append(v[:1])
+                    elif k not in merged_kwargs:
+                        merged_kwargs[k] = v
+            for k, vs in per_row_keys.items():
+                merged_kwargs[k] = mx.concatenate(vs, axis=0)
 
             # APC: also harvest cold-prefill prefixes so future requests hit.
             apc_meta = self._build_apc_meta_for_cold(input_ids, prompt_kwargs_list)
