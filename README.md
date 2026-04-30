@@ -273,7 +273,7 @@ Verify via the health endpoint:
 
 ```sh
 curl http://localhost:8080/health
-# {"status":"healthy","loaded_model":"...","continuous_batching_enabled":true}
+# {"status":"healthy","loaded_model":"...","apc_enabled":false}
 ```
 
 If `--model` is omitted, the model is loaded on the first request.

@@ -2605,7 +2605,6 @@ async def health_check():
         "status": "healthy",
         "loaded_model": model_cache.get("model_path", None),
         "loaded_adapter": model_cache.get("adapter_path", None),
-        "continuous_batching_enabled": response_generator is not None,
         "apc_enabled": apc_manager is not None,
     }
 
