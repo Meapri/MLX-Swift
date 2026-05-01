@@ -177,22 +177,122 @@ class DiskBlockStore:
     """
 
     SUFFIX = ".safetensors"
+    # Eviction targets this fraction of max_bytes after a single sweep so
+    # we don't thrash on every write near the cap.
+    _EVICT_LOW_WATERMARK = 0.9
 
-    def __init__(self, root: Path, namespace: str = "default", num_workers: int = 1):
+    def __init__(
+        self,
+        root: Path,
+        namespace: str = "default",
+        num_workers: int = 1,
+        max_bytes: Optional[int] = None,
+    ):
         self.dir = Path(root) / _safe_namespace(namespace)
         self.dir.mkdir(parents=True, exist_ok=True)
+        self.max_bytes = max_bytes
         self._q: queue.Queue = queue.Queue(maxsize=4096)
         self._stop = threading.Event()
         # Track in-flight hashes so a lookup that races a pending write can
         # wait briefly for the bytes to land instead of falsely missing.
         self._in_flight: dict[int, threading.Event] = {}
         self._in_flight_lock = threading.Lock()
+
+        # Sweep up partial writes from a previous crashed/killed run before
+        # measuring disk usage — they should not count against the cap.
+        n_orphans = self._cleanup_partials()
+        if n_orphans:
+            logger.info(
+                "APC disk: removed %d orphaned partial file(s) from %s",
+                n_orphans,
+                self.dir,
+            )
+        self._disk_bytes = self._scan_initial_size()
+
         self._workers = [
             threading.Thread(target=self._writer_loop, daemon=True, name=f"apc-disk-{i}")
             for i in range(max(1, num_workers))
         ]
         for t in self._workers:
             t.start()
+
+    # ---------- Housekeeping ----------
+    def _cleanup_partials(self) -> int:
+        """Delete leftover ``*.<pid>-<tid>.safetensors`` partial writes.
+
+        Canonical block files have a 16-hex-char stem. Anything else with a
+        ``.safetensors`` suffix is a write that didn't finish — safe to drop.
+        """
+        n = 0
+        for p in self.dir.glob(f"*{self.SUFFIX}"):
+            if not p.is_file():
+                continue
+            if len(p.stem) == 16 and all(c in "0123456789abcdef" for c in p.stem):
+                continue
+            try:
+                p.unlink()
+                n += 1
+            except OSError as e:
+                logger.warning("APC disk: failed to remove partial %s: %s", p, e)
+        return n
+
+    def _scan_initial_size(self) -> int:
+        total = 0
+        for p in self.dir.glob(f"*{self.SUFFIX}"):
+            if len(p.stem) != 16:
+                continue
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass
+        return total
+
+    @property
+    def disk_bytes(self) -> int:
+        return self._disk_bytes
+
+    def _maybe_evict(self) -> int:
+        """If ``max_bytes`` is set and we're over it, delete oldest-atime
+        canonical block files until we're back under the low watermark.
+
+        Returns the number of files evicted.
+        """
+        if self.max_bytes is None or self._disk_bytes <= self.max_bytes:
+            return 0
+        target = int(self.max_bytes * self._EVICT_LOW_WATERMARK)
+        # Snapshot in-flight hashes so we don't evict files mid-write.
+        with self._in_flight_lock:
+            skip = {self._path(h) for h in self._in_flight.keys()}
+        # Collect (atime, size, path) for canonical files only.
+        candidates: list[tuple[float, int, Path]] = []
+        for p in self.dir.glob(f"*{self.SUFFIX}"):
+            if len(p.stem) != 16 or p in skip:
+                continue
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            candidates.append((st.st_atime, st.st_size, p))
+        candidates.sort()  # oldest atime first
+
+        evicted = 0
+        for _, size, p in candidates:
+            if self._disk_bytes <= target:
+                break
+            try:
+                p.unlink()
+                self._disk_bytes -= size
+                evicted += 1
+            except OSError as e:
+                logger.warning("APC disk: failed to evict %s: %s", p, e)
+        if evicted:
+            logger.info(
+                "APC disk: evicted %d block(s) (%.1f MB) to stay under %.1f MB cap",
+                evicted,
+                (self.max_bytes - self._disk_bytes) / 1e6,
+                self.max_bytes / 1e6,
+            )
+        return evicted
 
     def _path(self, block_hash: int) -> Path:
         unsigned = block_hash & ((1 << 64) - 1)
@@ -222,6 +322,11 @@ class DiskBlockStore:
         except Exception as e:  # corrupt file or partial write
             logger.warning("APC disk load failed for %s: %s", path, e)
             return None
+        # Touch atime so the LRU eviction sweeps prefer truly-cold files.
+        try:
+            os.utime(path, None)
+        except OSError:
+            pass
         try:
             num_layers = len(arrays) // 2
             keys = [arrays[f"k_{i}"] for i in range(num_layers)]
@@ -261,6 +366,12 @@ class DiskBlockStore:
                 break
             block_hash, keys, values, metadata, ev = item
             path = self._path(block_hash)
+            old_size = 0
+            if path.exists():
+                try:
+                    old_size = path.stat().st_size
+                except OSError:
+                    pass
             try:
                 arrays = {}
                 for i, (k, v) in enumerate(zip(keys, values)):
@@ -275,6 +386,13 @@ class DiskBlockStore:
                 tmp = path.parent / f"{path.stem}.{tag}{self.SUFFIX}"
                 mx.save_safetensors(str(tmp), arrays, metadata=metadata)
                 os.replace(tmp, path)  # atomic on POSIX
+                # Update disk-bytes accounting and possibly evict LRU.
+                try:
+                    new_size = path.stat().st_size
+                except OSError:
+                    new_size = 0
+                self._disk_bytes += new_size - old_size
+                self._maybe_evict()
             except Exception as e:
                 logger.warning("APC disk save failed for %s: %s", path, e)
             finally:
@@ -555,7 +673,11 @@ class APCManager:
     def stats_snapshot(self) -> dict:
         with self.lock:
             self.stats.pool_used = sum(1 for x in self.pool if x.block_hash is not None)
-            return self.stats.snapshot(self.num_blocks, self.block_size)
+            snap = self.stats.snapshot(self.num_blocks, self.block_size)
+            if self.disk is not None:
+                snap["disk_bytes"] = self.disk.disk_bytes
+                snap["disk_max_bytes"] = self.disk.max_bytes
+            return snap
 
     def reset_stats(self) -> None:
         with self.lock:
@@ -779,9 +901,14 @@ def from_env(model_namespace: Optional[str] = None) -> Optional[APCManager]:
     disk_path = os.environ.get("APC_DISK_PATH")
     if disk_path:
         ns = model_namespace or os.environ.get("APC_DISK_NAMESPACE", "default")
+        max_gb = float(os.environ.get("APC_DISK_MAX_GB", 0))
+        max_bytes = int(max_gb * (1 << 30)) if max_gb > 0 else None
         try:
-            disk = DiskBlockStore(Path(disk_path).expanduser(), namespace=ns)
-            logger.info("APC disk tier at %s (ns=%s)", disk.dir, ns)
+            disk = DiskBlockStore(
+                Path(disk_path).expanduser(), namespace=ns, max_bytes=max_bytes
+            )
+            cap_str = f"{max_gb:.1f} GB" if max_bytes else "unbounded"
+            logger.info("APC disk tier at %s (ns=%s, cap=%s)", disk.dir, ns, cap_str)
         except Exception as e:
             logger.warning("APC disk tier disabled (init failed): %s", e)
 
