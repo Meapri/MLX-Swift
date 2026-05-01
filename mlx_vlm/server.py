@@ -124,6 +124,10 @@ class GenerationArguments:
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None
+    # Per-tenant salt for APC. When set, it's mixed into ``extra_hash`` so
+    # cached blocks from one tenant can't be reused (or detected via timing)
+    # by another. None = no salt = single-tenant behaviour.
+    tenant_id: Optional[str] = None
 
     def to_generate_kwargs(self) -> dict:
         """Convert to kwargs dict for generate()/stream_generate()."""
@@ -482,6 +486,11 @@ class ResponseGenerator:
                     # already happened on the caller thread.
                     input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
                     has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
+                    # Per-tenant APC salt: keep this out of the model forward
+                    # by namespacing under "_apc_tenant"; BatchGenerator strips
+                    # it before merging kwargs for the language model.
+                    if getattr(args, "tenant_id", None):
+                        gen_kwargs["_apc_tenant"] = args.tenant_id
 
                     # Drain pending text-only prompts before inserting an
                     # embed-bearing request — multi-row PromptProcessingBatch
@@ -827,7 +836,9 @@ def process_tool_calls(model_output: str, tool_module, tools):
     return dict(calls=called_tools, remaining_text=remaining)
 
 
-def _build_gen_args(request, processor=None) -> GenerationArguments:
+def _build_gen_args(
+    request, processor=None, tenant_id: Optional[str] = None
+) -> GenerationArguments:
     """Build GenerationArguments from an OpenAIRequest or ChatRequest."""
     max_tokens = getattr(request, "max_tokens", None) or getattr(
         request, "max_output_tokens", DEFAULT_MAX_TOKENS
@@ -846,10 +857,22 @@ def _build_gen_args(request, processor=None) -> GenerationArguments:
         enable_thinking=getattr(request, "enable_thinking", True),
         thinking_budget=getattr(request, "thinking_budget", None),
         thinking_start_token=getattr(request, "thinking_start_token", None),
+        tenant_id=tenant_id,
     )
     if processor is not None:
         args.logits_processors = _build_structured_logits_processors(request, processor)
     return args
+
+
+def _read_tenant_id(http_request) -> Optional[str]:
+    """Pull a per-tenant APC salt from the request headers.
+
+    Honoured headers (in order): ``X-APC-Tenant``, ``X-Tenant-Id``.
+    """
+    if http_request is None or not hasattr(http_request, "headers"):
+        return None
+    h = http_request.headers
+    return h.get("x-apc-tenant") or h.get("x-tenant-id") or None
 
 
 def _as_plain_dict(value):
@@ -1724,7 +1747,9 @@ async def responses_endpoint(request: Request):
             raise HTTPException(status_code=400, detail="Missing input.")
 
         try:
-            gen_args = _build_gen_args(openai_request, processor)
+            gen_args = _build_gen_args(
+                openai_request, processor, tenant_id=_read_tenant_id(request)
+            )
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
@@ -2049,7 +2074,7 @@ async def responses_endpoint(request: Request):
 
 @app.post("/chat/completions", response_model=None)
 @app.post("/v1/chat/completions", response_model=None, include_in_schema=False)
-async def chat_completions_endpoint(request: ChatRequest):
+async def chat_completions_endpoint(request: ChatRequest, http_request: Request):
     """
     Generate text based on a prompt and optional images.
     Prompt must be a list of chat messages, including system, user, and assistant messages.
@@ -2143,7 +2168,9 @@ async def chat_completions_endpoint(request: ChatRequest):
                 tool_module = load_tool_module(tool_parser_type)
 
         try:
-            gen_args = _build_gen_args(request, processor)
+            gen_args = _build_gen_args(
+                request, processor, tenant_id=_read_tenant_id(http_request)
+            )
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 

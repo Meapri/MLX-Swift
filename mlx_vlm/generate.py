@@ -2192,12 +2192,25 @@ class BatchGenerator:
         self._wire_stack.enter_context(wired_limit(model, [self._stream]))
 
     # ---------------- APC integration helpers ----------------
+    # Keys that are APC-only metadata; stripped from ``prompt_kwargs`` before
+    # the merged kwargs are passed to the language model forward.
+    _APC_PRIVATE_KEYS = ("_apc_tenant",)
+
     def _apc_extra_hash(self, prompt_kwargs: dict) -> int:
-        """Image content hash for an admitted prompt (or 0 when text-only)."""
+        """Salt for the APC hash chain. Combines the image-content hash with
+        an optional per-tenant salt so cross-tenant lookups never collide
+        even when the token prefixes are identical.
+        """
         if self.apc_manager is None:
             return 0
-        pixel_values = prompt_kwargs.get("pixel_values") if prompt_kwargs else None
-        return _apc.hash_image_payload(pixel_values=pixel_values, image_ref=None)
+        if prompt_kwargs is None:
+            prompt_kwargs = {}
+        pixel_values = prompt_kwargs.get("pixel_values")
+        img = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=None)
+        tenant = prompt_kwargs.get("_apc_tenant")
+        if tenant:
+            return hash((tenant, img))
+        return img
 
     def _apc_pick_for(self, sequence) -> Optional[dict]:
         """Look up an APC prefix for ``sequence``. Returns dict with matched
@@ -2288,13 +2301,15 @@ class BatchGenerator:
         # Merge prompt-side kwargs (excluding inputs_embeds, which we've just
         # rebuilt). Per-batch tensors get concatenated across rows; scalars
         # take the first row's value (matches the existing cold-only path).
+        # APC-private keys (e.g. tenant salt) are dropped — they're consumed
+        # in _apc_extra_hash, never forwarded to the model.
         merged_kwargs: dict = {}
         per_row_keys: dict = {}
         for kw in prompt_kwargs_list:
             if not kw:
                 continue
             for k, v in kw.items():
-                if k == "inputs_embeds":
+                if k == "inputs_embeds" or k in self._APC_PRIVATE_KEYS:
                     continue
                 if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
                     per_row_keys.setdefault(k, []).append(v[:1])
@@ -2580,7 +2595,7 @@ class BatchGenerator:
                 if not kw:
                     continue
                 for k, v in kw.items():
-                    if k == "inputs_embeds":
+                    if k == "inputs_embeds" or k in self._APC_PRIVATE_KEYS:
                         continue
                     if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
                         per_row_keys.setdefault(k, []).append(v[:1])
