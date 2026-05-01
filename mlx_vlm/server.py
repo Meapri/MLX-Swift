@@ -1101,7 +1101,7 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
     vision_cache = VisionFeatureCache(max_size=vision_cache_size)
 
     # APC: build a shared block pool if opted in via env var.
-    apc_manager = _apc.from_env()
+    apc_manager = _apc.from_env(model_namespace=model_path)
 
     # KV cache quantization (uniform or TurboQuant)
     kv_bits = get_quantized_kv_bits(model_path)

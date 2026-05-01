@@ -41,9 +41,12 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import queue
+import re
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
@@ -133,6 +136,8 @@ class APCStats:
     evictions: int = 0
     stores: int = 0
     pool_used: int = 0
+    disk_hits: int = 0
+    disk_writes: int = 0
 
     def snapshot(self, num_blocks: int, block_size: int) -> dict:
         denom = self.matched_tokens + self.served_tokens
@@ -148,7 +153,160 @@ class APCStats:
             "token_hit_rate": hit_rate,
             "evictions": self.evictions,
             "stores": self.stores,
+            "disk_hits": self.disk_hits,
+            "disk_writes": self.disk_writes,
         }
+
+
+def _safe_namespace(name: str) -> str:
+    """Sanitize a model identifier into a filesystem-friendly directory name."""
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_") or "default"
+    return safe[:128]
+
+
+class DiskBlockStore:
+    """Persistent SSD-backed cold tier for APC blocks.
+
+    Each fully-filled block is written as a .safetensors file under
+    ``<root>/<namespace>/<hex_hash>.safetensors`` with all per-layer K/V
+    tensors plus a small metadata blob (token tuple, parent hash, etc).
+
+    Writes go through a background worker thread so the prefill hot path
+    isn't blocked by SSD latency. Loads are inline (~10-50 ms per block on
+    Apple SSDs is much cheaper than re-prefilling).
+    """
+
+    SUFFIX = ".safetensors"
+
+    def __init__(self, root: Path, namespace: str = "default", num_workers: int = 1):
+        self.dir = Path(root) / _safe_namespace(namespace)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self._q: queue.Queue = queue.Queue(maxsize=4096)
+        self._stop = threading.Event()
+        # Track in-flight hashes so a lookup that races a pending write can
+        # wait briefly for the bytes to land instead of falsely missing.
+        self._in_flight: dict[int, threading.Event] = {}
+        self._in_flight_lock = threading.Lock()
+        self._workers = [
+            threading.Thread(target=self._writer_loop, daemon=True, name=f"apc-disk-{i}")
+            for i in range(max(1, num_workers))
+        ]
+        for t in self._workers:
+            t.start()
+
+    def _path(self, block_hash: int) -> Path:
+        unsigned = block_hash & ((1 << 64) - 1)
+        return self.dir / f"{unsigned:016x}{self.SUFFIX}"
+
+    def has(self, block_hash: int) -> bool:
+        return self._path(block_hash).exists()
+
+    def load(
+        self, block_hash: int, *, wait_in_flight_ms: float = 0.0
+    ) -> Optional[Tuple[List[mx.array], List[mx.array], dict]]:
+        """Read one block from disk. Returns (keys, values, metadata) or None."""
+        path = self._path(block_hash)
+        if not path.exists():
+            if wait_in_flight_ms > 0:
+                with self._in_flight_lock:
+                    ev = self._in_flight.get(block_hash)
+                if ev is not None and ev.wait(wait_in_flight_ms / 1000.0):
+                    if not path.exists():
+                        return None
+                else:
+                    return None
+            else:
+                return None
+        try:
+            arrays, metadata = mx.load(str(path), return_metadata=True)
+        except Exception as e:  # corrupt file or partial write
+            logger.warning("APC disk load failed for %s: %s", path, e)
+            return None
+        try:
+            num_layers = len(arrays) // 2
+            keys = [arrays[f"k_{i}"] for i in range(num_layers)]
+            values = [arrays[f"v_{i}"] for i in range(num_layers)]
+        except KeyError as e:
+            logger.warning("APC disk file %s missing tensor: %s", path, e)
+            return None
+        return keys, values, dict(metadata)
+
+    def save(
+        self,
+        block_hash: int,
+        keys: List[mx.array],
+        values: List[mx.array],
+        metadata: dict,
+    ) -> None:
+        """Schedule a write. Returns immediately; worker thread does the I/O."""
+        ev = threading.Event()
+        with self._in_flight_lock:
+            self._in_flight[block_hash] = ev
+        try:
+            self._q.put_nowait((block_hash, keys, values, metadata, ev))
+        except queue.Full:
+            # Queue saturated → drop this write rather than block prefill.
+            with self._in_flight_lock:
+                self._in_flight.pop(block_hash, None)
+            ev.set()
+            logger.warning("APC disk write queue full; dropping block %x", block_hash)
+
+    def _writer_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                item = self._q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+            block_hash, keys, values, metadata, ev = item
+            path = self._path(block_hash)
+            try:
+                arrays = {}
+                for i, (k, v) in enumerate(zip(keys, values)):
+                    arrays[f"k_{i}"] = k
+                    arrays[f"v_{i}"] = v
+                mx.eval(list(arrays.values()))
+                # mx.save_safetensors rejects non-".safetensors" filenames, so
+                # write to ``<hash>.<pid>-<tid>.safetensors`` and atomically
+                # rename to ``<hash>.safetensors``. list_hashes() only matches
+                # the 16-hex base name, so partial files don't get picked up.
+                tag = f"{os.getpid()}-{threading.get_ident()}"
+                tmp = path.parent / f"{path.stem}.{tag}{self.SUFFIX}"
+                mx.save_safetensors(str(tmp), arrays, metadata=metadata)
+                os.replace(tmp, path)  # atomic on POSIX
+            except Exception as e:
+                logger.warning("APC disk save failed for %s: %s", path, e)
+            finally:
+                with self._in_flight_lock:
+                    self._in_flight.pop(block_hash, None)
+                ev.set()
+
+    def close(self) -> None:
+        self._stop.set()
+        for _ in self._workers:
+            try:
+                self._q.put_nowait(None)
+            except queue.Full:
+                pass
+        for t in self._workers:
+            t.join(timeout=2.0)
+
+    def list_hashes(self) -> List[int]:
+        out: List[int] = []
+        for p in self.dir.glob(f"*{self.SUFFIX}"):
+            stem = p.stem
+            if len(stem) != 16:  # ignore tmp / partial files
+                continue
+            try:
+                # signed reinterpret to match Python hash() / our hash space
+                u = int(stem, 16)
+                if u >= (1 << 63):
+                    u -= 1 << 64
+                out.append(u)
+            except ValueError:
+                continue
+        return out
 
 
 class APCManager:
@@ -158,6 +316,7 @@ class APCManager:
         self,
         num_blocks: int = DEFAULT_NUM_BLOCKS,
         block_size: int = DEFAULT_BLOCK_SIZE,
+        disk: Optional["DiskBlockStore"] = None,
     ):
         self.block_size = block_size
         self.num_blocks = num_blocks
@@ -169,6 +328,7 @@ class APCManager:
         self.hash_table: dict[int, APCBlock] = {}
         self.stats = APCStats()
         self.lock = threading.RLock()
+        self.disk = disk
 
     # ---------- LRU free queue (O(1)) ----------
     def _free_push(self, b: APCBlock) -> None:
@@ -231,7 +391,12 @@ class APCManager:
         self, token_ids: Sequence[int], extra_hash: int = 0
     ) -> Tuple[List[APCBlock], int]:
         """Walk the hash chain over ``token_ids``; return acquired matched
-        blocks and matched_token_count. Caller must release the blocks."""
+        blocks and matched_token_count. Caller must release the blocks.
+
+        When a disk tier is configured, an in-memory miss falls through to
+        the SSD store; a disk hit promotes the block back into the in-memory
+        pool (counts the same as a memory hit for downstream callers).
+        """
         with self.lock:
             n_full = len(token_ids) // self.block_size
             matched: List[APCBlock] = []
@@ -243,7 +408,12 @@ class APCManager:
                 h = _hash_tokens(parent, chunk, extra_hash)
                 b = self.hash_table.get(h)
                 if b is None or b.token_ids != chunk:
-                    break
+                    promoted = self._try_promote_from_disk(h, chunk, parent, extra_hash)
+                    if promoted is None:
+                        break
+                    matched.append(promoted)
+                    parent = h
+                    continue
                 matched.append(self._acquire_existing(b))
                 parent = h
             matched_tokens = len(matched) * self.block_size
@@ -253,6 +423,47 @@ class APCManager:
             else:
                 self.stats.misses += 1
             return matched, matched_tokens
+
+    def _try_promote_from_disk(
+        self,
+        block_hash: int,
+        chunk: Tuple[int, ...],
+        parent_hash: int,
+        extra_hash: int,
+    ) -> Optional[APCBlock]:
+        """Load a single block from the SSD tier into the in-memory pool.
+
+        Returns the freshly-acquired in-memory block on success, or None
+        when the block isn't on disk or fails verification.
+        """
+        if self.disk is None:
+            return None
+        loaded = self.disk.load(block_hash, wait_in_flight_ms=50.0)
+        if loaded is None:
+            return None
+        keys, values, metadata = loaded
+        # Verify exact tokens + extra_hash match — paranoia against hash
+        # collisions or stale files left over from a different tenant/model.
+        try:
+            stored_tokens = tuple(int(x) for x in metadata.get("token_ids", "").split(",") if x)
+            stored_extra = int(metadata.get("extra_hash", "0"))
+        except (TypeError, ValueError):
+            return None
+        if stored_tokens != chunk or stored_extra != extra_hash:
+            return None
+        b = self._evict_lru()
+        if b is None:
+            return None
+        b.block_hash = block_hash
+        b.parent_hash = parent_hash
+        b.token_ids = chunk
+        b.extra_hash = extra_hash
+        b.keys = keys
+        b.values = values
+        b.ref_cnt = 1
+        self.hash_table[block_hash] = b
+        self.stats.disk_hits += 1
+        return b
 
     def store_kv_blocks(
         self,
@@ -321,6 +532,22 @@ class APCManager:
                 new_blocks.append(b)
                 self.stats.stores += 1
                 self.stats.served_tokens += self.block_size
+                # Fan out to the persistent tier asynchronously — survives
+                # restarts and (later) shares across processes.
+                if self.disk is not None and not self.disk.has(h):
+                    self.disk.save(
+                        h,
+                        k_slabs,
+                        v_slabs,
+                        metadata={
+                            "block_hash": str(h),
+                            "parent_hash": str(parent),
+                            "extra_hash": str(extra_hash),
+                            "token_ids": ",".join(str(t) for t in chunk),
+                            "block_size": str(self.block_size),
+                        },
+                    )
+                    self.stats.disk_writes += 1
                 parent = h
             self.stats.pool_used = sum(1 for x in self.pool if x.block_hash is not None)
             return new_blocks
@@ -536,16 +763,33 @@ def model_supports_apc(language_model: Any) -> bool:
     return not hasattr(language_model, "make_cache")
 
 
-def from_env() -> Optional[APCManager]:
-    """Build an APCManager from env vars when ``APC_ENABLED=1``, else None."""
+def from_env(model_namespace: Optional[str] = None) -> Optional[APCManager]:
+    """Build an APCManager from env vars when ``APC_ENABLED=1``, else None.
+
+    When ``APC_DISK_PATH`` is set, also wires up a SSD cold-tier rooted
+    there. The directory is namespaced by ``model_namespace`` so cached
+    blocks from one model can't be loaded back into a different one.
+    """
     if os.environ.get("APC_ENABLED", "0") not in ("1", "true", "True", "yes"):
         return None
     block_size = int(os.environ.get("APC_BLOCK_SIZE", DEFAULT_BLOCK_SIZE))
     num_blocks = int(os.environ.get("APC_NUM_BLOCKS", DEFAULT_NUM_BLOCKS))
+
+    disk: Optional[DiskBlockStore] = None
+    disk_path = os.environ.get("APC_DISK_PATH")
+    if disk_path:
+        ns = model_namespace or os.environ.get("APC_DISK_NAMESPACE", "default")
+        try:
+            disk = DiskBlockStore(Path(disk_path).expanduser(), namespace=ns)
+            logger.info("APC disk tier at %s (ns=%s)", disk.dir, ns)
+        except Exception as e:
+            logger.warning("APC disk tier disabled (init failed): %s", e)
+
     logger.info(
-        "APC enabled (block_size=%d, num_blocks=%d, hash=%s)",
+        "APC enabled (block_size=%d, num_blocks=%d, hash=%s, disk=%s)",
         block_size,
         num_blocks,
         "sha256" if _hash_use_sha256() else "fast",
+        bool(disk),
     )
-    return APCManager(num_blocks=num_blocks, block_size=block_size)
+    return APCManager(num_blocks=num_blocks, block_size=block_size, disk=disk)
