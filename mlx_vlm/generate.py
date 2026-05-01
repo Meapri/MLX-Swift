@@ -2045,6 +2045,31 @@ class PromptProcessingBatch:
                 rope_deltas = rope_deltas.reshape(1, 1)
             elif rope_deltas.ndim == 1:
                 rope_deltas = rope_deltas[:, None]
+            # When a warm-start batch reuses the model's cached _rope_deltas
+            # (computed during a previous prefill with a smaller batch), the
+            # batch dim won't match this prompt batch's row count. Realign
+            # so extend()/filter() down the line stay consistent with the
+            # generation batch's row count.
+            target_b = first_tokens.shape[0]
+            if rope_deltas.shape[0] != target_b:
+                if rope_deltas.shape[0] == 1:
+                    rope_deltas = mx.broadcast_to(
+                        rope_deltas, (target_b, rope_deltas.shape[1])
+                    )
+                elif rope_deltas.shape[0] < target_b:
+                    pad = target_b - rope_deltas.shape[0]
+                    rope_deltas = mx.concatenate(
+                        [
+                            rope_deltas,
+                            mx.broadcast_to(
+                                rope_deltas[-1:],
+                                (pad, rope_deltas.shape[1]),
+                            ),
+                        ],
+                        axis=0,
+                    )
+                else:
+                    rope_deltas = rope_deltas[:target_b]
             gen_batch._rope_deltas = rope_deltas
 
         # APC: harvest the post-prefill K/V into hashed blocks. Done after the
@@ -2490,6 +2515,12 @@ class BatchGenerator:
             # warm and cold rows prefill in a single forward pass.
             n = min(self.prefill_batch_size, len(self._unprocessed_sequences))
             sequences = self._unprocessed_sequences[:n]
+            if os.environ.get("APC_DEBUG"):
+                logger.warning(
+                    "APC admit n=%d (pending=%d)",
+                    n,
+                    len(self._unprocessed_sequences),
+                )
             mixed = self._build_mixed_prompt_batch(sequences)
             if mixed is not None:
                 self._unprocessed_sequences = self._unprocessed_sequences[n:]

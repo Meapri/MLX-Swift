@@ -1845,14 +1845,28 @@ async def responses_endpoint(request: Request):
                     usage_stats = {"input_tokens": 0, "output_tokens": 0}
 
                     if response_generator is not None:
-                        ctx, token_iter = response_generator.generate(
-                            prompt=formatted_prompt,
-                            images=images if images else None,
-                            args=gen_args,
+                        # generate() blocks on _cpu_preprocess + queue.get;
+                        # offload so concurrent handlers preprocess in parallel.
+                        ctx, token_iter = await asyncio.to_thread(
+                            response_generator.generate,
+                            formatted_prompt,
+                            images if images else None,
+                            None,  # audio
+                            gen_args,
                         )
 
                         output_tokens = 0
-                        for token in token_iter:
+
+                        def _next_token_resp_stream():
+                            try:
+                                return next(token_iter)
+                            except StopIteration:
+                                return None
+
+                        while True:
+                            token = await asyncio.to_thread(_next_token_resp_stream)
+                            if token is None:
+                                break
                             output_tokens += 1
                             delta = token.text
                             full_text += delta
@@ -1967,21 +1981,28 @@ async def responses_endpoint(request: Request):
                 output_tokens = 0
 
                 if response_generator is not None:
-                    ctx, token_iter = response_generator.generate(
-                        prompt=formatted_prompt,
-                        images=images if images else None,
-                        args=gen_args,
+                    def _blocking_resp():
+                        ctx_, ti = response_generator.generate(
+                            prompt=formatted_prompt,
+                            images=images if images else None,
+                            args=gen_args,
+                        )
+                        text = ""
+                        ot = 0
+                        for tok in ti:
+                            text += tok.text
+                            ot += 1
+                            if tok.finish_reason:
+                                break
+                        try:
+                            ti.close()
+                        except Exception:
+                            pass
+                        return ctx_.prompt_tokens, text, ot
+
+                    prompt_tokens, full_text, output_tokens = await asyncio.to_thread(
+                        _blocking_resp
                     )
-                    prompt_tokens = ctx.prompt_tokens
-                    for token in token_iter:
-                        full_text += token.text
-                        output_tokens += 1
-                        if token.finish_reason:
-                            break
-                    try:
-                        token_iter.close()
-                    except Exception:
-                        pass
                 else:
                     result = generate(
                         model=model,
