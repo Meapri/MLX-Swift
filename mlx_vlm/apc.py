@@ -191,6 +191,7 @@ class DiskBlockStore:
         self.dir = Path(root) / _safe_namespace(namespace)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.max_bytes = max_bytes
+        self.evictions = 0  # cumulative file deletions by _maybe_evict
         self._q: queue.Queue = queue.Queue(maxsize=4096)
         self._stop = threading.Event()
         # Track in-flight hashes so a lookup that races a pending write can
@@ -286,6 +287,7 @@ class DiskBlockStore:
             except OSError as e:
                 logger.warning("APC disk: failed to evict %s: %s", p, e)
         if evicted:
+            self.evictions += evicted
             logger.info(
                 "APC disk: evicted %d block(s) (%.1f MB) to stay under %.1f MB cap",
                 evicted,
@@ -491,6 +493,15 @@ class APCManager:
         if b.ref_cnt == 0:
             self._free_remove(b)
         b.ref_cnt += 1
+        # Memory hits should also bump the on-disk atime so that hot blocks
+        # (e.g., shared system-prompt prefixes referenced by many requests)
+        # don't look "cold" to the on-disk LRU just because they were written
+        # once at the very beginning of the session.
+        if self.disk is not None and b.block_hash is not None:
+            try:
+                os.utime(self.disk._path(b.block_hash), None)
+            except OSError:
+                pass
         return b
 
     def _release_one(self, b: APCBlock) -> None:
@@ -677,6 +688,16 @@ class APCManager:
             if self.disk is not None:
                 snap["disk_bytes"] = self.disk.disk_bytes
                 snap["disk_max_bytes"] = self.disk.max_bytes
+                snap["disk_evictions"] = self.disk.evictions
+                # files-on-disk count via cheap glob
+                try:
+                    snap["disk_files"] = sum(
+                        1
+                        for p in self.disk.dir.glob(f"*{self.disk.SUFFIX}")
+                        if len(p.stem) == 16
+                    )
+                except OSError:
+                    snap["disk_files"] = -1
             return snap
 
     def reset_stats(self) -> None:
