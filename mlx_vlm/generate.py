@@ -4,6 +4,7 @@ import contextlib
 import functools
 import json
 import logging
+import os
 import time
 import warnings
 from collections.abc import Sequence
@@ -1994,6 +1995,19 @@ class PromptProcessingBatch:
             for c in self.prompt_cache:
                 if hasattr(c, "finalize"):
                     c.finalize()
+        if os.environ.get("APC_DEBUG"):
+            c0 = self.prompt_cache[0] if self.prompt_cache else None
+            if c0 is not None:
+                off = getattr(c0, "offset", None)
+                lp = getattr(c0, "left_padding", None)
+                logger.warning(
+                    "post-prefill cache[0]: _idx=%s offset=%s left_padding=%s right_pad_per_row=%s suffix_lens=%s",
+                    getattr(c0, "_idx", None),
+                    off.tolist() if hasattr(off, "tolist") else off,
+                    lp.tolist() if hasattr(lp, "tolist") else lp,
+                    self._right_pad_per_row,
+                    self._suffix_lens,
+                )
 
         gen_batch = GenerationBatch(
             model=self.model,
