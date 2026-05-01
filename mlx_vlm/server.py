@@ -32,7 +32,6 @@ from .generate import (
     DEFAULT_KV_QUANT_SCHEME,
     DEFAULT_MAX_TOKENS,
     DEFAULT_MODEL_PATH,
-    DEFAULT_PREFILL_BATCH_SIZE,
     DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
     DEFAULT_SEED,
@@ -417,16 +416,6 @@ class ResponseGenerator:
         # uid -> {rqueue, tokens, gen_kwargs}
         active: dict = {}
 
-        # Admission window: when the GPU is idle and only a partial batch
-        # has arrived, wait briefly for more concurrent arrivals so they can
-        # be admitted in a single PromptProcessingBatch. Cost is per-request
-        # latency in the single-request case; benefit is amortised prefill
-        # across concurrent arrivals. 0 disables.
-        admit_delay_ms = float(os.environ.get("APC_ADMIT_DELAY_MS", 0))
-        admit_target = int(
-            os.environ.get("APC_ADMIT_TARGET", DEFAULT_PREFILL_BATCH_SIZE)
-        )
-
         while not self._stop:
             try:
                 # Poll the request queue — non-blocking when generating, short
@@ -460,38 +449,6 @@ class ResponseGenerator:
                             new_items.append(item)
                     except QueueEmpty:
                         break
-
-                # Admission window: only when we're not actively decoding,
-                # we have at least one arrival, and the batch isn't full.
-                if (
-                    admit_delay_ms > 0
-                    and not active
-                    and 0 < len(new_items) < admit_target
-                ):
-                    deadline = time.monotonic() + (admit_delay_ms / 1000.0)
-                    while (
-                        len(new_items) < admit_target
-                        and time.monotonic() < deadline
-                    ):
-                        remaining = deadline - time.monotonic()
-                        if remaining <= 0:
-                            break
-                        try:
-                            item = self.requests.get(timeout=remaining)
-                            if item is None:
-                                if self._stop:
-                                    break
-                            else:
-                                new_items.append(item)
-                        except QueueEmpty:
-                            break
-                    while True:
-                        try:
-                            item = self.requests.get_nowait()
-                            if item is not None:
-                                new_items.append(item)
-                        except QueueEmpty:
-                            break
 
                 # Drop abandoned requests before doing more work.
                 cancelled = self._drain_cancellations()
