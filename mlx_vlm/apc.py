@@ -2273,6 +2273,7 @@ class APCManager:
 
 def make_warm_kv_cache(
     matched_blocks: List[APCBlock],
+    min_capacity_tokens: Optional[int] = None,
 ) -> List[Any]:
     """Stitch matched blocks into per-layer ``KVCache`` instances pre-filled
     with the cached prefix's K/V state. Used by the single-stream
@@ -2285,11 +2286,27 @@ def make_warm_kv_cache(
     num_layers = len(matched_blocks[0].keys)
     out: List[Any] = []
     prefix_len = sum(b.keys[0].shape[-2] for b in matched_blocks)
+    kv_step = int(getattr(KVCache, "step", 256))
+    capacity = prefix_len
+    if min_capacity_tokens is not None:
+        capacity = max(prefix_len, int(min_capacity_tokens))
+        if capacity > prefix_len and kv_step > 0:
+            capacity = ((capacity + kv_step - 1) // kv_step) * kv_step
     for layer_idx in range(num_layers):
         ks = [b.keys[layer_idx] for b in matched_blocks]
         vs = [b.values[layer_idx] for b in matched_blocks]
         merged_k = mx.concatenate(ks, axis=2)
         merged_v = mx.concatenate(vs, axis=2)
+        if capacity > prefix_len:
+            pad_tokens = capacity - prefix_len
+            k_pad_shape = (*merged_k.shape[:2], pad_tokens, merged_k.shape[3])
+            v_pad_shape = (*merged_v.shape[:2], pad_tokens, merged_v.shape[3])
+            merged_k = mx.concatenate(
+                [merged_k, mx.zeros(k_pad_shape, dtype=merged_k.dtype)], axis=2
+            )
+            merged_v = mx.concatenate(
+                [merged_v, mx.zeros(v_pad_shape, dtype=merged_v.dtype)], axis=2
+            )
         c = KVCache()
         c.keys = merged_k
         c.values = merged_v

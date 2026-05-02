@@ -1182,7 +1182,10 @@ def stream_generate(
             if image_token_id is None or image_token_id not in new_ids:
                 pixel_values = None
                 kwargs.pop("cached_image_features", None)
-            kwargs["prompt_cache"] = _apc.make_warm_kv_cache(matched_blocks)
+            kwargs["prompt_cache"] = _apc.make_warm_kv_cache(
+                matched_blocks,
+                min_capacity_tokens=prefix_len + input_ids.shape[1] + 1,
+            )
         elif matched_blocks:
             # Full match (no new tokens to compute) — release; fall through to normal path
             apc_manager.release(matched_blocks)

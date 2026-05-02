@@ -141,6 +141,14 @@ def test_lookup_and_store() -> None:
         "warm cache shape correct",
         all(c.keys.shape == (1, n_heads, 3 * bs, head_dim) for c in warm),
     )
+    warm_padded = make_warm_kv_cache(m2, min_capacity_tokens=3 * bs + 17)
+    _info(
+        "warm cache can preserve spare capacity",
+        all(
+            c.offset == 3 * bs and c.keys.shape[2] >= 3 * bs + 17
+            for c in warm_padded
+        ),
+    )
 
     # Partial-prefix mismatch: alter the 3rd block's tokens → should match 2 blocks
     altered = list(tokens)
