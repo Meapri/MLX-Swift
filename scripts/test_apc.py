@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
+import tempfile
 import time
 from typing import List
 
@@ -33,6 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from mlx_vlm.apc import (  # noqa: E402
     APCBlock,
     APCManager,
+    DiskBlockStore,
     SEED_PARENT_HASH,
     _hash_tokens,
     hash_image_payload,
@@ -76,7 +79,7 @@ def _make_fake_kv(num_layers: int, n_kv_heads: int, seq_len: int, head_dim: int)
 
 
 def test_hash_determinism() -> None:
-    print("\n[1/7] Hash determinism")
+    print("\n[1/8] Hash determinism")
     a = _hash_tokens(0, tuple(range(16)), 0)
     b = _hash_tokens(0, tuple(range(16)), 0)
     _info("hash deterministic", a == b)
@@ -91,7 +94,7 @@ def test_hash_determinism() -> None:
 
 
 def test_image_hash() -> None:
-    print("\n[2/7] Multimodal hash")
+    print("\n[2/8] Multimodal hash")
     arr1 = mx.array(np.zeros((1, 3, 32, 32), dtype=np.float32))
     arr2 = mx.array(np.ones((1, 3, 32, 32), dtype=np.float32))
     h1 = hash_image_payload(pixel_values=arr1, image_ref=None)
@@ -105,7 +108,7 @@ def test_image_hash() -> None:
 
 
 def test_lookup_and_store() -> None:
-    print("\n[3/7] Block lookup + store")
+    print("\n[3/8] Block lookup + store")
     bs = 16
     mgr = APCManager(num_blocks=64, block_size=bs)
 
@@ -149,7 +152,7 @@ def test_lookup_and_store() -> None:
 
 
 def test_eviction_lru() -> None:
-    print("\n[4/7] LRU eviction")
+    print("\n[4/8] LRU eviction")
     bs = 16
     mgr = APCManager(num_blocks=4, block_size=bs)  # tiny pool
     n_layers, n_heads, head_dim = 2, 1, 8
@@ -189,7 +192,7 @@ def test_eviction_lru() -> None:
 
 
 def test_multimodal_collision_avoidance() -> None:
-    print("\n[5/7] Image-hash isolation")
+    print("\n[5/8] Image-hash isolation")
     bs = 16
     mgr = APCManager(num_blocks=16, block_size=bs)
     toks = list(range(bs * 2))
@@ -215,7 +218,7 @@ def test_multimodal_collision_avoidance() -> None:
 
 
 def test_partial_block_not_stored() -> None:
-    print("\n[6/7] Partial trailing block ignored")
+    print("\n[6/8] Partial trailing block ignored")
     bs = 16
     mgr = APCManager(num_blocks=16, block_size=bs)
     toks = list(range(bs + 5))  # 1 full + 5 leftover
@@ -227,7 +230,7 @@ def test_partial_block_not_stored() -> None:
 
 
 def test_skip_first_n() -> None:
-    print("\n[7/7] skip_first_n_tokens (no double-store)")
+    print("\n[7/8] skip_first_n_tokens (no double-store)")
     bs = 16
     mgr = APCManager(num_blocks=16, block_size=bs)
     n_layers, n_heads, head_dim = 2, 1, 8
@@ -250,6 +253,48 @@ def test_skip_first_n() -> None:
         stores_after == stores_before and len(nb2) == 1,
     )
     mgr.release(nb2)
+
+
+def test_disk_layer_major_warm_prefix() -> None:
+    print("\n[8/8] Disk layer-major warm prefix")
+    bs = 16
+    root = tempfile.mkdtemp(prefix="apc-disk-test-")
+    try:
+        n_layers, n_heads, head_dim = 2, 1, 8
+        seq_len = 3 * bs
+        toks = list(range(seq_len))
+        keys, vals = _make_fake_kv(n_layers, n_heads, seq_len, head_dim)
+
+        disk = DiskBlockStore(root, namespace="unit")
+        mgr = APCManager(num_blocks=16, block_size=bs, disk=disk)
+        nb = mgr.store_kv_blocks(toks, keys, vals)
+        _info("disk store accepts 3 blocks", len(nb) == 3)
+        mgr.release(nb)
+        disk.close()
+
+        disk = DiskBlockStore(root, namespace="unit")
+        mgr = APCManager(num_blocks=16, block_size=bs, disk=disk)
+        warm, matched = mgr.lookup_prefix_disk_cache(toks)
+        _info(
+            "disk restore returns full prefix",
+            warm is not None and matched == seq_len,
+        )
+        _info("warm cache has correct layer count", len(warm) == n_layers)
+        _info(
+            "warm cache offset is exact prefix",
+            all(c.offset == seq_len for c in warm),
+        )
+        _info(
+            "warm cache preserves spare capacity",
+            all(c.keys.shape[2] > c.offset for c in warm),
+        )
+        _info(
+            "disk restore does not populate APCBlock pool",
+            mgr.stats_snapshot()["pool_used"] == 0,
+        )
+        disk.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 # --------------------------- Phase 2 model test ---------------------------
@@ -359,6 +404,7 @@ def main():
     test_multimodal_collision_avoidance()
     test_partial_block_not_stored()
     test_skip_first_n()
+    test_disk_layer_major_warm_prefix()
 
     print()
     print(_green("All unit tests passed."))

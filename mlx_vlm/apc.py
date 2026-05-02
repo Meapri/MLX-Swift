@@ -788,7 +788,11 @@ class DiskBlockStore:
         return loaded[0] if loaded else None
 
     def _load_layer_major_segment(
-        self, shard_path: Path, block_indices: Sequence[int]
+        self,
+        shard_path: Path,
+        block_indices: Sequence[int],
+        *,
+        preserve_capacity: bool = False,
     ) -> Optional[Tuple[List[mx.array], List[mx.array], List[dict]]]:
         if not block_indices:
             return None
@@ -799,11 +803,12 @@ class DiskBlockStore:
         if parsed is None:
             return None
         tensor_entries, file_metadata, data_start = parsed
-        if file_metadata.get("layout") == "token_major_v2":
+        layout = file_metadata.get("layout")
+        if layout == "token_major_v2":
             return self._load_token_major_segment(
                 shard_path, tensor_entries, file_metadata, data_start, block_indices
             )
-        if file_metadata.get("layout") != "layer_major_v1":
+        if layout not in ("layer_major_v1", "layer_major_v2"):
             return None
         try:
             num_layers = int(file_metadata.get("num_layers", "0"))
@@ -815,6 +820,11 @@ class DiskBlockStore:
 
         token_start = start_idx * block_size
         token_end = token_start + len(block_indices) * block_size
+        slice_end = (
+            None
+            if preserve_capacity and layout == "layer_major_v2" and start_idx == 0
+            else token_end
+        )
         keys: List[mx.array] = []
         values: List[mx.array] = []
         for l in range(num_layers):
@@ -826,8 +836,8 @@ class DiskBlockStore:
             v = _read_safetensors_tensor(shard_path, data_start, v_entry)
             if k is None or v is None:
                 return None
-            keys.append(k[..., token_start:token_end, :])
-            values.append(v[..., token_start:token_end, :])
+            keys.append(k[..., token_start:slice_end, :])
+            values.append(v[..., token_start:slice_end, :])
 
         metadata = [
             self._decode_block_metadata(file_metadata, idx) for idx in block_indices
@@ -1052,7 +1062,7 @@ class DiskBlockStore:
         return keys, values, metadata
 
     def load_layer_major_prefix(
-        self, block_hashes: Sequence[int]
+        self, block_hashes: Sequence[int], *, preserve_capacity: bool = True
     ) -> Optional[Tuple[List[mx.array], List[mx.array], List[dict]]]:
         """Load a cached prefix directly as per-layer K/V tensors.
 
@@ -1101,10 +1111,20 @@ class DiskBlockStore:
             return raw_token_major
 
         trace_load_t0 = time.perf_counter()
-        loaded_segments = [
-            self._load_layer_major_segment(shard_path, block_indices)
-            for shard_path, block_indices in segments
-        ]
+        loaded_segments = []
+        for shard_path, block_indices in segments:
+            loaded_segments.append(
+                self._load_layer_major_segment(
+                    shard_path,
+                    block_indices,
+                    preserve_capacity=(
+                        preserve_capacity
+                        and len(segments) == 1
+                        and bool(block_indices)
+                        and block_indices[0] == 0
+                    ),
+                )
+            )
         trace_load_t1 = time.perf_counter()
         if any(seg is None for seg in loaded_segments):
             return None
@@ -1186,7 +1206,11 @@ class DiskBlockStore:
         except (TypeError, ValueError):
             return [None] * len(block_indices)
 
-        if file_metadata.get("layout") in ("layer_major_v1", "token_major_v2"):
+        if file_metadata.get("layout") in (
+            "layer_major_v1",
+            "layer_major_v2",
+            "token_major_v2",
+        ):
             try:
                 block_hashes = [
                     int(json.loads(file_metadata[f"b{idx}_meta"])["block_hash"])
@@ -1194,7 +1218,9 @@ class DiskBlockStore:
                 ]
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 return [None] * len(block_indices)
-            loaded = self.load_layer_major_prefix(block_hashes)
+            loaded = self.load_layer_major_prefix(
+                block_hashes, preserve_capacity=False
+            )
             if loaded is None:
                 return [None] * len(block_indices)
             layer_keys, layer_values, metadatas = loaded
@@ -1379,26 +1405,37 @@ class DiskBlockStore:
                             [b.values[l] for b in blocks if b.values is not None], axis=2
                         )
                     )
-                can_token_major = (
-                    bool(layer_keys)
-                    and all(len(k.shape) == 4 for k in layer_keys)
-                    and all(len(v.shape) == 4 for v in layer_values)
-                    and all(k.shape == layer_keys[0].shape for k in layer_keys)
-                    and all(v.shape == layer_values[0].shape for v in layer_values)
-                )
-                if can_token_major:
-                    arrays["k_all"] = mx.stack(
-                        [mx.transpose(k, (2, 0, 1, 3)) for k in layer_keys], axis=1
-                    )
-                    arrays["v_all"] = mx.stack(
-                        [mx.transpose(v, (2, 0, 1, 3)) for v in layer_values], axis=1
-                    )
-                    metadata["layout"] = "token_major_v2"
-                else:
-                    for l, (k, v) in enumerate(zip(layer_keys, layer_values)):
-                        arrays[f"k{l}"] = k
-                        arrays[f"v{l}"] = v
-                    metadata["layout"] = "layer_major_v1"
+                if layer_keys:
+                    total_tokens = int(layer_keys[0].shape[2])
+                    kv_step = 256
+                    capacity = ((total_tokens + 1 + kv_step - 1) // kv_step) * kv_step
+                    pad_tokens = capacity - total_tokens
+                    if pad_tokens > 0:
+                        padded_keys: List[mx.array] = []
+                        padded_values: List[mx.array] = []
+                        for k, v in zip(layer_keys, layer_values):
+                            if len(k.shape) != 4 or len(v.shape) != 4:
+                                padded_keys.append(k)
+                                padded_values.append(v)
+                                continue
+                            k_pad_shape = (*k.shape[:2], pad_tokens, k.shape[3])
+                            v_pad_shape = (*v.shape[:2], pad_tokens, v.shape[3])
+                            padded_keys.append(
+                                mx.concatenate(
+                                    [k, mx.zeros(k_pad_shape, dtype=k.dtype)], axis=2
+                                )
+                            )
+                            padded_values.append(
+                                mx.concatenate(
+                                    [v, mx.zeros(v_pad_shape, dtype=v.dtype)], axis=2
+                                )
+                            )
+                        layer_keys = padded_keys
+                        layer_values = padded_values
+                for l, (k, v) in enumerate(zip(layer_keys, layer_values)):
+                    arrays[f"k{l}"] = k
+                    arrays[f"v{l}"] = v
+                metadata["layout"] = "layer_major_v2"
                 metadata["block_hashes"] = ",".join(
                     str(int(b.block_hash)) for b in blocks
                 )
