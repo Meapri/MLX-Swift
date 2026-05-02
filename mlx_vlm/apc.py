@@ -162,6 +162,9 @@ class _DiskLayerMajorSnapshot:
     layer_keys: List[mx.array]
     layer_values: List[mx.array]
     block_size: int
+    store_id: str
+    segment_index: int
+    segment_count: int
 
 
 @dataclass
@@ -399,9 +402,10 @@ def _free_ram_bytes() -> Optional[int]:
 class DiskBlockStore:
     """Persistent SSD-backed cold tier for APC blocks.
 
-    Layout: one shard per ``store_kv_blocks`` call. Each shard is a single
-    ``.safetensors`` file under ``<root>/<namespace>/`` containing all of
-    that call's blocks. Co-locating chain-contiguous blocks in one file
+    Layout: one or more segment shards per ``store_kv_blocks`` call. Each
+    shard is a single ``.safetensors`` file under ``<root>/<namespace>/``
+    containing a bounded run of that call's blocks. Co-locating
+    chain-contiguous blocks in segment files
     makes restoration O(few sequential reads) rather than O(num_blocks
     random reads) — the difference is roughly two orders of magnitude on
     Apple NVMe for ~200-block prefixes.
@@ -421,8 +425,8 @@ class DiskBlockStore:
     a single restore don't re-mmap the same file.
 
     Writes go through a single background worker so the prefill hot path
-    isn't blocked. Eviction is at shard granularity (drop the whole
-    file).
+    isn't blocked. Eviction is at segment-shard granularity (drop one
+    bounded file).
     """
 
     SUFFIX = ".safetensors"
@@ -470,6 +474,21 @@ class DiskBlockStore:
         self._header_cache_max = int(os.environ.get("APC_DISK_HEADER_CACHE", 4))
         self._direct_max_overread_bytes = int(
             float(os.environ.get("APC_DISK_DIRECT_MAX_OVERREAD_MB", "8")) * (1 << 20)
+        )
+        # Bound layer-major shard size so disk eviction is segment-granular
+        # instead of one huge all-or-nothing prefix file. A Qwen3-VL-4B block
+        # is ~2.25 MiB, so 256 blocks is roughly a 576 MiB shard before the
+        # small KV step padding.
+        self._shard_max_blocks = max(
+            1, int(os.environ.get("APC_DISK_SHARD_MAX_BLOCKS", "256"))
+        )
+        # Layer-major warm-disk restore concatenates segment shards one layer
+        # at a time. Clearing MLX's allocator cache after each layer keeps the
+        # temporary segment tensors from coexisting with the fully-restored
+        # prompt cache. Set to 0 to disable, or a larger value to trade peak
+        # memory for slightly lower restore overhead.
+        self._restore_clear_every = max(
+            0, int(os.environ.get("APC_DISK_RESTORE_CLEAR_EVERY", "1"))
         )
         # Bounded LRU of mmap'd shards: shard_path -> (arrays_dict, file_metadata).
         # Default capped at 2 — the within-restore working set is typically
@@ -584,8 +603,11 @@ class DiskBlockStore:
         return self._read_mode == "direct"
 
     def _maybe_evict(self) -> int:
-        """Evict whole shards (oldest atime first) until under the low
-        watermark. Removes their index entries and mmap-cache entries.
+        """Evict segment shards until under the low watermark.
+
+        Stores are ordered by last-used time; segments within the same store
+        are evicted tail-first so a partially-retained store still has a
+        useful prefix.
         """
         if self.max_bytes is None or self._disk_bytes <= self.max_bytes:
             return 0
@@ -599,7 +621,7 @@ class DiskBlockStore:
                 self._index[h][0] for h in in_flight_hashes if h in self._index
             }
 
-        candidates: list[tuple[float, int, Path]] = []
+        candidates: list[dict[str, Any]] = []
         for p in self.dir.glob(f"*{self.SUFFIX}"):
             if not self._is_canonical_shard(p) or p in in_flight_paths:
                 continue
@@ -607,13 +629,48 @@ class DiskBlockStore:
                 st = p.stat()
             except OSError:
                 continue
-            candidates.append((st.st_atime, st.st_size, p))
-        candidates.sort()  # oldest atime first
+            store_id = str(p)
+            segment_index = 0
+            metadata = _read_safetensors_metadata(p)
+            if metadata is not None:
+                store_id = metadata.get("store_id", store_id)
+                try:
+                    segment_index = int(metadata.get("segment_index", "0"))
+                except (TypeError, ValueError):
+                    segment_index = 0
+            candidates.append(
+                {
+                    # Header reads during eviction can update atime on some
+                    # filesystems. Use mtime as our explicit last-used clock;
+                    # the load paths call os.utime(), which updates it.
+                    "last_used": st.st_mtime,
+                    "size": st.st_size,
+                    "path": p,
+                    "store_id": store_id,
+                    "segment_index": segment_index,
+                }
+            )
+        store_last_used: dict[str, float] = {}
+        for candidate in candidates:
+            sid = candidate["store_id"]
+            store_last_used[sid] = min(
+                candidate["last_used"],
+                store_last_used.get(sid, candidate["last_used"]),
+            )
+        candidates.sort(
+            key=lambda c: (
+                store_last_used[c["store_id"]],
+                -int(c["segment_index"]),
+                c["last_used"],
+            )
+        )
 
         evicted = 0
-        for _, size, p in candidates:
+        for candidate in candidates:
             if self._disk_bytes <= target:
                 break
+            size = int(candidate["size"])
+            p = candidate["path"]
             try:
                 p.unlink()
             except OSError as e:
@@ -670,7 +727,7 @@ class DiskBlockStore:
         except Exception as e:
             logger.warning("APC disk shard load failed for %s: %s", shard_path, e)
             return None
-        # Touch atime so LRU eviction prefers truly-cold shards.
+        # Touch recency timestamp so LRU eviction prefers truly-cold shards.
         try:
             os.utime(shard_path, None)
         except OSError:
@@ -841,9 +898,21 @@ class DiskBlockStore:
 
         token_start = start_idx * block_size
         token_end = token_start + len(block_indices) * block_size
+        shard_n_blocks = len(
+            [x for x in file_metadata.get("block_hashes", "").split(",") if x]
+        )
+        requested_to_shard_end = (
+            shard_n_blocks > 0
+            and start_idx == 0
+            and start_idx + len(block_indices) >= shard_n_blocks
+        )
         slice_end = (
             None
-            if preserve_capacity and layout == "layer_major_v2" and start_idx == 0
+            if (
+                preserve_capacity
+                and layout == "layer_major_v2"
+                and requested_to_shard_end
+            )
             else token_end
         )
         keys: List[mx.array] = []
@@ -868,6 +937,149 @@ class DiskBlockStore:
         except OSError:
             pass
         mx.eval(keys + values)
+        return keys, values, metadata
+
+    def _load_layer_major_prefix_segments_layerwise(
+        self,
+        segments: Sequence[Tuple[Path, List[int]]],
+        *,
+        preserve_capacity: bool,
+    ) -> Optional[Tuple[List[mx.array], List[mx.array], List[dict]]]:
+        """Load layer-major segments without holding all segment tensors.
+
+        The older restore path first read every segment's K/V for every layer,
+        then concatenated all layers at once. For long prefixes this doubled
+        peak MLX memory: segment tensors plus final KVCache tensors. This
+        routine reads all segments for one layer, emits that layer's final K/V,
+        clears temporary allocator state, and moves to the next layer.
+        """
+        if not segments:
+            return None
+
+        segment_infos: List[
+            Tuple[Path, dict, dict, int, int, Optional[int], List[int]]
+        ] = []
+        metadata: List[dict] = []
+        num_layers: Optional[int] = None
+        block_size_ref: Optional[int] = None
+        last_segment_idx = len(segments) - 1
+
+        for segment_idx, (shard_path, block_indices) in enumerate(segments):
+            if not block_indices:
+                return None
+            start_idx = block_indices[0]
+            if list(block_indices) != list(
+                range(start_idx, start_idx + len(block_indices))
+            ):
+                return None
+            parsed = self._open_shard_header(shard_path)
+            if parsed is None:
+                return None
+            tensor_entries, file_metadata, data_start = parsed
+            layout = file_metadata.get("layout")
+            if layout not in ("layer_major_v1", "layer_major_v2"):
+                return None
+            try:
+                shard_layers = int(file_metadata.get("num_layers", "0"))
+                block_size = int(file_metadata.get("block_size", "0"))
+            except (TypeError, ValueError):
+                return None
+            if shard_layers <= 0 or block_size <= 0:
+                return None
+            if num_layers is None:
+                num_layers = shard_layers
+                block_size_ref = block_size
+            elif shard_layers != num_layers or block_size != block_size_ref:
+                return None
+
+            token_start = start_idx * block_size
+            token_end = token_start + len(block_indices) * block_size
+            shard_n_blocks = len(
+                [x for x in file_metadata.get("block_hashes", "").split(",") if x]
+            )
+            requested_to_shard_end = (
+                shard_n_blocks > 0
+                and start_idx == 0
+                and start_idx + len(block_indices) >= shard_n_blocks
+            )
+            slice_end = (
+                None
+                if (
+                    preserve_capacity
+                    and segment_idx == last_segment_idx
+                    and layout == "layer_major_v2"
+                    and requested_to_shard_end
+                )
+                else token_end
+            )
+            segment_infos.append(
+                (
+                    shard_path,
+                    tensor_entries,
+                    file_metadata,
+                    data_start,
+                    token_start,
+                    slice_end,
+                    list(block_indices),
+                )
+            )
+            metadata.extend(
+                self._decode_block_metadata(file_metadata, idx)
+                for idx in block_indices
+            )
+            try:
+                os.utime(shard_path, None)
+            except OSError:
+                pass
+
+        if num_layers is None:
+            return None
+
+        keys: List[mx.array] = []
+        values: List[mx.array] = []
+        for layer_idx in range(num_layers):
+            k_parts: List[mx.array] = []
+            v_parts: List[mx.array] = []
+            for (
+                shard_path,
+                tensor_entries,
+                _file_metadata,
+                data_start,
+                token_start,
+                slice_end,
+                _block_indices,
+            ) in segment_infos:
+                k_entry = tensor_entries.get(f"k{layer_idx}")
+                v_entry = tensor_entries.get(f"v{layer_idx}")
+                if k_entry is None or v_entry is None:
+                    return None
+                k = _read_safetensors_tensor(shard_path, data_start, k_entry)
+                v = _read_safetensors_tensor(shard_path, data_start, v_entry)
+                if k is None or v is None:
+                    return None
+                k_parts.append(k[..., token_start:slice_end, :])
+                v_parts.append(v[..., token_start:slice_end, :])
+
+            k_out = (
+                k_parts[0]
+                if len(k_parts) == 1
+                else mx.concatenate(k_parts, axis=2)
+            )
+            v_out = (
+                v_parts[0]
+                if len(v_parts) == 1
+                else mx.concatenate(v_parts, axis=2)
+            )
+            mx.eval(k_out, v_out)
+            keys.append(k_out)
+            values.append(v_out)
+            del k_parts, v_parts, k_out, v_out
+            if (
+                self._restore_clear_every > 0
+                and (layer_idx + 1) % self._restore_clear_every == 0
+            ):
+                mx.clear_cache()
+
         return keys, values, metadata
 
     def _load_token_major_segment(
@@ -1131,16 +1343,34 @@ class DiskBlockStore:
                 )
             return raw_token_major
 
+        trace_layerwise_t0 = time.perf_counter()
+        layerwise = self._load_layer_major_prefix_segments_layerwise(
+            segments,
+            preserve_capacity=preserve_capacity,
+        )
+        trace_layerwise_t1 = time.perf_counter()
+        if layerwise is not None:
+            if trace:
+                print(
+                    "APC_DISK_TRACE restore "
+                    f"blocks={len(block_hashes)} segments={len(segments)} "
+                    f"layerwise={trace_layerwise_t1 - trace_layerwise_t0:.3f}s "
+                    f"total={trace_layerwise_t1 - trace_t0:.3f}s",
+                    flush=True,
+                )
+            return layerwise
+
         trace_load_t0 = time.perf_counter()
         loaded_segments = []
-        for shard_path, block_indices in segments:
+        last_segment_idx = len(segments) - 1
+        for segment_idx, (shard_path, block_indices) in enumerate(segments):
             loaded_segments.append(
                 self._load_layer_major_segment(
                     shard_path,
                     block_indices,
                     preserve_capacity=(
                         preserve_capacity
-                        and len(segments) == 1
+                        and segment_idx == last_segment_idx
                         and bool(block_indices)
                         and block_indices[0] == 0
                     ),
@@ -1332,7 +1562,7 @@ class DiskBlockStore:
             else:
                 out.append(None)
 
-        # Touch atime so LRU eviction prefers truly-cold shards.
+        # Touch recency timestamp so LRU eviction prefers truly-cold shards.
         try:
             os.utime(shard_path, None)
         except OSError:
@@ -1340,7 +1570,7 @@ class DiskBlockStore:
         return out
 
     def save_batch(self, blocks: List["APCBlock"]) -> None:
-        """Schedule a single shard write containing ``blocks``. Returns
+        """Schedule segment-shard writes containing ``blocks``. Returns
         immediately; the writer thread does the safetensors save + atomic
         rename + index update.
         """
@@ -1361,13 +1591,13 @@ class DiskBlockStore:
                     values=list(b.values),
                 )
             )
+            if len(snapshots) >= self._shard_max_blocks:
+                self._enqueue_block_snapshots(snapshots)
+                snapshots = []
         if not snapshots:
             return
 
-        block_hashes = [b.block_hash for b in snapshots]
-        self._enqueue_shard(
-            self._shard_id_for(block_hashes), block_hashes, snapshots
-        )
+        self._enqueue_block_snapshots(snapshots)
 
     def save_layer_major_blocks(
         self,
@@ -1383,15 +1613,33 @@ class DiskBlockStore:
         """
         if not blocks or not layer_keys or not layer_values:
             return
-        block_hashes = [b.block_hash for b in blocks]
-        snapshot = _DiskLayerMajorSnapshot(
-            blocks=list(blocks),
-            layer_keys=list(layer_keys),
-            layer_values=list(layer_values),
-            block_size=int(block_size),
-        )
+        shared_layer_keys = list(layer_keys)
+        shared_layer_values = list(layer_values)
+        all_block_hashes = [b.block_hash for b in blocks]
+        store_id = self._shard_id_for(all_block_hashes)
+        segment_count = (
+            len(blocks) + self._shard_max_blocks - 1
+        ) // self._shard_max_blocks
+        for start in range(0, len(blocks), self._shard_max_blocks):
+            chunk = list(blocks[start : start + self._shard_max_blocks])
+            block_hashes = [b.block_hash for b in chunk]
+            snapshot = _DiskLayerMajorSnapshot(
+                blocks=chunk,
+                layer_keys=shared_layer_keys,
+                layer_values=shared_layer_values,
+                block_size=int(block_size),
+                store_id=store_id,
+                segment_index=start // self._shard_max_blocks,
+                segment_count=segment_count,
+            )
+            self._enqueue_shard(
+                self._shard_id_for(block_hashes), block_hashes, snapshot
+            )
+
+    def _enqueue_block_snapshots(self, snapshots: List[_DiskBlockSnapshot]) -> None:
+        block_hashes = [b.block_hash for b in snapshots]
         self._enqueue_shard(
-            self._shard_id_for(block_hashes), block_hashes, snapshot
+            self._shard_id_for(block_hashes), block_hashes, list(snapshots)
         )
 
     def _enqueue_shard(
@@ -1484,6 +1732,9 @@ class DiskBlockStore:
             raise ValueError("layer-major disk snapshot has mismatched K/V layers")
 
         metadata: dict[str, str] = {}
+        metadata["store_id"] = snapshot.store_id
+        metadata["segment_index"] = str(int(snapshot.segment_index))
+        metadata["segment_count"] = str(int(snapshot.segment_count))
         for idx, b in enumerate(blocks):
             metadata[f"b{idx}_meta"] = json.dumps({
                 "block_hash": int(b.block_hash),
@@ -1604,6 +1855,12 @@ class DiskBlockStore:
                         self._in_flight.pop(int(block_hash), None)
                 ev.set()
                 self._q.task_done()
+                # Layer-major segment payloads share references to the full
+                # source KV cache. Drop the last processed payload promptly
+                # instead of retaining it in this thread's frame until the
+                # next queue item arrives.
+                payload = None
+                item = None
 
     def close(self) -> None:
         self._stop.set()

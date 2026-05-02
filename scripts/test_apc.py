@@ -259,6 +259,8 @@ def test_disk_layer_major_warm_prefix() -> None:
     print("\n[8/8] Disk layer-major warm prefix")
     bs = 16
     root = tempfile.mkdtemp(prefix="apc-disk-test-")
+    old_shard_max = os.environ.get("APC_DISK_SHARD_MAX_BLOCKS")
+    os.environ["APC_DISK_SHARD_MAX_BLOCKS"] = "1"
     try:
         n_layers, n_heads, head_dim = 2, 1, 8
         seq_len = 3 * bs
@@ -271,6 +273,12 @@ def test_disk_layer_major_warm_prefix() -> None:
         _info("memory pool stores bounded subset", len(nb) == 1)
         mgr.release(nb)
         disk.close()
+        shard_count = sum(
+            1
+            for name in os.listdir(os.path.join(root, "unit"))
+            if name.startswith("shard_") and name.endswith(".safetensors")
+        )
+        _info("disk splits prefix into segment shards", shard_count == 3)
 
         disk = DiskBlockStore(root, namespace="unit")
         mgr = APCManager(num_blocks=16, block_size=bs, disk=disk)
@@ -292,8 +300,31 @@ def test_disk_layer_major_warm_prefix() -> None:
             "disk restore does not populate APCBlock pool",
             mgr.stats_snapshot()["pool_used"] == 0,
         )
+        bytes_before_evict = disk.disk_bytes
+        disk.max_bytes = int(bytes_before_evict * 0.75)
+        evicted = disk._maybe_evict()
+        shard_count_after = sum(
+            1
+            for name in os.listdir(os.path.join(root, "unit"))
+            if name.startswith("shard_") and name.endswith(".safetensors")
+        )
+        _info("disk evicts segment shards", evicted > 0)
+        _info(
+            "segment eviction keeps part of prefix",
+            0 < shard_count_after < shard_count,
+        )
+        warm_after_evict, matched_after_evict = mgr.lookup_prefix_disk_cache(toks)
+        _info(
+            "segment eviction preserves usable prefix",
+            warm_after_evict is not None
+            and 0 < matched_after_evict < seq_len,
+        )
         disk.close()
     finally:
+        if old_shard_max is None:
+            os.environ.pop("APC_DISK_SHARD_MAX_BLOCKS", None)
+        else:
+            os.environ["APC_DISK_SHARD_MAX_BLOCKS"] = old_shard_max
         shutil.rmtree(root, ignore_errors=True)
 
 
