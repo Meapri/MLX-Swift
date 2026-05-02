@@ -409,6 +409,42 @@ class PromptCacheState:
         self.cache = kv_cache
 
 
+def _prime_cached_prefix_rope_state(
+    model: nn.Module,
+    full_input_ids: mx.array,
+    mask: Optional[mx.array],
+    kwargs: Dict[str, Any],
+) -> None:
+    """Prime Qwen-style mRoPE metadata before a cached-prefix trim.
+
+    Qwen VL language models keep ``_rope_deltas`` on the model object and use
+    it when continuing from a non-empty KV cache. If APC trims the prompt to
+    only the uncached suffix, the suffix alone is not enough to recompute the
+    original prompt's RoPE delta, so derive it from the full prompt first.
+    """
+    lm = getattr(model, "language_model", None)
+    get_rope_index = getattr(lm, "get_rope_index", None)
+    if not callable(get_rope_index):
+        return
+    if not (hasattr(lm, "_rope_deltas") or hasattr(lm, "_position_ids")):
+        return
+    try:
+        position_ids, rope_deltas = get_rope_index(
+            full_input_ids,
+            kwargs.get("image_grid_thw", None),
+            kwargs.get("video_grid_thw", None),
+            mask,
+        )
+    except Exception as e:
+        logger.debug("Could not prime cached-prefix RoPE state: %s", e)
+        return
+    if hasattr(lm, "_position_ids"):
+        lm._position_ids = position_ids
+    if hasattr(lm, "_rope_deltas"):
+        lm._rope_deltas = rope_deltas
+    kwargs["rope_deltas"] = rope_deltas
+
+
 def _speculative_walk(
     draft_tokens: mx.array,
     target_tokens: mx.array,
@@ -1077,6 +1113,7 @@ def stream_generate(
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
         if prefix_len > 0 and prefix_len < input_ids.shape[1]:
             reused_prefix_len = prefix_len
+            _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs)
             # Trim to only new tokens
             input_ids = input_ids[:, prefix_len:]
             # Only skip vision if no image tokens in the new (trimmed) tokens
@@ -1110,9 +1147,33 @@ def stream_generate(
         matched_blocks, prefix_len = apc_manager.lookup_prefix(
             full_input_ids_list, extra_hash=apc_extra_hash
         )
-        if prefix_len > 0 and prefix_len < input_ids.shape[1]:
+        disk_prompt_cache = None
+        disk_prefix_len = 0
+        if prefix_len < input_ids.shape[1]:
+            disk_prompt_cache, disk_prefix_len = apc_manager.lookup_prefix_disk_cache(
+                full_input_ids_list,
+                extra_hash=apc_extra_hash,
+                min_prefix_tokens=prefix_len,
+                allow_memory_overlap=prefix_len > 0,
+            )
+        if disk_prefix_len > prefix_len and disk_prefix_len < input_ids.shape[1]:
+            if matched_blocks:
+                apc_manager.release(matched_blocks)
+            reused_prefix_len = disk_prefix_len
+            _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs)
+            input_ids = input_ids[:, disk_prefix_len:]
+            image_token_id = getattr(model.config, "image_token_id", None) or getattr(
+                model.config, "image_token_index", None
+            )
+            new_ids = input_ids.flatten().tolist()
+            if image_token_id is None or image_token_id not in new_ids:
+                pixel_values = None
+                kwargs.pop("cached_image_features", None)
+            kwargs["prompt_cache"] = disk_prompt_cache
+        elif prefix_len > 0 and prefix_len < input_ids.shape[1]:
             apc_blocks_in_use = matched_blocks
             reused_prefix_len = prefix_len
+            _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs)
             input_ids = input_ids[:, prefix_len:]
             image_token_id = getattr(model.config, "image_token_id", None) or getattr(
                 model.config, "image_token_index", None
@@ -2230,19 +2291,40 @@ class BatchGenerator:
         matched, prefix_len = self.apc_manager.lookup_prefix(
             ids_list, extra_hash=extra_hash
         )
-        if prefix_len <= 0 or prefix_len >= len(ids_list):
+        warm_cache = None
+        disk_prefix_len = 0
+        if prefix_len < len(ids_list):
+            warm_cache, disk_prefix_len = self.apc_manager.lookup_prefix_disk_cache(
+                ids_list,
+                extra_hash=extra_hash,
+                min_prefix_tokens=prefix_len,
+                allow_memory_overlap=prefix_len > 0,
+            )
+        if disk_prefix_len > prefix_len and disk_prefix_len < len(ids_list):
             if matched:
                 self.apc_manager.release(matched)
-            return None
-        if image_token_id is not None and image_token_id in ids_list[:prefix_len]:
+            if image_token_id is not None and image_token_id in ids_list[:disk_prefix_len]:
+                return None
+            return {
+                "matched_blocks": [],
+                "warm_cache": warm_cache,
+                "prefix_len": disk_prefix_len,
+                "extra_hash": extra_hash,
+                "full_input_ids": list(ids_list),
+            }
+        if prefix_len > 0 and prefix_len < len(ids_list):
+            if image_token_id is not None and image_token_id in ids_list[:prefix_len]:
+                self.apc_manager.release(matched)
+                return None
+            return {
+                "matched_blocks": matched,
+                "prefix_len": prefix_len,
+                "extra_hash": extra_hash,
+                "full_input_ids": list(ids_list),
+            }
+        if matched:
             self.apc_manager.release(matched)
-            return None
-        return {
-            "matched_blocks": matched,
-            "prefix_len": prefix_len,
-            "extra_hash": extra_hash,
-            "full_input_ids": list(ids_list),
-        }
+        return None
 
     def _build_mixed_prompt_batch(
         self, sequences: List[tuple]
@@ -2335,7 +2417,7 @@ class BatchGenerator:
                 "extra_hash": picks[i]["extra_hash"]
                 if picks[i]
                 else self._apc_extra_hash(prompt_kwargs_list[i] or {}),
-                "apc_blocks": picks[i]["matched_blocks"] if picks[i] else [],
+                "apc_blocks": picks[i].get("matched_blocks", []) if picks[i] else [],
             }
             for i in range(len(sequences))
         ]

@@ -15,7 +15,9 @@ overhead).
 Eviction is LRU with reference counting: blocks are kept alive while
 ``ref_cnt > 0`` and the free queue is a doubly-linked list embedded in
 ``APCBlock`` for O(1) move-to-tail. All blocks are pre-allocated as a pool
-to avoid Python object churn. Pure in-memory; no persistence across restarts.
+to avoid Python object churn. When ``APC_DISK_PATH`` is configured, full
+blocks are also written to a shard-based SSD tier and can be restored after
+process restart through a direct-read prompt-cache path.
 
 Numerical note: APC itself is *exact*. The K/V tensors stored in the block
 pool are byte-identical to what a fresh prefill would produce — the cache
@@ -127,6 +129,18 @@ class APCBlock:
     last_used: float = 0.0
     prev: Optional["APCBlock"] = None
     next: Optional["APCBlock"] = None
+
+
+@dataclass(frozen=True)
+class _DiskBlockSnapshot:
+    """Immutable view of an APC block for the asynchronous disk writer."""
+
+    block_hash: int
+    parent_hash: int
+    extra_hash: int
+    token_ids: Tuple[int, ...]
+    keys: List[mx.array]
+    values: List[mx.array]
 
 
 @dataclass
@@ -1285,30 +1299,48 @@ class DiskBlockStore:
         """
         if not blocks:
             return
-        shard_id = self._shard_id_for([b.block_hash for b in blocks])
+
+        snapshots: List[_DiskBlockSnapshot] = []
+        for b in blocks:
+            if b.block_hash is None or b.keys is None or b.values is None:
+                continue
+            snapshots.append(
+                _DiskBlockSnapshot(
+                    block_hash=int(b.block_hash),
+                    parent_hash=int(b.parent_hash),
+                    extra_hash=int(b.extra_hash),
+                    token_ids=tuple(int(t) for t in b.token_ids),
+                    keys=list(b.keys),
+                    values=list(b.values),
+                )
+            )
+        if not snapshots:
+            return
+
+        shard_id = self._shard_id_for([b.block_hash for b in snapshots])
         path = self._shard_path(shard_id)
         # Already on disk? Just dedup.
         if path.exists():
             with self._index_lock:
                 # Make sure index reflects it (e.g. after restart).
-                for idx, b in enumerate(blocks):
+                for idx, b in enumerate(snapshots):
                     self._index.setdefault(b.block_hash, (path, idx))
             return
 
         ev = threading.Event()
         with self._in_flight_lock:
-            for b in blocks:
+            for b in snapshots:
                 self._in_flight[b.block_hash] = ev
         try:
-            self._q.put_nowait((shard_id, blocks, ev))
+            self._q.put_nowait((shard_id, snapshots, ev))
         except queue.Full:
             with self._in_flight_lock:
-                for b in blocks:
+                for b in snapshots:
                     self._in_flight.pop(b.block_hash, None)
             ev.set()
             logger.warning(
                 "APC disk write queue full; dropping shard with %d blocks",
-                len(blocks),
+                len(snapshots),
             )
 
     def _writer_loop(self) -> None:
@@ -1523,6 +1555,8 @@ class APCManager:
         token_ids: Sequence[int],
         extra_hash: int = 0,
         max_prefix_tokens: Optional[int] = None,
+        min_prefix_tokens: int = 0,
+        allow_memory_overlap: bool = False,
     ) -> Tuple[Optional[List[Any]], int]:
         """Return a ready prompt cache from a layer-major disk shard.
 
@@ -1562,7 +1596,11 @@ class APCManager:
                 # If the prefix is already in memory, the normal memory path is
                 # better and preserves the expected ref-count lifecycle.
                 b_mem = self.hash_table.get(h)
-                if b_mem is not None and b_mem.token_ids == chunk:
+                if (
+                    not allow_memory_overlap
+                    and b_mem is not None
+                    and b_mem.token_ids == chunk
+                ):
                     return None, 0
                 if not self.disk.has(h):
                     break
@@ -1571,6 +1609,9 @@ class APCManager:
                 parent = h
 
             if not block_hashes:
+                return None, 0
+            matched_tokens = len(block_hashes) * self.block_size
+            if matched_tokens <= min_prefix_tokens:
                 return None, 0
 
             loaded = self.disk.load_layer_major_prefix(block_hashes)
@@ -1590,7 +1631,6 @@ class APCManager:
                 if stored_tokens != chunk or stored_extra != extra_hash:
                     return None, 0
 
-            matched_tokens = len(block_hashes) * self.block_size
             warm_cache = make_warm_kv_cache_from_layers(keys, values, matched_tokens)
             self.stats.disk_hits += len(block_hashes)
             self.stats.hits += 1
@@ -1648,6 +1688,7 @@ class APCManager:
             n_full = len(token_ids) // self.block_size
             skip_full = skip_first_n_tokens // self.block_size
             new_blocks: List[APCBlock] = []
+            disk_blocks: List[APCBlock] = []
             parent = SEED_PARENT_HASH
             # Recompute hash chain over already-cached prefix to get parent for first new block.
             for i in range(skip_full):
@@ -1663,7 +1704,10 @@ class APCManager:
                 h = _hash_tokens(parent, chunk, extra_hash)
                 existing = self.hash_table.get(h)
                 if existing is not None and existing.token_ids == chunk:
-                    new_blocks.append(self._acquire_existing(existing))
+                    acquired = self._acquire_existing(existing)
+                    new_blocks.append(acquired)
+                    if self.disk is not None and not self.disk.has(h):
+                        disk_blocks.append(acquired)
                     parent = h
                     continue
                 b = self._evict_lru()
@@ -1695,9 +1739,17 @@ class APCManager:
                 b.ref_cnt = 1
                 self.hash_table[h] = b
                 new_blocks.append(b)
+                if self.disk is not None:
+                    disk_blocks.append(b)
                 self.stats.stores += 1
                 self.stats.served_tokens += self.block_size
                 parent = h
+            if self.disk is not None and disk_blocks:
+                try:
+                    self.disk.save_batch(disk_blocks)
+                    self.stats.disk_writes += len(disk_blocks)
+                except Exception as e:
+                    logger.warning("APC disk save scheduling failed: %s", e)
             self.stats.pool_used = sum(1 for x in self.pool if x.block_hash is not None)
             return new_blocks
 
@@ -1850,9 +1902,20 @@ def make_warm_batch_kv_cache_multi(
     if max_prefix == 0:
         return [], 0
 
+    def layer_tensors(pick: dict, layer_idx: int) -> Tuple[mx.array, mx.array]:
+        warm_cache = pick.get("warm_cache")
+        if warm_cache is not None:
+            c = warm_cache[layer_idx]
+            prefix_len = pick["prefix_len"]
+            return c.keys[..., :prefix_len, :], c.values[..., :prefix_len, :]
+        blocks = pick["matched_blocks"]
+        ks = [b.keys[layer_idx] for b in blocks]
+        vs = [b.values[layer_idx] for b in blocks]
+        return mx.concatenate(ks, axis=2), mx.concatenate(vs, axis=2)
+
     # Discover dtype / head dims from the first non-empty pick.
     sample = next(p for p in picks if p)
-    sample_k = sample["matched_blocks"][0].keys[0]  # [1, H, bs, D]
+    sample_k, _ = layer_tensors(sample, 0)  # [1, H, prefix_len, D]
     n_kv_heads = sample_k.shape[1]
     head_dim = sample_k.shape[-1]
     dtype = sample_k.dtype
@@ -1873,11 +1936,7 @@ def make_warm_batch_kv_cache_multi(
                     mx.zeros((1, n_kv_heads, max_prefix, head_dim), dtype=dtype)
                 )
                 continue
-            blocks = pick["matched_blocks"]
-            ks = [b.keys[layer_idx] for b in blocks]
-            vs = [b.values[layer_idx] for b in blocks]
-            warm_k = mx.concatenate(ks, axis=2)  # [1, H, prefix_len, D]
-            warm_v = mx.concatenate(vs, axis=2)
+            warm_k, warm_v = layer_tensors(pick, layer_idx)
             lp = max_prefix - pick["prefix_len"]
             if lp > 0:
                 pad_k = mx.zeros((1, n_kv_heads, lp, head_dim), dtype=dtype)
@@ -1953,19 +2012,45 @@ def model_supports_apc(language_model: Any) -> bool:
 def from_env(model_namespace: Optional[str] = None) -> Optional[APCManager]:
     """Build an APCManager from env vars when ``APC_ENABLED=1``, else None.
 
-    APC is currently memory-only. Disk persistence is intentionally not wired
-    from env because the disk read/restore path is not part of the active
-    request flow.
+    When ``APC_DISK_PATH`` is set, also wires up the shard-based SSD tier.
+    The disk read path defaults to direct file reads so restored K/V tensors
+    are MLX-owned buffers rather than mmap-backed safetensors views.
     """
     if os.environ.get("APC_ENABLED", "0") not in ("1", "true", "True", "yes"):
         return None
     block_size = int(os.environ.get("APC_BLOCK_SIZE", DEFAULT_BLOCK_SIZE))
     num_blocks = int(os.environ.get("APC_NUM_BLOCKS", DEFAULT_NUM_BLOCKS))
 
+    disk: Optional[DiskBlockStore] = None
+    disk_path = os.environ.get("APC_DISK_PATH")
+    if disk_path:
+        ns = model_namespace or os.environ.get("APC_DISK_NAMESPACE", "default")
+        max_gb = float(os.environ.get("APC_DISK_MAX_GB", 0))
+        max_bytes = int(max_gb * (1 << 30)) if max_gb > 0 else None
+        workers = int(os.environ.get("APC_DISK_WORKERS", "1"))
+        try:
+            disk = DiskBlockStore(
+                Path(disk_path).expanduser(),
+                namespace=ns,
+                num_workers=workers,
+                max_bytes=max_bytes,
+            )
+            cap_str = f"{max_gb:.1f} GB" if max_bytes else "unbounded"
+            logger.info(
+                "APC disk tier at %s (ns=%s, cap=%s, read_mode=%s)",
+                disk.dir,
+                ns,
+                cap_str,
+                disk._read_mode,
+            )
+        except Exception as e:
+            logger.warning("APC disk tier disabled (init failed): %s", e)
+
     logger.info(
-        "APC enabled (block_size=%d, num_blocks=%d, hash=%s, disk=False)",
+        "APC enabled (block_size=%d, num_blocks=%d, hash=%s, disk=%s)",
         block_size,
         num_blocks,
         "sha256" if _hash_use_sha256() else "fast",
+        bool(disk),
     )
-    return APCManager(num_blocks=num_blocks, block_size=block_size, disk=None)
+    return APCManager(num_blocks=num_blocks, block_size=block_size, disk=disk)
