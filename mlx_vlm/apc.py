@@ -1832,7 +1832,7 @@ def make_warm_kv_cache_from_layers(
     layer_values: List[mx.array],
     prefix_len: int,
 ) -> List[Any]:
-    """Build ``KVCache`` objects from already-concatenated per-layer K/V."""
+    """Build ``KVCache`` objects from already-concatenated disk-restored K/V."""
     from mlx_lm.models.cache import KVCache
 
     out: List[Any] = []
@@ -1842,6 +1842,7 @@ def make_warm_kv_cache_from_layers(
         c.values = v
         c.offset = prefix_len
         out.append(c)
+    mx.clear_cache()
     return out
 
 
