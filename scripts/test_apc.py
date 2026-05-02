@@ -266,9 +266,9 @@ def test_disk_layer_major_warm_prefix() -> None:
         keys, vals = _make_fake_kv(n_layers, n_heads, seq_len, head_dim)
 
         disk = DiskBlockStore(root, namespace="unit")
-        mgr = APCManager(num_blocks=16, block_size=bs, disk=disk)
+        mgr = APCManager(num_blocks=1, block_size=bs, disk=disk)
         nb = mgr.store_kv_blocks(toks, keys, vals)
-        _info("disk store accepts 3 blocks", len(nb) == 3)
+        _info("memory pool stores bounded subset", len(nb) == 1)
         mgr.release(nb)
         disk.close()
 

@@ -143,6 +143,27 @@ class _DiskBlockSnapshot:
     values: List[mx.array]
 
 
+@dataclass(frozen=True)
+class _DiskLayerMajorBlock:
+    """Per-block metadata for a direct layer-major disk write."""
+
+    block_hash: int
+    parent_hash: int
+    extra_hash: int
+    token_ids: Tuple[int, ...]
+    source_block_idx: int
+
+
+@dataclass(frozen=True)
+class _DiskLayerMajorSnapshot:
+    """Direct shard snapshot from the live per-layer KV cache."""
+
+    blocks: List[_DiskLayerMajorBlock]
+    layer_keys: List[mx.array]
+    layer_values: List[mx.array]
+    block_size: int
+
+
 @dataclass
 class APCStats:
     hits: int = 0
@@ -389,7 +410,7 @@ class DiskBlockStore:
     SHA-256 prefix of the contained block hashes; identical stores
     naturally dedup. Inside the file:
 
-      * tensor ``b{idx}_k{layer}`` / ``b{idx}_v{layer}`` per block / layer
+      * tensor ``k{layer}`` / ``v{layer}`` per layer in runtime KV layout
       * metadata: ``block_hashes`` (csv), ``num_layers``, ``block_size``,
         and ``b{idx}_meta`` (JSON) per block carrying parent_hash,
         extra_hash, and the token tuple
@@ -1343,128 +1364,244 @@ class DiskBlockStore:
         if not snapshots:
             return
 
-        shard_id = self._shard_id_for([b.block_hash for b in snapshots])
+        block_hashes = [b.block_hash for b in snapshots]
+        self._enqueue_shard(
+            self._shard_id_for(block_hashes), block_hashes, snapshots
+        )
+
+    def save_layer_major_blocks(
+        self,
+        blocks: List[_DiskLayerMajorBlock],
+        layer_keys: Sequence[mx.array],
+        layer_values: Sequence[mx.array],
+        block_size: int,
+    ) -> None:
+        """Schedule a layer-major shard write directly from a KV cache.
+
+        This avoids building thousands of per-block MLX tensors when the
+        caller only needs durable disk persistence for future warm restores.
+        """
+        if not blocks or not layer_keys or not layer_values:
+            return
+        block_hashes = [b.block_hash for b in blocks]
+        snapshot = _DiskLayerMajorSnapshot(
+            blocks=list(blocks),
+            layer_keys=list(layer_keys),
+            layer_values=list(layer_values),
+            block_size=int(block_size),
+        )
+        self._enqueue_shard(
+            self._shard_id_for(block_hashes), block_hashes, snapshot
+        )
+
+    def _enqueue_shard(
+        self,
+        shard_id: str,
+        block_hashes: Sequence[int],
+        payload: Any,
+    ) -> None:
         path = self._shard_path(shard_id)
         # Already on disk? Just dedup.
         if path.exists():
             with self._index_lock:
                 # Make sure index reflects it (e.g. after restart).
-                for idx, b in enumerate(snapshots):
-                    self._index.setdefault(b.block_hash, (path, idx))
+                for idx, block_hash in enumerate(block_hashes):
+                    self._index.setdefault(int(block_hash), (path, idx))
             return
 
         ev = threading.Event()
         with self._in_flight_lock:
-            for b in snapshots:
-                self._in_flight[b.block_hash] = ev
+            for block_hash in block_hashes:
+                self._in_flight[int(block_hash)] = ev
         try:
-            self._q.put_nowait((shard_id, snapshots, ev))
+            self._q.put_nowait((shard_id, list(block_hashes), payload, ev))
         except queue.Full:
             with self._in_flight_lock:
-                for b in snapshots:
-                    self._in_flight.pop(b.block_hash, None)
+                for block_hash in block_hashes:
+                    self._in_flight.pop(int(block_hash), None)
             ev.set()
             logger.warning(
                 "APC disk write queue full; dropping shard with %d blocks",
-                len(snapshots),
+                len(block_hashes),
             )
 
+    @staticmethod
+    def _pad_layer_major_arrays(
+        layer_keys: List[mx.array],
+        layer_values: List[mx.array],
+    ) -> Tuple[List[mx.array], List[mx.array]]:
+        if not layer_keys:
+            return layer_keys, layer_values
+        total_tokens = int(layer_keys[0].shape[2])
+        kv_step = 256
+        capacity = ((total_tokens + 1 + kv_step - 1) // kv_step) * kv_step
+        pad_tokens = capacity - total_tokens
+        if pad_tokens <= 0:
+            return layer_keys, layer_values
+
+        padded_keys: List[mx.array] = []
+        padded_values: List[mx.array] = []
+        for k, v in zip(layer_keys, layer_values):
+            if len(k.shape) != 4 or len(v.shape) != 4:
+                padded_keys.append(k)
+                padded_values.append(v)
+                continue
+            k_pad_shape = (*k.shape[:2], pad_tokens, k.shape[3])
+            v_pad_shape = (*v.shape[:2], pad_tokens, v.shape[3])
+            padded_keys.append(
+                mx.concatenate([k, mx.zeros(k_pad_shape, dtype=k.dtype)], axis=2)
+            )
+            padded_values.append(
+                mx.concatenate([v, mx.zeros(v_pad_shape, dtype=v.dtype)], axis=2)
+            )
+        return padded_keys, padded_values
+
+    @staticmethod
+    def _contiguous_ranges(indices: Sequence[int]) -> List[Tuple[int, int]]:
+        if not indices:
+            return []
+        ranges: List[Tuple[int, int]] = []
+        start = prev = int(indices[0])
+        for idx_raw in indices[1:]:
+            idx = int(idx_raw)
+            if idx == prev + 1:
+                prev = idx
+                continue
+            ranges.append((start, prev + 1))
+            start = prev = idx
+        ranges.append((start, prev + 1))
+        return ranges
+
+    def _write_layer_major_snapshot(
+        self,
+        path: Path,
+        snapshot: _DiskLayerMajorSnapshot,
+    ) -> List[int]:
+        blocks = snapshot.blocks
+        if not blocks:
+            return []
+        if len(snapshot.layer_keys) != len(snapshot.layer_values):
+            raise ValueError("layer-major disk snapshot has mismatched K/V layers")
+
+        metadata: dict[str, str] = {}
+        for idx, b in enumerate(blocks):
+            metadata[f"b{idx}_meta"] = json.dumps({
+                "block_hash": int(b.block_hash),
+                "parent_hash": int(b.parent_hash),
+                "extra_hash": int(b.extra_hash),
+                "token_ids": [int(t) for t in b.token_ids],
+            })
+
+        ranges = self._contiguous_ranges([b.source_block_idx for b in blocks])
+        layer_keys: List[mx.array] = []
+        layer_values: List[mx.array] = []
+        bs = int(snapshot.block_size)
+        for k_src, v_src in zip(snapshot.layer_keys, snapshot.layer_values):
+            k_parts = [k_src[..., start * bs : end * bs, :] for start, end in ranges]
+            v_parts = [v_src[..., start * bs : end * bs, :] for start, end in ranges]
+            layer_keys.append(
+                k_parts[0] if len(k_parts) == 1 else mx.concatenate(k_parts, axis=2)
+            )
+            layer_values.append(
+                v_parts[0] if len(v_parts) == 1 else mx.concatenate(v_parts, axis=2)
+            )
+
+        layer_keys, layer_values = self._pad_layer_major_arrays(
+            layer_keys, layer_values
+        )
+        self._save_layer_major_shard(path, blocks, metadata, layer_keys, layer_values, bs)
+        return [b.block_hash for b in blocks]
+
+    def _write_block_snapshot(
+        self,
+        path: Path,
+        blocks: List[_DiskBlockSnapshot],
+    ) -> List[int]:
+        metadata: dict[str, str] = {}
+        num_layers = len(blocks[0].keys) if blocks and blocks[0].keys else 0
+        for idx, b in enumerate(blocks):
+            if b.keys is None or b.values is None:
+                continue
+            metadata[f"b{idx}_meta"] = json.dumps({
+                "block_hash": int(b.block_hash),
+                "parent_hash": int(b.parent_hash),
+                "extra_hash": int(b.extra_hash),
+                "token_ids": [int(t) for t in b.token_ids],
+            })
+        layer_keys: List[mx.array] = []
+        layer_values: List[mx.array] = []
+        for l in range(num_layers):
+            layer_keys.append(
+                mx.concatenate(
+                    [b.keys[l] for b in blocks if b.keys is not None], axis=2
+                )
+            )
+            layer_values.append(
+                mx.concatenate(
+                    [b.values[l] for b in blocks if b.values is not None], axis=2
+                )
+            )
+        layer_keys, layer_values = self._pad_layer_major_arrays(
+            layer_keys, layer_values
+        )
+        block_size = len(blocks[0].token_ids) if blocks and blocks[0].token_ids else 0
+        self._save_layer_major_shard(
+            path, blocks, metadata, layer_keys, layer_values, block_size
+        )
+        return [b.block_hash for b in blocks]
+
+    def _save_layer_major_shard(
+        self,
+        path: Path,
+        blocks: Sequence[Any],
+        metadata: dict[str, str],
+        layer_keys: List[mx.array],
+        layer_values: List[mx.array],
+        block_size: int,
+    ) -> None:
+        arrays: dict[str, mx.array] = {}
+        for l, (k, v) in enumerate(zip(layer_keys, layer_values)):
+            arrays[f"k{l}"] = k
+            arrays[f"v{l}"] = v
+        metadata["layout"] = "layer_major_v2"
+        metadata["block_hashes"] = ",".join(str(int(b.block_hash)) for b in blocks)
+        metadata["num_layers"] = str(len(layer_keys))
+        metadata["block_size"] = str(int(block_size))
+        mx.eval(list(arrays.values()))
+        # mx.save_safetensors only accepts ".safetensors"; route
+        # the temp through a sibling that retains the suffix.
+        tag = f"{os.getpid()}-{threading.get_ident()}"
+        tmp = path.parent / f"{path.stem}.{tag}{self.SUFFIX}"
+        mx.save_safetensors(str(tmp), arrays, metadata=metadata)
+        os.replace(tmp, path)
+        try:
+            self._disk_bytes += path.stat().st_size
+        except OSError:
+            pass
+        with self._index_lock:
+            for idx, b in enumerate(blocks):
+                self._index[int(b.block_hash)] = (path, idx)
+        self._maybe_evict()
+
     def _writer_loop(self) -> None:
-        import json as _json
         while True:
             item = self._q.get()
             if item is None:
                 self._q.task_done()
                 break
-            shard_id, blocks, ev = item
+            shard_id, block_hashes, payload, ev = item
             path = self._shard_path(shard_id)
             try:
-                # Build the tensor dict and metadata for this shard.
-                arrays: dict[str, mx.array] = {}
-                metadata: dict[str, str] = {}
-                num_layers = len(blocks[0].keys) if blocks[0].keys else 0
-                for idx, b in enumerate(blocks):
-                    if b.keys is None or b.values is None:
-                        continue
-                    metadata[f"b{idx}_meta"] = _json.dumps({
-                        "block_hash": int(b.block_hash),
-                        "parent_hash": int(b.parent_hash),
-                        "extra_hash": int(b.extra_hash),
-                        "token_ids": [int(t) for t in b.token_ids],
-                    })
-                layer_keys: List[mx.array] = []
-                layer_values: List[mx.array] = []
-                for l in range(num_layers):
-                    layer_keys.append(
-                        mx.concatenate(
-                            [b.keys[l] for b in blocks if b.keys is not None], axis=2
-                        )
-                    )
-                    layer_values.append(
-                        mx.concatenate(
-                            [b.values[l] for b in blocks if b.values is not None], axis=2
-                        )
-                    )
-                if layer_keys:
-                    total_tokens = int(layer_keys[0].shape[2])
-                    kv_step = 256
-                    capacity = ((total_tokens + 1 + kv_step - 1) // kv_step) * kv_step
-                    pad_tokens = capacity - total_tokens
-                    if pad_tokens > 0:
-                        padded_keys: List[mx.array] = []
-                        padded_values: List[mx.array] = []
-                        for k, v in zip(layer_keys, layer_values):
-                            if len(k.shape) != 4 or len(v.shape) != 4:
-                                padded_keys.append(k)
-                                padded_values.append(v)
-                                continue
-                            k_pad_shape = (*k.shape[:2], pad_tokens, k.shape[3])
-                            v_pad_shape = (*v.shape[:2], pad_tokens, v.shape[3])
-                            padded_keys.append(
-                                mx.concatenate(
-                                    [k, mx.zeros(k_pad_shape, dtype=k.dtype)], axis=2
-                                )
-                            )
-                            padded_values.append(
-                                mx.concatenate(
-                                    [v, mx.zeros(v_pad_shape, dtype=v.dtype)], axis=2
-                                )
-                            )
-                        layer_keys = padded_keys
-                        layer_values = padded_values
-                for l, (k, v) in enumerate(zip(layer_keys, layer_values)):
-                    arrays[f"k{l}"] = k
-                    arrays[f"v{l}"] = v
-                metadata["layout"] = "layer_major_v2"
-                metadata["block_hashes"] = ",".join(
-                    str(int(b.block_hash)) for b in blocks
-                )
-                metadata["num_layers"] = str(num_layers)
-                metadata["block_size"] = str(
-                    len(blocks[0].token_ids) if blocks[0].token_ids else 0
-                )
-                mx.eval(list(arrays.values()))
-                # mx.save_safetensors only accepts ".safetensors"; route
-                # the temp through a sibling that retains the suffix.
-                tag = f"{os.getpid()}-{threading.get_ident()}"
-                tmp = path.parent / f"{path.stem}.{tag}{self.SUFFIX}"
-                mx.save_safetensors(str(tmp), arrays, metadata=metadata)
-                os.replace(tmp, path)
-                # Accounting + index update + maybe evict.
-                try:
-                    self._disk_bytes += path.stat().st_size
-                except OSError:
-                    pass
-                with self._index_lock:
-                    for idx, b in enumerate(blocks):
-                        self._index[b.block_hash] = (path, idx)
-                self._maybe_evict()
+                if isinstance(payload, _DiskLayerMajorSnapshot):
+                    block_hashes = self._write_layer_major_snapshot(path, payload)
+                else:
+                    block_hashes = self._write_block_snapshot(path, payload)
             except Exception as e:
                 logger.warning("APC disk shard save failed for %s: %s", path, e)
             finally:
                 with self._in_flight_lock:
-                    for b in blocks:
-                        self._in_flight.pop(b.block_hash, None)
+                    for block_hash in block_hashes:
+                        self._in_flight.pop(int(block_hash), None)
                 ev.set()
                 self._q.task_done()
 
@@ -1528,6 +1665,14 @@ class APCManager:
         # small relative to the model's recommended Apple-Silicon working set.
         self._disk_load_block_chunk = max(
             1, int(os.environ.get("APC_DISK_LOAD_BLOCK_CHUNK", "256"))
+        )
+        # Apple Metal has a per-process resource-count ceiling separate from
+        # byte memory. Qwen3-VL-4B stores 72 MLX tensors per APCBlock, so a
+        # very large pool can hit the ceiling before unified memory is scarce.
+        # Keep disk persistence going, but stop adding memory-pool blocks near
+        # the resource limit. Set to 0 to disable.
+        self._max_pool_tensors = max(
+            0, int(os.environ.get("APC_MAX_POOL_TENSORS", "450000"))
         )
 
     # ---------- LRU free queue (O(1)) ----------
@@ -1725,7 +1870,8 @@ class APCManager:
             n_full = len(token_ids) // self.block_size
             skip_full = skip_first_n_tokens // self.block_size
             new_blocks: List[APCBlock] = []
-            disk_blocks: List[APCBlock] = []
+            disk_blocks: List[_DiskLayerMajorBlock] = []
+            per_block_tensors = len(layer_keys) + len(layer_values)
             parent = SEED_PARENT_HASH
             # Recompute hash chain over already-cached prefix to get parent for first new block.
             for i in range(skip_full):
@@ -1739,18 +1885,49 @@ class APCManager:
                     int(t) for t in token_ids[i * self.block_size : (i + 1) * self.block_size]
                 )
                 h = _hash_tokens(parent, chunk, extra_hash)
+                if self.disk is not None and not self.disk.has(h):
+                    disk_blocks.append(
+                        _DiskLayerMajorBlock(
+                            block_hash=int(h),
+                            parent_hash=int(parent),
+                            extra_hash=int(extra_hash),
+                            token_ids=chunk,
+                            source_block_idx=i,
+                        )
+                    )
                 existing = self.hash_table.get(h)
                 if existing is not None and existing.token_ids == chunk:
                     acquired = self._acquire_existing(existing)
                     new_blocks.append(acquired)
-                    if self.disk is not None and not self.disk.has(h):
-                        disk_blocks.append(acquired)
+                    parent = h
+                    continue
+                if (
+                    self._max_pool_tensors > 0
+                    and per_block_tensors > 0
+                    and (len(self.hash_table) + 1) * per_block_tensors
+                    > self._max_pool_tensors
+                ):
+                    logger.debug(
+                        "APC pool tensor limit reached; skipping memory store "
+                        "at block %d/%d",
+                        i,
+                        n_full,
+                    )
+                    if self.disk is None:
+                        break
                     parent = h
                     continue
                 b = self._evict_lru()
                 if b is None:
-                    logger.debug("APC pool exhausted; stopping store at block %d/%d", i, n_full)
-                    break
+                    logger.debug(
+                        "APC pool exhausted; skipping memory store at block %d/%d",
+                        i,
+                        n_full,
+                    )
+                    if self.disk is None:
+                        break
+                    parent = h
+                    continue
                 start = i * self.block_size
                 end = start + self.block_size
                 # Deep-copy each slice into its own buffer so the block tensor
@@ -1776,14 +1953,14 @@ class APCManager:
                 b.ref_cnt = 1
                 self.hash_table[h] = b
                 new_blocks.append(b)
-                if self.disk is not None:
-                    disk_blocks.append(b)
                 self.stats.stores += 1
                 self.stats.served_tokens += self.block_size
                 parent = h
             if self.disk is not None and disk_blocks:
                 try:
-                    self.disk.save_batch(disk_blocks)
+                    self.disk.save_layer_major_blocks(
+                        disk_blocks, layer_keys, layer_values, self.block_size
+                    )
                     self.stats.disk_writes += len(disk_blocks)
                 except Exception as e:
                     logger.warning("APC disk save scheduling failed: %s", e)
