@@ -303,7 +303,7 @@ model_id = "Qwen/Qwen3-VL-4B-Instruct"
 model, processor = load(model_id)
 
 disk = DiskBlockStore(
-    Path("~/.cache/mlx-vlm/apc").expanduser(),
+    Path("~/.cache/mlx-vlm/caching").expanduser(),
     namespace=model_id,
     max_bytes=3 * (1 << 30),  # 3 GB disk cap; use None for uncapped
 )
@@ -376,7 +376,7 @@ Enable the persistent disk tier:
 ```sh
 APC_ENABLED=1 \
 APC_NUM_BLOCKS=4096 \
-APC_DISK_PATH=~/.cache/mlx-vlm/apc \
+APC_DISK_PATH=~/.cache/mlx-vlm/caching \
 APC_DISK_MAX_GB=3 \
 APC_DISK_SHARD_MAX_BLOCKS=256 \
 mlx_vlm.server --model Qwen/Qwen3-VL-4B-Instruct --port 8080
