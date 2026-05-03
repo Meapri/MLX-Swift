@@ -149,6 +149,8 @@ class GenerationArguments:
             kw["thinking_start_token"] = self.thinking_start_token
         if self.logits_processors is not None:
             kw["logits_processors"] = self.logits_processors
+        if self.tenant_id is not None:
+            kw["apc_tenant"] = self.tenant_id
         return kw
 
     def to_template_kwargs(self) -> dict:
@@ -395,6 +397,12 @@ class ResponseGenerator:
         data_kwargs.pop("vision_cache", None)
         data_kwargs.pop("_image_key", None)
         gen_kwargs = {**data_kwargs, **embed.to_dict()}
+        if images is not None:
+            gen_kwargs["_apc_image_hash"] = _apc.hash_image_payload(image_ref=images)
+        elif pixel_values is not None:
+            gen_kwargs["_apc_image_hash"] = _apc.hash_image_payload(
+                pixel_values=pixel_values
+            )
         return input_ids, gen_kwargs
 
     def _run(self):
@@ -1875,6 +1883,7 @@ async def responses_endpoint(request: Request):
                             vision_cache=model_cache.get("vision_cache"),
                             logits_processors=gen_args.logits_processors,
                             apc_manager=apc_manager,
+                            apc_tenant=gen_args.tenant_id,
                             **kwargs,
                         )
 
@@ -2356,6 +2365,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             vision_cache=model_cache.get("vision_cache"),
                             logits_processors=gen_args.logits_processors,
                             apc_manager=apc_manager,
+                            apc_tenant=gen_args.tenant_id,
                             **kwargs,
                         )
 

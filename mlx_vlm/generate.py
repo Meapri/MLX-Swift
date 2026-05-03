@@ -414,7 +414,7 @@ def _prime_cached_prefix_rope_state(
     full_input_ids: mx.array,
     mask: Optional[mx.array],
     kwargs: Dict[str, Any],
-) -> None:
+) -> bool:
     """Prime Qwen-style mRoPE metadata before a cached-prefix trim.
 
     Qwen VL language models keep ``_rope_deltas`` on the model object and use
@@ -425,9 +425,9 @@ def _prime_cached_prefix_rope_state(
     lm = getattr(model, "language_model", None)
     get_rope_index = getattr(lm, "get_rope_index", None)
     if not callable(get_rope_index):
-        return
+        return True
     if not (hasattr(lm, "_rope_deltas") or hasattr(lm, "_position_ids")):
-        return
+        return True
     try:
         position_ids, rope_deltas = get_rope_index(
             full_input_ids,
@@ -436,13 +436,17 @@ def _prime_cached_prefix_rope_state(
             mask,
         )
     except Exception as e:
-        logger.debug("Could not prime cached-prefix RoPE state: %s", e)
-        return
+        logger.warning(
+            "Could not prime cached-prefix RoPE state; falling back to cold prefill: %s",
+            e,
+        )
+        return False
     if hasattr(lm, "_position_ids"):
         lm._position_ids = position_ids
     if hasattr(lm, "_rope_deltas"):
         lm._rope_deltas = rope_deltas
     kwargs["rope_deltas"] = rope_deltas
+    return True
 
 
 def _speculative_walk(
@@ -1059,6 +1063,9 @@ def stream_generate(
     resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
     image_token_index = getattr(model.config, "image_token_index", None)
     vision_cache = kwargs.pop("vision_cache", None)
+    prompt_cache_state = kwargs.pop("prompt_cache_state", None)
+    apc_manager: Optional[_apc.APCManager] = kwargs.pop("apc_manager", None)
+    apc_tenant: Optional[str] = kwargs.pop("apc_tenant", None)
 
     if kwargs.get("input_ids", None) is not None:
         input_ids = kwargs.pop("input_ids")
@@ -1098,8 +1105,6 @@ def stream_generate(
             kwargs["cached_image_features"] = features
 
     # Prompt cache reuse: skip common prefix from previous turn
-    prompt_cache_state = kwargs.pop("prompt_cache_state", None)
-    apc_manager: Optional[_apc.APCManager] = kwargs.pop("apc_manager", None)
     reused_prefix_len = 0
     full_input_ids_list = input_ids.flatten().tolist()
     apc_blocks_in_use: List[_apc.APCBlock] = []
@@ -1109,41 +1114,46 @@ def stream_generate(
     if apc_manager is not None and not _apc.model_supports_apc(model.language_model):
         apc_manager = None
 
+    if apc_manager is not None:
+        image_hash = _apc.hash_image_payload(
+            pixel_values=pixel_values, image_ref=image
+        )
+        apc_extra_hash = _apc.tenant_scoped_hash(apc_tenant, image_hash)
+
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
         if prefix_len > 0 and prefix_len < input_ids.shape[1]:
-            reused_prefix_len = prefix_len
-            _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs)
-            # Trim to only new tokens
-            input_ids = input_ids[:, prefix_len:]
-            # Only skip vision if no image tokens in the new (trimmed) tokens
-            image_token_id = getattr(model.config, "image_token_id", None) or getattr(
-                model.config, "image_token_index", None
-            )
-            new_ids = input_ids.flatten().tolist()
-            has_image_in_new = image_token_id is not None and image_token_id in new_ids
-            if not has_image_in_new:
-                pixel_values = None
-                kwargs.pop("cached_image_features", None)
-            # Reuse the saved KV cache (trimmed to prefix length)
-            kv_cache = prompt_cache_state.cache
-            # Trim cache to prefix_len in case it includes generated tokens
-            for c in kv_cache:
-                if hasattr(c, "keys") and c.keys is not None:
-                    cached_len = c.keys.shape[2]
-                    if cached_len > prefix_len:
-                        c.keys = c.keys[:, :, :prefix_len, :]
-                        c.values = c.values[:, :, :prefix_len, :]
-                        if hasattr(c, "offset"):
-                            c.offset = prefix_len
-            kwargs["prompt_cache"] = kv_cache
+            if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
+                reused_prefix_len = prefix_len
+                # Trim to only new tokens
+                input_ids = input_ids[:, prefix_len:]
+                # Only skip vision if no image tokens in the new (trimmed) tokens
+                image_token_id = getattr(
+                    model.config, "image_token_id", None
+                ) or getattr(model.config, "image_token_index", None)
+                new_ids = input_ids.flatten().tolist()
+                has_image_in_new = (
+                    image_token_id is not None and image_token_id in new_ids
+                )
+                if not has_image_in_new:
+                    pixel_values = None
+                    kwargs.pop("cached_image_features", None)
+                # Reuse the saved KV cache (trimmed to prefix length)
+                kv_cache = prompt_cache_state.cache
+                # Trim cache to prefix_len in case it includes generated tokens
+                for c in kv_cache:
+                    if hasattr(c, "keys") and c.keys is not None:
+                        cached_len = c.keys.shape[2]
+                        if cached_len > prefix_len:
+                            c.keys = c.keys[:, :, :prefix_len, :]
+                            c.values = c.values[:, :, :prefix_len, :]
+                            if hasattr(c, "offset"):
+                                c.offset = prefix_len
+                kwargs["prompt_cache"] = kv_cache
 
     # APC: cross-request, hash-based prefix lookup. Only consulted if a per-turn
     # PromptCacheState didn't already produce a hit.
     if apc_manager is not None and reused_prefix_len == 0:
-        apc_extra_hash = _apc.hash_image_payload(
-            pixel_values=pixel_values, image_ref=image
-        )
         matched_blocks, prefix_len = apc_manager.lookup_prefix(
             full_input_ids_list, extra_hash=apc_extra_hash
         )
@@ -1159,33 +1169,35 @@ def stream_generate(
         if disk_prefix_len > prefix_len and disk_prefix_len < input_ids.shape[1]:
             if matched_blocks:
                 apc_manager.release(matched_blocks)
-            reused_prefix_len = disk_prefix_len
-            _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs)
-            input_ids = input_ids[:, disk_prefix_len:]
-            image_token_id = getattr(model.config, "image_token_id", None) or getattr(
-                model.config, "image_token_index", None
-            )
-            new_ids = input_ids.flatten().tolist()
-            if image_token_id is None or image_token_id not in new_ids:
-                pixel_values = None
-                kwargs.pop("cached_image_features", None)
-            kwargs["prompt_cache"] = disk_prompt_cache
+            if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
+                reused_prefix_len = disk_prefix_len
+                input_ids = input_ids[:, disk_prefix_len:]
+                image_token_id = getattr(
+                    model.config, "image_token_id", None
+                ) or getattr(model.config, "image_token_index", None)
+                new_ids = input_ids.flatten().tolist()
+                if image_token_id is None or image_token_id not in new_ids:
+                    pixel_values = None
+                    kwargs.pop("cached_image_features", None)
+                kwargs["prompt_cache"] = disk_prompt_cache
         elif prefix_len > 0 and prefix_len < input_ids.shape[1]:
-            apc_blocks_in_use = matched_blocks
-            reused_prefix_len = prefix_len
-            _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs)
-            input_ids = input_ids[:, prefix_len:]
-            image_token_id = getattr(model.config, "image_token_id", None) or getattr(
-                model.config, "image_token_index", None
-            )
-            new_ids = input_ids.flatten().tolist()
-            if image_token_id is None or image_token_id not in new_ids:
-                pixel_values = None
-                kwargs.pop("cached_image_features", None)
-            kwargs["prompt_cache"] = _apc.make_warm_kv_cache(
-                matched_blocks,
-                min_capacity_tokens=prefix_len + input_ids.shape[1] + 1,
-            )
+            if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
+                apc_blocks_in_use = matched_blocks
+                reused_prefix_len = prefix_len
+                input_ids = input_ids[:, prefix_len:]
+                image_token_id = getattr(
+                    model.config, "image_token_id", None
+                ) or getattr(model.config, "image_token_index", None)
+                new_ids = input_ids.flatten().tolist()
+                if image_token_id is None or image_token_id not in new_ids:
+                    pixel_values = None
+                    kwargs.pop("cached_image_features", None)
+                kwargs["prompt_cache"] = _apc.make_warm_kv_cache(
+                    matched_blocks,
+                    min_capacity_tokens=prefix_len + input_ids.shape[1] + 1,
+                )
+            else:
+                apc_manager.release(matched_blocks)
         elif matched_blocks:
             # Full match (no new tokens to compute) — release; fall through to normal path
             apc_manager.release(matched_blocks)
@@ -1969,6 +1981,7 @@ class PromptProcessingBatch:
         # APC metadata used for post-prefill block harvest (per-row).
         self._apc_meta = apc_meta or []
         self._apc_manager = apc_manager
+        self._apc_harvest_enabled = True
 
         if warm_cache is not None:
             self.prompt_cache = warm_cache
@@ -1985,11 +1998,24 @@ class PromptProcessingBatch:
         # it into left-padding once the prefill forward pass is complete.
         if right_pad_per_row is not None and any(right_pad_per_row):
             for c in self.prompt_cache:
-                if hasattr(c, "prepare"):
-                    c.prepare(right_padding=right_pad_per_row)
+                prepare = getattr(c, "prepare", None)
+                if not callable(prepare):
+                    self._apc_harvest_enabled = False
+                    self._release_apc_meta_blocks()
+                    raise RuntimeError(
+                        "APC mixed prefill requires a prompt cache with prepare()"
+                    )
+                prepare(right_padding=right_pad_per_row)
 
     def __len__(self):
         return len(self.uids)
+
+    def _release_apc_meta_blocks(self):
+        if self._apc_manager is None:
+            return
+        for meta in self._apc_meta:
+            if meta is not None:
+                self._apc_manager.release(meta.get("apc_blocks", []))
 
     def needs_processing(self):
         """True if prompt needs chunked processing before generate()."""
@@ -2056,8 +2082,14 @@ class PromptProcessingBatch:
         # GenerationBatch sees a canonical layout.
         if self._right_pad_per_row is not None and any(self._right_pad_per_row):
             for c in self.prompt_cache:
-                if hasattr(c, "finalize"):
-                    c.finalize()
+                finalize = getattr(c, "finalize", None)
+                if not callable(finalize):
+                    self._apc_harvest_enabled = False
+                    self._release_apc_meta_blocks()
+                    raise RuntimeError(
+                        "APC mixed prefill requires a prompt cache with finalize()"
+                    )
+                finalize()
         if os.environ.get("APC_DEBUG"):
             c0 = self.prompt_cache[0] if self.prompt_cache else None
             if c0 is not None:
@@ -2138,7 +2170,11 @@ class PromptProcessingBatch:
         # APC: harvest the post-prefill K/V into hashed blocks. Done after the
         # final prefill forward but before the cache references are released
         # so the block tensors snapshot the prompt prefix.
-        if self._apc_manager is not None and self._apc_meta:
+        if (
+            self._apc_manager is not None
+            and self._apc_meta
+            and self._apc_harvest_enabled
+        ):
             try:
                 for batch_idx, meta in enumerate(self._apc_meta):
                     if meta is None:
@@ -2255,23 +2291,20 @@ class BatchGenerator:
     # ---------------- APC integration helpers ----------------
     # Keys that are APC-only metadata; stripped from ``prompt_kwargs`` before
     # the merged kwargs are passed to the language model forward.
-    _APC_PRIVATE_KEYS = ("_apc_tenant",)
+    _APC_PRIVATE_KEYS = ("_apc_tenant", "_apc_image_hash")
 
     def _apc_extra_hash(self, prompt_kwargs: dict) -> int:
-        """Salt for the APC hash chain. Combines the image-content hash with
-        an optional per-tenant salt so cross-tenant lookups never collide
-        even when the token prefixes are identical.
-        """
+        """Salt for the APC hash chain."""
         if self.apc_manager is None:
             return 0
         if prompt_kwargs is None:
             prompt_kwargs = {}
-        pixel_values = prompt_kwargs.get("pixel_values")
-        img = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=None)
+        img = prompt_kwargs.get("_apc_image_hash")
+        if img is None:
+            pixel_values = prompt_kwargs.get("pixel_values")
+            img = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=None)
         tenant = prompt_kwargs.get("_apc_tenant")
-        if tenant:
-            return hash((tenant, img))
-        return img
+        return _apc.tenant_scoped_hash(tenant, img)
 
     def _apc_pick_for(self, sequence) -> Optional[dict]:
         """Look up an APC prefix for ``sequence``. Returns dict with matched

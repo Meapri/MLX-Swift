@@ -78,6 +78,25 @@ def _hash_tokens(parent: int, tokens: Tuple[int, ...], extra: int) -> int:
     return hash((parent, tokens, extra))
 
 
+def _stable_int_hash(*values: int) -> int:
+    h = hashlib.sha256()
+    for value in values:
+        h.update(int(value & ((1 << 64) - 1)).to_bytes(8, "little"))
+    return int.from_bytes(h.digest()[:8], "little", signed=True)
+
+
+def tenant_scoped_hash(tenant: Optional[str], payload_hash: int = 0) -> int:
+    """Stable APC salt for tenant-scoped multimodal context."""
+    if not tenant:
+        return int(payload_hash)
+    tenant_bytes = str(tenant).encode("utf-8")
+    h = hashlib.sha256()
+    h.update(len(tenant_bytes).to_bytes(4, "little"))
+    h.update(tenant_bytes)
+    h.update(int(payload_hash & ((1 << 64) - 1)).to_bytes(8, "little"))
+    return int.from_bytes(h.digest()[:8], "little", signed=True)
+
+
 def hash_image_payload(
     pixel_values: Optional[mx.array] = None,
     image_ref: Any = None,
@@ -101,7 +120,7 @@ def hash_image_payload(
     if isinstance(image_ref, (list, tuple)):
         h = SEED_PARENT_HASH
         for it in image_ref:
-            h = hash((h, hash_image_payload(image_ref=it)))
+            h = _stable_int_hash(h, hash_image_payload(image_ref=it))
         return h
     if isinstance(image_ref, str):
         digest = hashlib.sha256(image_ref.encode("utf-8")).digest()
@@ -2005,7 +2024,8 @@ class APCManager:
         individual APCBlock slabs into the memory pool; it restores the prefix
         as one per-layer K/V tensor set, matching what generation consumes.
         """
-        if self.disk is None:
+        disk = self.disk
+        if disk is None:
             return None, 0
         with self.lock:
             if self._disk_min_free_ram_bytes > 0:
@@ -2040,7 +2060,7 @@ class APCManager:
                     and b_mem.token_ids == chunk
                 ):
                     return None, 0
-                if not self.disk.has(h):
+                if not disk.has(h):
                     break
                 block_hashes.append(h)
                 chunks.append(chunk)
@@ -2052,28 +2072,29 @@ class APCManager:
             if matched_tokens <= min_prefix_tokens:
                 return None, 0
 
-            loaded = self.disk.load_layer_major_prefix(block_hashes)
-            if loaded is None:
+        loaded = disk.load_layer_major_prefix(block_hashes)
+        if loaded is None:
+            return None, 0
+        keys, values, metadatas = loaded
+        if len(metadatas) != len(chunks):
+            return None, 0
+        for chunk, metadata in zip(chunks, metadatas):
+            try:
+                stored_tokens = tuple(
+                    int(x) for x in metadata.get("token_ids", "").split(",") if x
+                )
+                stored_extra = int(metadata.get("extra_hash", "0"))
+            except (TypeError, ValueError):
                 return None, 0
-            keys, values, metadatas = loaded
-            if len(metadatas) != len(chunks):
+            if stored_tokens != chunk or stored_extra != extra_hash:
                 return None, 0
-            for chunk, metadata in zip(chunks, metadatas):
-                try:
-                    stored_tokens = tuple(
-                        int(x) for x in metadata.get("token_ids", "").split(",") if x
-                    )
-                    stored_extra = int(metadata.get("extra_hash", "0"))
-                except (TypeError, ValueError):
-                    return None, 0
-                if stored_tokens != chunk or stored_extra != extra_hash:
-                    return None, 0
 
-            warm_cache = make_warm_kv_cache_from_layers(keys, values, matched_tokens)
+        warm_cache = make_warm_kv_cache_from_layers(keys, values, matched_tokens)
+        with self.lock:
             self.stats.disk_hits += len(block_hashes)
             self.stats.hits += 1
             self.stats.matched_tokens += matched_tokens
-            return warm_cache, matched_tokens
+        return warm_cache, matched_tokens
 
     def lookup_prefix(
         self, token_ids: Sequence[int], extra_hash: int = 0

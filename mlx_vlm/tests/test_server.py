@@ -157,6 +157,7 @@ class TestResponseGenerator:
             enable_thinking=False,
             thinking_budget=100,
             logits_processors=[processor],
+            tenant_id="tenant-a",
         )
         kw = args.to_generate_kwargs()
         assert kw["max_tokens"] == 50
@@ -167,6 +168,7 @@ class TestResponseGenerator:
         assert kw["enable_thinking"] is False
         assert kw["thinking_budget"] == 100
         assert kw["logits_processors"] == [processor]
+        assert kw["apc_tenant"] == "tenant-a"
 
     def test_generate_arguments_to_template_kwargs(self):
         args = server.GenerationArguments(enable_thinking=False, thinking_budget=50)
@@ -194,10 +196,11 @@ class TestResponseGenerator:
             thinking_budget=None,
             thinking_start_token=None,
         )
-        args = server._build_gen_args(req)
+        args = server._build_gen_args(req, tenant_id="tenant-a")
         assert args.max_tokens == 128
         assert args.top_k == 32
         assert args.logit_bias == {5: -1.0}  # string keys converted to int
+        assert args.to_generate_kwargs()["apc_tenant"] == "tenant-a"
 
     def test_build_gen_args_from_chat_request(self):
         req = SimpleNamespace(

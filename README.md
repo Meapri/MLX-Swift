@@ -286,7 +286,7 @@ Automatic Prefix Caching reuses block-level K/V cache state across requests that
 APC has two tiers:
 
 - **Warm memory**: keeps reusable `APCBlock` tensors in process memory. This is the fastest path, but it keeps both the reusable block pool and the runtime `KVCache`.
-- **Warm disk**: persists cached prefixes as safetensors shards so they survive process restarts. Disk restores build the layer-major prompt cache directly and do not populate the `APCBlock` pool, which is usually better for very long contexts.
+- **Warm disk**: persists cached prefixes as safetensors shards so they survive process restarts. Warm-disk reads build the layer-major prompt cache directly without promoting restored blocks into the `APCBlock` pool; writes can still populate both memory and disk tiers.
 
 #### Python Script
 
