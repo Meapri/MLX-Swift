@@ -14,7 +14,6 @@ import time
 
 import httpx
 
-
 SHARED_SYSTEM = (
     "You are a careful technical writer producing reference material. "
     "Always reply with a multi-paragraph explanation: at least three paragraphs, "
@@ -67,7 +66,9 @@ async def main():
         # Reset stats + warm-up so the system prompt is cached.
         await client.post(f"{args.base}/v1/cache/reset", timeout=10.0)
         print("Warm-up…")
-        await fire(client, url, args.model, SHARED_SYSTEM, USERS[0], -1, args.max_tokens)
+        await fire(
+            client, url, args.model, SHARED_SYSTEM, USERS[0], -1, args.max_tokens
+        )
 
         await client.post(f"{args.base}/v1/cache/reset", timeout=10.0)
 
@@ -81,7 +82,9 @@ async def main():
             user = USERS[i % len(USERS)]
             tasks.append(
                 asyncio.create_task(
-                    fire(client, url, args.model, SHARED_SYSTEM, user, i, args.max_tokens)
+                    fire(
+                        client, url, args.model, SHARED_SYSTEM, user, i, args.max_tokens
+                    )
                 )
             )
             await asyncio.sleep(args.stagger_ms / 1000.0)

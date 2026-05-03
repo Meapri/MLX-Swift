@@ -37,7 +37,9 @@ USERS = [
 
 
 def _get_inputs(model, processor, prompt_text):
-    formatted = apply_chat_template(processor, model.config, prompt=prompt_text, num_images=0)
+    formatted = apply_chat_template(
+        processor, model.config, prompt=prompt_text, num_images=0
+    )
     inputs = prepare_inputs(processor, prompts=formatted, image_token_index=None)
     input_ids = inputs["input_ids"]
     embed = model.get_input_embeddings(input_ids, None)

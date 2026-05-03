@@ -1283,8 +1283,7 @@ def stream_generate(
             try:
                 if all_ids is None:
                     all_ids = full_input_ids_list + [
-                        t.item() if hasattr(t, "item") else t
-                        for t in generated_tokens
+                        t.item() if hasattr(t, "item") else t for t in generated_tokens
                     ]
                 # Snapshot keys/values up to the live offset for each layer.
                 layer_keys: List[mx.array] = []
@@ -2152,9 +2151,7 @@ class PromptProcessingBatch:
                         extra_hash=meta.get("extra_hash", 0),
                         skip_first_n_tokens=meta.get("prefix_len", 0),
                     )
-                    self._apc_manager.release(
-                        meta.get("apc_blocks", []) + new_blocks
-                    )
+                    self._apc_manager.release(meta.get("apc_blocks", []) + new_blocks)
             except Exception as e:
                 logger.warning("APC harvest failed during batched prefill: %s", e)
                 # Best effort — release any acquired prefix blocks.
@@ -2287,9 +2284,9 @@ class BatchGenerator:
             return None
         # v1/v2: don't trim a prefix that contains image tokens — re-running
         # vision merging on the suffix is the cheap path here.
-        image_token_id = getattr(
-            self.model.config, "image_token_id", None
-        ) or getattr(self.model.config, "image_token_index", None)
+        image_token_id = getattr(self.model.config, "image_token_id", None) or getattr(
+            self.model.config, "image_token_index", None
+        )
         extra_hash = self._apc_extra_hash(prompt_kwargs or {})
         matched, prefix_len = self.apc_manager.lookup_prefix(
             ids_list, extra_hash=extra_hash
@@ -2306,7 +2303,10 @@ class BatchGenerator:
         if disk_prefix_len > prefix_len and disk_prefix_len < len(ids_list):
             if matched:
                 self.apc_manager.release(matched)
-            if image_token_id is not None and image_token_id in ids_list[:disk_prefix_len]:
+            if (
+                image_token_id is not None
+                and image_token_id in ids_list[:disk_prefix_len]
+            ):
                 return None
             return {
                 "matched_blocks": [],
@@ -2358,9 +2358,7 @@ class BatchGenerator:
 
         # Per-row prefix length and suffix tokens
         prefix_lens = [p["prefix_len"] if p else 0 for p in picks]
-        suffix_ids_list = [
-            full_ids[i][prefix_lens[i]:] for i in range(len(sequences))
-        ]
+        suffix_ids_list = [full_ids[i][prefix_lens[i] :] for i in range(len(sequences))]
         suffix_lens = [len(s) for s in suffix_ids_list]
 
         max_suffix_len = max(suffix_lens)
@@ -2373,7 +2371,7 @@ class BatchGenerator:
             if kw is None or kw.get("inputs_embeds") is None:
                 raise ValueError("APC mixed prefill requires precomputed inputs_embeds")
             full = kw["inputs_embeds"]  # [1, full_len, D]
-            suff = full[:, prefix_lens[i]:, :]
+            suff = full[:, prefix_lens[i] :, :]
             pad = right_pad_per_row[i]
             if pad > 0:
                 pad_emb = mx.zeros(
@@ -2417,9 +2415,11 @@ class BatchGenerator:
             {
                 "full_input_ids": full_ids[i],
                 "prefix_len": prefix_lens[i],
-                "extra_hash": picks[i]["extra_hash"]
-                if picks[i]
-                else self._apc_extra_hash(prompt_kwargs_list[i] or {}),
+                "extra_hash": (
+                    picks[i]["extra_hash"]
+                    if picks[i]
+                    else self._apc_extra_hash(prompt_kwargs_list[i] or {})
+                ),
                 "apc_blocks": picks[i].get("matched_blocks", []) if picks[i] else [],
             }
             for i in range(len(sequences))

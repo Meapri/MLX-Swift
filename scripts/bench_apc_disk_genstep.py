@@ -27,7 +27,6 @@ from mlx_vlm.apc import APCManager, DiskBlockStore
 from mlx_vlm.generate import stream_generate
 from mlx_vlm.prompt_utils import apply_chat_template
 
-
 SYSTEM = (
     "You are a careful technical writer producing detailed reference "
     "material. Always reply in full prose paragraphs without bullets."
@@ -74,8 +73,12 @@ def run_one(label, model, processor, formatted_prompt, mgr=None):
     t0 = time.perf_counter()
     last = None
     for chunk in stream_generate(
-        model, processor, formatted_prompt,
-        max_tokens=2, temperature=0.0, apc_manager=mgr,
+        model,
+        processor,
+        formatted_prompt,
+        max_tokens=2,
+        temperature=0.0,
+        apc_manager=mgr,
     ):
         last = chunk
     wall = (time.perf_counter() - t0) * 1000.0
@@ -114,8 +117,10 @@ def main():
     print(f"\n[cold] no APC, full prefill of {args.test_prompt_tokens} target tok")
     cold = run_one("cold", model, processor, formatted_prompt, mgr=None)
 
-    disk_root = Path(args.disk_path) if args.disk_path else Path(
-        tempfile.mkdtemp(prefix="apc-disk-bench-")
+    disk_root = (
+        Path(args.disk_path)
+        if args.disk_path
+        else Path(tempfile.mkdtemp(prefix="apc-disk-bench-"))
     )
     disk_root.mkdir(parents=True, exist_ok=True)
     max_bytes = int(args.disk_cap_gb * (1 << 30)) if args.disk_cap_gb > 0 else None
@@ -134,26 +139,36 @@ def main():
             processor, model.config, prompt=filler_full, num_images=0
         )
         for _ in stream_generate(
-            model, processor, prompt,
-            max_tokens=1, temperature=0.0, apc_manager=mgr1,
+            model,
+            processor,
+            prompt,
+            max_tokens=1,
+            temperature=0.0,
+            apc_manager=mgr1,
         ):
             pass
     print(f"  fill done in {time.perf_counter()-fill_t0:.1f}s")
 
     # Send the test prompt once so its blocks land in the in-memory pool.
     for _ in stream_generate(
-        model, processor, formatted_prompt,
-        max_tokens=1, temperature=0.0, apc_manager=mgr1,
+        model,
+        processor,
+        formatted_prompt,
+        max_tokens=1,
+        temperature=0.0,
+        apc_manager=mgr1,
     ):
         pass
 
     s_after_fill = mgr1.stats_snapshot()
-    print(f"  stats after fill: stores={s_after_fill['stores']} "
-          f"mem_evictions={s_after_fill['evictions']} "
-          f"pool_used={s_after_fill['pool_used']} "
-          f"disk_writes={s_after_fill['disk_writes']} "
-          f"disk_files={s_after_fill.get('disk_files', '?')} "
-          f"disk_blocks={s_after_fill.get('disk_blocks_indexed', '?')}")
+    print(
+        f"  stats after fill: stores={s_after_fill['stores']} "
+        f"mem_evictions={s_after_fill['evictions']} "
+        f"pool_used={s_after_fill['pool_used']} "
+        f"disk_writes={s_after_fill['disk_writes']} "
+        f"disk_files={s_after_fill.get('disk_files', '?')} "
+        f"disk_blocks={s_after_fill.get('disk_blocks_indexed', '?')}"
+    )
     mgr1.close()
 
     # ---- Warm-from-disk: new manager, same disk namespace, empty memory pool ----
@@ -164,32 +179,44 @@ def main():
     warm_disk = run_one("warm-disk", model, processor, formatted_prompt, mgr=mgr2)
     s_after_disk = mgr2.stats_snapshot()
     disk_match = s_after_disk["matched_tokens"] - s_before_disk["matched_tokens"]
-    print(f"    stats: matched_tokens={disk_match} "
-          f"disk_hits={s_after_disk['disk_hits']} "
-          f"pool_used={s_after_disk['pool_used']}")
+    print(
+        f"    stats: matched_tokens={disk_match} "
+        f"disk_hits={s_after_disk['disk_hits']} "
+        f"pool_used={s_after_disk['pool_used']}"
+    )
 
     print(f"\n[warm-disk-repeat] same manager, immediate repeat")
     s_before_repeat = mgr2.stats_snapshot()
-    warm_disk_repeat = run_one("warm-disk-repeat", model, processor, formatted_prompt, mgr=mgr2)
+    warm_disk_repeat = run_one(
+        "warm-disk-repeat", model, processor, formatted_prompt, mgr=mgr2
+    )
     s_after_repeat = mgr2.stats_snapshot()
     repeat_match = s_after_repeat["matched_tokens"] - s_before_repeat["matched_tokens"]
-    print(f"    stats: matched_tokens={repeat_match} "
-          f"disk_hits={s_after_repeat['disk_hits']} pool_used={s_after_repeat['pool_used']}")
+    print(
+        f"    stats: matched_tokens={repeat_match} "
+        f"disk_hits={s_after_repeat['disk_hits']} pool_used={s_after_repeat['pool_used']}"
+    )
     mgr2.close()
 
     # ---- Summary ----
     print("\n" + "=" * 60)
     print(f"Model: {args.model}")
-    print(f"Test prompt: ~{args.test_prompt_tokens} target tokens "
-          f"(actual={cold.prompt_tokens})")
+    print(
+        f"Test prompt: ~{args.test_prompt_tokens} target tokens "
+        f"(actual={cold.prompt_tokens})"
+    )
     print("=" * 60)
     print(f"  cold       prompt_tps = {cold.prompt_tps:.0f}")
     if warm_disk:
-        print(f"  warm-disk  prompt_tps = {warm_disk.prompt_tps:.0f}  "
-              f"(matched {disk_match} tok from disk)")
+        print(
+            f"  warm-disk  prompt_tps = {warm_disk.prompt_tps:.0f}  "
+            f"(matched {disk_match} tok from disk)"
+        )
     if warm_disk_repeat:
-        print(f"  repeat     prompt_tps = {warm_disk_repeat.prompt_tps:.0f}  "
-              f"(matched {repeat_match} tok from disk)")
+        print(
+            f"  repeat     prompt_tps = {warm_disk_repeat.prompt_tps:.0f}  "
+            f"(matched {repeat_match} tok from disk)"
+        )
 
     if args.disk_path is None and not args.keep_disk:
         shutil.rmtree(disk_root, ignore_errors=True)

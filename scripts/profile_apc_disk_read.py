@@ -20,8 +20,8 @@ from __future__ import annotations
 import argparse
 import gc
 import os
-import sys
 import shutil
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -49,7 +49,7 @@ def rss_mb() -> float:
 
 
 def avail_gb() -> float:
-    return psutil.virtual_memory().available / (1024 ** 3)
+    return psutil.virtual_memory().available / (1024**3)
 
 
 def mlx_mem_mb() -> tuple[float, float, float]:
@@ -134,9 +134,7 @@ def profile_load(
     # Fresh store — forces _rebuild_index. Tear-down at the end frees the
     # mmap cache, exposing whether holding only APCBlock refs is enough.
     disk = DiskBlockStore(root, namespace="profile")
-    print(
-        f"[after open]              {mem_line()}  indexed={disk.num_blocks_indexed}"
-    )
+    print(f"[after open]              {mem_line()}  indexed={disk.num_blocks_indexed}")
 
     n_full = len(token_ids) // BLOCK_SIZE
     parent = 0  # SEED_PARENT_HASH
@@ -153,9 +151,7 @@ def profile_load(
     t_total = time.perf_counter_ns()
 
     for i in range(n_full):
-        chunk = tuple(
-            int(t) for t in token_ids[i * BLOCK_SIZE : (i + 1) * BLOCK_SIZE]
-        )
+        chunk = tuple(int(t) for t in token_ids[i * BLOCK_SIZE : (i + 1) * BLOCK_SIZE])
         h = _hash_tokens(parent, chunk, 0)
         if not disk.has(h):
             break
@@ -170,12 +166,8 @@ def profile_load(
 
         if deep_copy:
             t0 = time.perf_counter_ns()
-            keys = [
-                mx.contiguous(k + mx.array(0, dtype=k.dtype)) for k in keys
-            ]
-            values = [
-                mx.contiguous(v + mx.array(0, dtype=v.dtype)) for v in values
-            ]
+            keys = [mx.contiguous(k + mx.array(0, dtype=k.dtype)) for k in keys]
+            values = [mx.contiguous(v + mx.array(0, dtype=v.dtype)) for v in values]
             t1 = time.perf_counter_ns()
             times_copy.append(t1 - t0)
 
@@ -264,7 +256,9 @@ def main():
     args = ap.parse_args()
 
     print(f"profile target")
-    print(f"  layers={N_LAYERS}  heads={N_KV_HEADS}  head_dim={HEAD_DIM}  bs={BLOCK_SIZE}  dtype={DTYPE}")
+    print(
+        f"  layers={N_LAYERS}  heads={N_KV_HEADS}  head_dim={HEAD_DIM}  bs={BLOCK_SIZE}  dtype={DTYPE}"
+    )
     print(f"  per-tensor : {PER_TENSOR_BYTES/1024:.1f}KB")
     print(f"  per-block  : {PER_BLOCK_BYTES/1024:.1f}KB ({N_LAYERS*2} tensors)")
     print(f"  n_blocks   : {args.n_blocks}")
@@ -281,7 +275,7 @@ def main():
 
         for label, chunk, copy in [
             ("Variant A — 1 block / no deep-copy", 1, False),
-            ("Variant B — 1 block / + deep-copy",  1, True),
+            ("Variant B — 1 block / + deep-copy", 1, True),
             ("Variant C — 4 blocks / + deep-copy", 4, True),
             ("Variant D — 8 blocks / + deep-copy", 8, True),
             ("Variant E — 16 blocks / + deep-copy", 16, True),

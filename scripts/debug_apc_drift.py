@@ -1,6 +1,8 @@
 """Compare logits between cold prefill vs APC warm-start for the same prompt."""
 
-import sys, os
+import os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import mlx.core as mx
@@ -47,7 +49,9 @@ def main():
     mx.eval(cold_logits)
     cold_last = cold_logits[:, -1, :]
     cold_argmax = mx.argmax(cold_last, axis=-1).item()
-    print(f"COLD: top1 token id={cold_argmax}, top5={mx.argsort(cold_last, axis=-1)[..., -5:].tolist()}")
+    print(
+        f"COLD: top1 token id={cold_argmax}, top5={mx.argsort(cold_last, axis=-1)[..., -5:].tolist()}"
+    )
 
     # Build APC blocks from cold cache, then warm-start.
     bs = 16
@@ -74,7 +78,9 @@ def main():
     mx.eval(warm_logits)
     warm_last = warm_logits[:, -1, :]
     warm_argmax = mx.argmax(warm_last, axis=-1).item()
-    print(f"WARM: top1 token id={warm_argmax}, top5={mx.argsort(warm_last, axis=-1)[..., -5:].tolist()}")
+    print(
+        f"WARM: top1 token id={warm_argmax}, top5={mx.argsort(warm_last, axis=-1)[..., -5:].tolist()}"
+    )
 
     # Diff
     diff = mx.abs(cold_last - warm_last)
@@ -100,7 +106,9 @@ def main():
     suffix_len = ids.shape[1] - prefix_len
     per_pos_max = []
     for p in range(suffix_len):
-        d = mx.max(mx.abs(cold_logits[:, prefix_len + p, :] - warm_logits[:, p, :])).item()
+        d = mx.max(
+            mx.abs(cold_logits[:, prefix_len + p, :] - warm_logits[:, p, :])
+        ).item()
         per_pos_max.append(d)
     print(
         f"  max|Δ logits|: min={min(per_pos_max):.4e}, max={max(per_pos_max):.4e}, "

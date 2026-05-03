@@ -17,7 +17,6 @@ import time
 
 import httpx
 
-
 PROMPT_A_SYSTEM = (
     "You are a senior Rust engineer. Reply with concise, idiomatic Rust code "
     "and a brief one-sentence explanation underneath. Use stable Rust 1.85+ "
@@ -64,7 +63,13 @@ def reset(client: httpx.Client, base: str) -> None:
 def diff_stats(before: dict, after: dict) -> dict:
     return {
         k: after[k] - before[k]
-        for k in ("lookups_hit", "lookups_miss", "matched_tokens", "stores", "evictions")
+        for k in (
+            "lookups_hit",
+            "lookups_miss",
+            "matched_tokens",
+            "stores",
+            "evictions",
+        )
     }
 
 
@@ -104,9 +109,13 @@ def main():
         )
 
         if a1_delta["matched_tokens"] != 0:
-            failures.append(f"A1 should be a cold miss; got matched={a1_delta['matched_tokens']}")
+            failures.append(
+                f"A1 should be a cold miss; got matched={a1_delta['matched_tokens']}"
+            )
         if b1_delta["matched_tokens"] != 0:
-            failures.append(f"B1 should be a cold miss; got matched={b1_delta['matched_tokens']}")
+            failures.append(
+                f"B1 should be a cold miss; got matched={b1_delta['matched_tokens']}"
+            )
         if a1_delta["stores"] <= 0:
             failures.append("A1 should have stored at least 1 block")
         if b1_delta["stores"] <= 0:
@@ -122,9 +131,13 @@ def main():
         )
 
         if a2_delta["matched_tokens"] <= 0:
-            failures.append(f"A2 should hit cache; got matched={a2_delta['matched_tokens']}")
+            failures.append(
+                f"A2 should hit cache; got matched={a2_delta['matched_tokens']}"
+            )
         if b2_delta["matched_tokens"] <= 0:
-            failures.append(f"B2 should hit cache; got matched={b2_delta['matched_tokens']}")
+            failures.append(
+                f"B2 should hit cache; got matched={b2_delta['matched_tokens']}"
+            )
 
         # Cross-contamination check: A and B answers should be distinct
         if a1_text == b1_text:

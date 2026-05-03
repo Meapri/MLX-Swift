@@ -13,7 +13,6 @@ import sys
 
 import httpx
 
-
 PROMPT = (
     "You are a confidential medical assistant. Answer concisely. "
     "What are common side effects of metformin?"
@@ -64,7 +63,9 @@ def main():
         chat(c, args.base, args.model, tenant="alice", max_tokens=args.max_tokens)
         s1 = stats(c, args.base)
         d_a1 = {k: s1[k] - s0[k] for k in ("lookups_hit", "lookups_miss", "stores")}
-        print(f"A1 (alice cold): Δhits={d_a1['lookups_hit']} Δmiss={d_a1['lookups_miss']} Δstores={d_a1['stores']}")
+        print(
+            f"A1 (alice cold): Δhits={d_a1['lookups_hit']} Δmiss={d_a1['lookups_miss']} Δstores={d_a1['stores']}"
+        )
         if d_a1["lookups_hit"] != 0 or d_a1["stores"] <= 0:
             failures.append(f"A1 should be cold + store blocks; got {d_a1}")
 
@@ -72,7 +73,9 @@ def main():
         chat(c, args.base, args.model, tenant="bob", max_tokens=args.max_tokens)
         s2 = stats(c, args.base)
         d_b1 = {k: s2[k] - s1[k] for k in ("lookups_hit", "lookups_miss", "stores")}
-        print(f"B1 (bob, same prompt): Δhits={d_b1['lookups_hit']} Δmiss={d_b1['lookups_miss']} Δstores={d_b1['stores']}")
+        print(
+            f"B1 (bob, same prompt): Δhits={d_b1['lookups_hit']} Δmiss={d_b1['lookups_miss']} Δstores={d_b1['stores']}"
+        )
         if d_b1["lookups_hit"] != 0:
             failures.append(
                 f"B1 leaked Alice's blocks! Δhits={d_b1['lookups_hit']} (expected 0)"
@@ -84,23 +87,33 @@ def main():
         chat(c, args.base, args.model, tenant="alice", max_tokens=args.max_tokens)
         s3 = stats(c, args.base)
         d_a2 = {k: s3[k] - s2[k] for k in ("lookups_hit", "lookups_miss", "stores")}
-        print(f"A2 (alice repeat): Δhits={d_a2['lookups_hit']} Δmiss={d_a2['lookups_miss']} Δstores={d_a2['stores']}")
+        print(
+            f"A2 (alice repeat): Δhits={d_a2['lookups_hit']} Δmiss={d_a2['lookups_miss']} Δstores={d_a2['stores']}"
+        )
         if d_a2["lookups_hit"] != 1:
-            failures.append(f"A2 should hit Alice's prior blocks; got Δhits={d_a2['lookups_hit']}")
+            failures.append(
+                f"A2 should hit Alice's prior blocks; got Δhits={d_a2['lookups_hit']}"
+            )
 
         # Tenant B — repeat: must HIT its own blocks.
         chat(c, args.base, args.model, tenant="bob", max_tokens=args.max_tokens)
         s4 = stats(c, args.base)
         d_b2 = {k: s4[k] - s3[k] for k in ("lookups_hit", "lookups_miss", "stores")}
-        print(f"B2 (bob repeat): Δhits={d_b2['lookups_hit']} Δmiss={d_b2['lookups_miss']} Δstores={d_b2['stores']}")
+        print(
+            f"B2 (bob repeat): Δhits={d_b2['lookups_hit']} Δmiss={d_b2['lookups_miss']} Δstores={d_b2['stores']}"
+        )
         if d_b2["lookups_hit"] != 1:
-            failures.append(f"B2 should hit Bob's prior blocks; got Δhits={d_b2['lookups_hit']}")
+            failures.append(
+                f"B2 should hit Bob's prior blocks; got Δhits={d_b2['lookups_hit']}"
+            )
 
         # No-header request — uses unsalted bucket; must MISS both Alice & Bob.
         chat(c, args.base, args.model, tenant=None, max_tokens=args.max_tokens)
         s5 = stats(c, args.base)
         d_n = {k: s5[k] - s4[k] for k in ("lookups_hit", "lookups_miss", "stores")}
-        print(f"N1 (no header): Δhits={d_n['lookups_hit']} Δmiss={d_n['lookups_miss']} Δstores={d_n['stores']}")
+        print(
+            f"N1 (no header): Δhits={d_n['lookups_hit']} Δmiss={d_n['lookups_miss']} Δstores={d_n['stores']}"
+        )
         if d_n["lookups_hit"] != 0:
             failures.append(
                 f"Anonymous request leaked tenant blocks! Δhits={d_n['lookups_hit']}"

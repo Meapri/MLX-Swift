@@ -20,6 +20,7 @@ import argparse
 import os
 import shutil
 import statistics
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -27,17 +28,15 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
-import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from mlx_vlm.apc import APCManager, DiskBlockStore
 
-
 PROFILES = {
     # name, n_layers, n_kv_heads, head_dim, dtype
-    "smolvlm_bf16":      (24,  3, 64, mx.bfloat16),  # Idefics3 small
-    "qwen3_vl_4b_bf16":  (36,  8, 128, mx.bfloat16),
-    "qwen3_vl_8b_bf16":  (36,  8, 128, mx.bfloat16),  # similar dims
-    "gemma3_12b_bf16":   (62, 16, 256, mx.bfloat16),  # the arxiv paper's setup
+    "smolvlm_bf16": (24, 3, 64, mx.bfloat16),  # Idefics3 small
+    "qwen3_vl_4b_bf16": (36, 8, 128, mx.bfloat16),
+    "qwen3_vl_8b_bf16": (36, 8, 128, mx.bfloat16),  # similar dims
+    "gemma3_12b_bf16": (62, 16, 256, mx.bfloat16),  # the arxiv paper's setup
 }
 
 BLOCK_SIZE = 16
@@ -66,7 +65,6 @@ def _drop_page_cache(path: Path) -> None:
     measurement of (cold-OS-cache hot-disk-cache) which is realistic for
     a process restart on a non-rebooted host.
     """
-    pass
 
 
 def bench_load(profile_name: str, n_warmup: int = 1, n_runs: int = 5) -> dict:
@@ -140,7 +138,9 @@ def bench_evict(profile_name: str, n_blocks: int, evict_pct: float, n_runs: int 
     try:
         # Stage 1: write n_blocks files with a generous cap (no eviction)
         big_disk = DiskBlockStore(tmp, namespace=profile_name)
-        mgr = APCManager(num_blocks=max(64, n_blocks + 8), block_size=BLOCK_SIZE, disk=big_disk)
+        mgr = APCManager(
+            num_blocks=max(64, n_blocks + 8), block_size=BLOCK_SIZE, disk=big_disk
+        )
         for s in range(n_blocks):
             keys, values = _make_block(n_layers, n_kv_heads, head_dim, dtype, seed=s)
             ids = list(range(s * BLOCK_SIZE * 100, s * BLOCK_SIZE * 100 + BLOCK_SIZE))
@@ -186,10 +186,18 @@ def bench_evict(profile_name: str, n_blocks: int, evict_pct: float, n_runs: int 
                 shutil.rmtree(tmp, ignore_errors=True)
                 tmp.mkdir(parents=True, exist_ok=True)
                 big_disk = DiskBlockStore(tmp, namespace=profile_name)
-                mgr = APCManager(num_blocks=max(64, n_blocks + 8), block_size=BLOCK_SIZE, disk=big_disk)
+                mgr = APCManager(
+                    num_blocks=max(64, n_blocks + 8),
+                    block_size=BLOCK_SIZE,
+                    disk=big_disk,
+                )
                 for s in range(n_blocks):
-                    keys, values = _make_block(n_layers, n_kv_heads, head_dim, dtype, seed=s)
-                    ids = list(range(s * BLOCK_SIZE * 100, s * BLOCK_SIZE * 100 + BLOCK_SIZE))
+                    keys, values = _make_block(
+                        n_layers, n_kv_heads, head_dim, dtype, seed=s
+                    )
+                    ids = list(
+                        range(s * BLOCK_SIZE * 100, s * BLOCK_SIZE * 100 + BLOCK_SIZE)
+                    )
                     nb = mgr.store_kv_blocks(ids, keys, values)
                     mgr.release(nb)
                 big_disk.close()
@@ -215,10 +223,13 @@ def main():
         nargs="+",
         default=["smolvlm_bf16", "qwen3_vl_4b_bf16", "gemma3_12b_bf16"],
     )
-    ap.add_argument("--evict-blocks", type=int, default=200,
-                    help="staging block count for eviction bench")
-    ap.add_argument("--evict-pct", type=float, default=0.5,
-                    help="fraction to evict")
+    ap.add_argument(
+        "--evict-blocks",
+        type=int,
+        default=200,
+        help="staging block count for eviction bench",
+    )
+    ap.add_argument("--evict-pct", type=float, default=0.5, help="fraction to evict")
     args = ap.parse_args()
 
     print("=" * 80)
@@ -246,7 +257,9 @@ def main():
         f"~{int(args.evict_pct*100)}% evicted)"
     )
     print("=" * 70)
-    print(f"{'profile':<22}{'n_blocks':>10}{'avg_size':>12}{'min_ms':>10}{'med_ms':>10}{'max_ms':>10}")
+    print(
+        f"{'profile':<22}{'n_blocks':>10}{'avg_size':>12}{'min_ms':>10}{'med_ms':>10}{'max_ms':>10}"
+    )
     for prof in args.profiles:
         r = bench_evict(prof, args.evict_blocks, args.evict_pct)
         print(

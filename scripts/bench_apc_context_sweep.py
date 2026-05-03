@@ -22,7 +22,6 @@ from mlx_vlm.apc import APCManager, DiskBlockStore  # noqa: E402
 from mlx_vlm.generate import stream_generate  # noqa: E402
 from mlx_vlm.prompt_utils import apply_chat_template  # noqa: E402
 
-
 SYSTEM = (
     "You are a careful technical writer producing detailed reference "
     "material. Always reply in full prose paragraphs without bullets."

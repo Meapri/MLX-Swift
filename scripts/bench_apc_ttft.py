@@ -19,7 +19,6 @@ import time
 
 import httpx
 
-
 LONG_SYSTEM = (
     "You are a senior staff engineer reviewing pull requests. Always start by "
     "summarising the change in one sentence, then list concrete concerns by "
@@ -40,7 +39,9 @@ USERS = [
 ]
 
 
-def stream_ttft(client: httpx.Client, base: str, model: str, system: str, user: str, max_tokens: int):
+def stream_ttft(
+    client: httpx.Client, base: str, model: str, system: str, user: str, max_tokens: int
+):
     payload = {
         "model": model,
         "messages": [
@@ -105,7 +106,9 @@ def main():
     p.add_argument("--base", default="http://127.0.0.1:8089")
     p.add_argument("--model", default="mlx-community/SmolVLM-Instruct-bf16")
     p.add_argument("--max-tokens", type=int, default=8)
-    p.add_argument("--n-warm", type=int, default=3, help="warm-call repeats for averaging")
+    p.add_argument(
+        "--n-warm", type=int, default=3, help="warm-call repeats for averaging"
+    )
     args = p.parse_args()
 
     with httpx.Client() as c:
@@ -120,8 +123,12 @@ def main():
         # Discard the first request — it has cold-import overhead unrelated to APC.
         reset_stats(c, args.base)
         print("\nWarmup (cold) + Discard (excludes import & first-graph-build)…")
-        warm0 = stream_ttft(c, args.base, args.model, LONG_SYSTEM, USERS[0], args.max_tokens)
-        print(f"  discarded TTFT={warm0['ttft_ms']:.0f}ms total={warm0['total_ms']:.0f}ms")
+        warm0 = stream_ttft(
+            c, args.base, args.model, LONG_SYSTEM, USERS[0], args.max_tokens
+        )
+        print(
+            f"  discarded TTFT={warm0['ttft_ms']:.0f}ms total={warm0['total_ms']:.0f}ms"
+        )
 
         # ---- Cold ----
         reset_stats(c, args.base)
@@ -139,15 +146,21 @@ def main():
         # ---- Warm ----
         # Warm the prefix first
         reset_stats(c, args.base)
-        _ = stream_ttft(c, args.base, args.model, LONG_SYSTEM, USERS[0], args.max_tokens)
+        _ = stream_ttft(
+            c, args.base, args.model, LONG_SYSTEM, USERS[0], args.max_tokens
+        )
         s_after_seed = get_stats(c, args.base)
-        print(f"\nSeeded prefix; pool_used={s_after_seed['pool_used']} stores={s_after_seed['stores']}")
+        print(
+            f"\nSeeded prefix; pool_used={s_after_seed['pool_used']} stores={s_after_seed['stores']}"
+        )
 
         print("\nWARM (different user msgs share the long system prefix):")
         warm = []
         for round_idx in range(args.n_warm):
             for i, u in enumerate(USERS):
-                r = stream_ttft(c, args.base, args.model, LONG_SYSTEM, u, args.max_tokens)
+                r = stream_ttft(
+                    c, args.base, args.model, LONG_SYSTEM, u, args.max_tokens
+                )
                 warm.append(r)
                 print(
                     f"  r{round_idx}.{i}  TTFT={r['ttft_ms']:.0f}ms  total={r['total_ms']:.0f}ms  "
@@ -171,7 +184,9 @@ def main():
     print(f"  cold:  {_stat(cold_ttft)}")
     print(f"  warm:  {_stat(warm_ttft)}")
     saved = statistics.median(cold_ttft) - statistics.median(warm_ttft)
-    print(f"  saved: {saved:.0f}ms ({saved / statistics.median(cold_ttft) * 100:.0f}% of cold TTFT)")
+    print(
+        f"  saved: {saved:.0f}ms ({saved / statistics.median(cold_ttft) * 100:.0f}% of cold TTFT)"
+    )
 
     print("\nTotal latency (max_tokens=", args.max_tokens, "):", sep="")
     print(f"  cold:  {_stat(cold_total)}")

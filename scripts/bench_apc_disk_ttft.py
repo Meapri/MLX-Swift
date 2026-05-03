@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import signal
@@ -13,8 +14,6 @@ import time
 from pathlib import Path
 
 import httpx
-import json
-
 
 PROMPT = (
     "You are a careful technical writer producing reference material. "
@@ -33,7 +32,15 @@ def start_server(model: str, port: int, disk_path: Path | None) -> subprocess.Po
         env["APC_DISK_PATH"] = str(disk_path)
     env["MLX_VLM_PRELOAD_MODEL"] = model
     proc = subprocess.Popen(
-        [sys.executable, "-m", "mlx_vlm.server", "--host", "127.0.0.1", "--port", str(port)],
+        [
+            sys.executable,
+            "-m",
+            "mlx_vlm.server",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ],
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -74,7 +81,9 @@ def stream_ttft(client, base, model, max_tokens):
     t_post = time.perf_counter()
     t_first = None
     n = 0
-    with client.stream("POST", f"{base}/v1/chat/completions", json=payload, timeout=120.0) as r:
+    with client.stream(
+        "POST", f"{base}/v1/chat/completions", json=payload, timeout=120.0
+    ) as r:
         r.raise_for_status()
         for line in r.iter_lines():
             if not line.startswith("data:"):
@@ -111,9 +120,13 @@ def main():
         try:
             with httpx.Client() as c:
                 ttft_a, total_a = stream_ttft(c, base, args.model, args.max_tokens)
-                print(f"  TTFT={ttft_a:.0f}ms total={total_a:.0f}ms (cold disk; populates)")
+                print(
+                    f"  TTFT={ttft_a:.0f}ms total={total_a:.0f}ms (cold disk; populates)"
+                )
                 s = c.get(f"{base}/v1/cache/stats", timeout=5.0).json()
-                print(f"  stats: stores={s['stores']} disk_writes={s.get('disk_writes')}")
+                print(
+                    f"  stats: stores={s['stores']} disk_writes={s.get('disk_writes')}"
+                )
         finally:
             stop_server(proc)
 

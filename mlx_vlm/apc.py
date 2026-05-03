@@ -49,7 +49,7 @@ import re
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
@@ -260,7 +260,9 @@ def _safetensors_dtype_info(dtype: str):
     return mapping.get(dtype)
 
 
-def _safetensors_tensor_bounds(entry: dict) -> Optional[Tuple[int, int, Tuple[int, ...]]]:
+def _safetensors_tensor_bounds(
+    entry: dict,
+) -> Optional[Tuple[int, int, Tuple[int, ...]]]:
     try:
         start, end = entry["data_offsets"]
         shape = tuple(int(x) for x in entry["shape"])
@@ -293,7 +295,9 @@ def _mlx_array_from_safetensors_bytes(buf, entry: dict) -> Optional[mx.array]:
     return out
 
 
-def _read_safetensors_tensor(path: Path, data_start: int, entry: dict) -> Optional[mx.array]:
+def _read_safetensors_tensor(
+    path: Path, data_start: int, entry: dict
+) -> Optional[mx.array]:
     bounds = _safetensors_tensor_bounds(entry)
     if bounds is None:
         return None
@@ -374,12 +378,14 @@ def _free_ram_bytes() -> Optional[int]:
     """
     try:
         import psutil  # type: ignore
+
         return int(psutil.virtual_memory().available)
     except Exception:
         pass
     # macOS fallback: parse vm_stat. Cheap; runs in <2ms typically.
     try:
         import subprocess
+
         out = subprocess.check_output(["vm_stat"], timeout=1.0).decode("utf-8")
         page_size = 16384  # default on Apple Silicon; refined below
         free_pages = 0
@@ -504,13 +510,16 @@ class DiskBlockStore:
         if n_orphans:
             logger.info(
                 "APC disk: removed %d orphaned partial file(s) from %s",
-                n_orphans, self.dir,
+                n_orphans,
+                self.dir,
             )
         # Build index from existing shards and compute current byte usage.
         self._disk_bytes = self._rebuild_index()
 
         self._workers = [
-            threading.Thread(target=self._writer_loop, daemon=True, name=f"apc-disk-{i}")
+            threading.Thread(
+                target=self._writer_loop, daemon=True, name=f"apc-disk-{i}"
+            )
             for i in range(max(1, num_workers))
         ]
         for t in self._workers:
@@ -522,7 +531,7 @@ class DiskBlockStore:
         stem = path.stem
         if not stem.startswith(cls.SHARD_PREFIX):
             return False
-        rest = stem[len(cls.SHARD_PREFIX):]
+        rest = stem[len(cls.SHARD_PREFIX) :]
         if len(rest) != 32:
             return False
         return all(c in "0123456789abcdef" for c in rest)
@@ -691,7 +700,9 @@ class DiskBlockStore:
             self.evictions += evicted
             logger.info(
                 "APC disk: evicted %d shard(s); now %.1f MB / %.1f MB cap",
-                evicted, self._disk_bytes / 1e6, self.max_bytes / 1e6,
+                evicted,
+                self._disk_bytes / 1e6,
+                self.max_bytes / 1e6,
             )
         return evicted
 
@@ -783,8 +794,7 @@ class DiskBlockStore:
             return []
         if self._read_mode == "mmap":
             return [
-                self.load(h, wait_in_flight_ms=wait_in_flight_ms)
-                for h in block_hashes
+                self.load(h, wait_in_flight_ms=wait_in_flight_ms) for h in block_hashes
             ]
 
         entries: List[Optional[Tuple[Path, int]]] = []
@@ -799,9 +809,9 @@ class DiskBlockStore:
                         entry = self._index.get(h)
             entries.append(entry)
 
-        out: List[Optional[Tuple[List[mx.array], List[mx.array], dict]]] = [
-            None
-        ] * len(block_hashes)
+        out: List[Optional[Tuple[List[mx.array], List[mx.array], dict]]] = [None] * len(
+            block_hashes
+        )
         i = 0
         while i < len(entries):
             entry = entries[i]
@@ -875,7 +885,9 @@ class DiskBlockStore:
         if not block_indices:
             return None
         start_idx = block_indices[0]
-        if list(block_indices) != list(range(start_idx, start_idx + len(block_indices))):
+        if list(block_indices) != list(
+            range(start_idx, start_idx + len(block_indices))
+        ):
             return None
         parsed = self._open_shard_header(shard_path)
         if parsed is None:
@@ -1024,8 +1036,7 @@ class DiskBlockStore:
                 )
             )
             metadata.extend(
-                self._decode_block_metadata(file_metadata, idx)
-                for idx in block_indices
+                self._decode_block_metadata(file_metadata, idx) for idx in block_indices
             )
             try:
                 os.utime(shard_path, None)
@@ -1060,16 +1071,8 @@ class DiskBlockStore:
                 k_parts.append(k[..., token_start:slice_end, :])
                 v_parts.append(v[..., token_start:slice_end, :])
 
-            k_out = (
-                k_parts[0]
-                if len(k_parts) == 1
-                else mx.concatenate(k_parts, axis=2)
-            )
-            v_out = (
-                v_parts[0]
-                if len(v_parts) == 1
-                else mx.concatenate(v_parts, axis=2)
-            )
+            k_out = k_parts[0] if len(k_parts) == 1 else mx.concatenate(k_parts, axis=2)
+            v_out = v_parts[0] if len(v_parts) == 1 else mx.concatenate(v_parts, axis=2)
             mx.eval(k_out, v_out)
             keys.append(k_out)
             values.append(v_out)
@@ -1119,13 +1122,9 @@ class DiskBlockStore:
         if k_all.shape[1] != num_layers or v_all.shape[1] != num_layers:
             return None
 
-        keys = [
-            mx.transpose(k_all[:, l, ...], (1, 2, 0, 3))
-            for l in range(num_layers)
-        ]
+        keys = [mx.transpose(k_all[:, l, ...], (1, 2, 0, 3)) for l in range(num_layers)]
         values = [
-            mx.transpose(v_all[:, l, ...], (1, 2, 0, 3))
-            for l in range(num_layers)
+            mx.transpose(v_all[:, l, ...], (1, 2, 0, 3)) for l in range(num_layers)
         ]
         metadata = [
             self._decode_block_metadata(file_metadata, idx) for idx in block_indices
@@ -1222,8 +1221,7 @@ class DiskBlockStore:
             v_buf.extend(v_raw)
             total_tokens += k_shape[0]
             metadata.extend(
-                self._decode_block_metadata(file_metadata, idx)
-                for idx in block_indices
+                self._decode_block_metadata(file_metadata, idx) for idx in block_indices
             )
             try:
                 os.utime(shard_path, None)
@@ -1282,15 +1280,9 @@ class DiskBlockStore:
         if v_bitcast_to is not None:
             values = [v.view(v_bitcast_to) for v in values]
         if k_bitcast_to is not None:
-            keys = [
-                mx.contiguous(k + mx.array(0, dtype=k.dtype))
-                for k in keys
-            ]
+            keys = [mx.contiguous(k + mx.array(0, dtype=k.dtype)) for k in keys]
         if v_bitcast_to is not None:
-            values = [
-                mx.contiguous(v + mx.array(0, dtype=v.dtype))
-                for v in values
-            ]
+            values = [mx.contiguous(v + mx.array(0, dtype=v.dtype)) for v in values]
         mx.eval(keys + values)
         return keys, values, metadata
 
@@ -1397,7 +1389,9 @@ class DiskBlockStore:
         trace_concat_t0 = time.perf_counter()
         for l in range(num_layers):
             keys.append(mx.concatenate([seg[0][l] for seg in loaded_segments], axis=2))
-            values.append(mx.concatenate([seg[1][l] for seg in loaded_segments], axis=2))
+            values.append(
+                mx.concatenate([seg[1][l] for seg in loaded_segments], axis=2)
+            )
         mx.eval(keys + values)
         trace_concat_t1 = time.perf_counter()
         if trace:
@@ -1469,9 +1463,7 @@ class DiskBlockStore:
                 ]
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 return [None] * len(block_indices)
-            loaded = self.load_layer_major_prefix(
-                block_hashes, preserve_capacity=False
-            )
+            loaded = self.load_layer_major_prefix(block_hashes, preserve_capacity=False)
             if loaded is None:
                 return [None] * len(block_indices)
             layer_keys, layer_values, metadatas = loaded
@@ -1557,7 +1549,11 @@ class DiskBlockStore:
                 values.append(v)
             if ok:
                 out.append(
-                    (keys, values, self._decode_block_metadata(file_metadata, block_idx))
+                    (
+                        keys,
+                        values,
+                        self._decode_block_metadata(file_metadata, block_idx),
+                    )
                 )
             else:
                 out.append(None)
@@ -1736,12 +1732,14 @@ class DiskBlockStore:
         metadata["segment_index"] = str(int(snapshot.segment_index))
         metadata["segment_count"] = str(int(snapshot.segment_count))
         for idx, b in enumerate(blocks):
-            metadata[f"b{idx}_meta"] = json.dumps({
-                "block_hash": int(b.block_hash),
-                "parent_hash": int(b.parent_hash),
-                "extra_hash": int(b.extra_hash),
-                "token_ids": [int(t) for t in b.token_ids],
-            })
+            metadata[f"b{idx}_meta"] = json.dumps(
+                {
+                    "block_hash": int(b.block_hash),
+                    "parent_hash": int(b.parent_hash),
+                    "extra_hash": int(b.extra_hash),
+                    "token_ids": [int(t) for t in b.token_ids],
+                }
+            )
 
         ranges = self._contiguous_ranges([b.source_block_idx for b in blocks])
         layer_keys: List[mx.array] = []
@@ -1760,7 +1758,9 @@ class DiskBlockStore:
         layer_keys, layer_values = self._pad_layer_major_arrays(
             layer_keys, layer_values
         )
-        self._save_layer_major_shard(path, blocks, metadata, layer_keys, layer_values, bs)
+        self._save_layer_major_shard(
+            path, blocks, metadata, layer_keys, layer_values, bs
+        )
         return [b.block_hash for b in blocks]
 
     def _write_block_snapshot(
@@ -1773,12 +1773,14 @@ class DiskBlockStore:
         for idx, b in enumerate(blocks):
             if b.keys is None or b.values is None:
                 continue
-            metadata[f"b{idx}_meta"] = json.dumps({
-                "block_hash": int(b.block_hash),
-                "parent_hash": int(b.parent_hash),
-                "extra_hash": int(b.extra_hash),
-                "token_ids": [int(t) for t in b.token_ids],
-            })
+            metadata[f"b{idx}_meta"] = json.dumps(
+                {
+                    "block_hash": int(b.block_hash),
+                    "parent_hash": int(b.parent_hash),
+                    "extra_hash": int(b.extra_hash),
+                    "token_ids": [int(t) for t in b.token_ids],
+                }
+            )
         layer_keys: List[mx.array] = []
         layer_values: List[mx.array] = []
         for l in range(num_layers):
@@ -2008,10 +2010,7 @@ class APCManager:
         with self.lock:
             if self._disk_min_free_ram_bytes > 0:
                 free_now = _free_ram_bytes()
-                if (
-                    free_now is not None
-                    and free_now < self._disk_min_free_ram_bytes
-                ):
+                if free_now is not None and free_now < self._disk_min_free_ram_bytes:
                     logger.info(
                         "APC: skipping disk prompt-cache restore "
                         "(free RAM %.1f GB < %.1f GB)",
@@ -2133,13 +2132,15 @@ class APCManager:
             # Recompute hash chain over already-cached prefix to get parent for first new block.
             for i in range(skip_full):
                 chunk = tuple(
-                    int(t) for t in token_ids[i * self.block_size : (i + 1) * self.block_size]
+                    int(t)
+                    for t in token_ids[i * self.block_size : (i + 1) * self.block_size]
                 )
                 parent = _hash_tokens(parent, chunk, extra_hash)
 
             for i in range(skip_full, n_full):
                 chunk = tuple(
-                    int(t) for t in token_ids[i * self.block_size : (i + 1) * self.block_size]
+                    int(t)
+                    for t in token_ids[i * self.block_size : (i + 1) * self.block_size]
                 )
                 h = _hash_tokens(parent, chunk, extra_hash)
                 if self.disk is not None and not self.disk.has(h):

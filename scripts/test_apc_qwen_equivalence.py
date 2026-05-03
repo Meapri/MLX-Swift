@@ -18,7 +18,6 @@ Expected result:
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -34,7 +33,6 @@ from mlx_vlm import models as _models
 from mlx_vlm.apc import APCManager, make_warm_kv_cache
 from mlx_vlm.generate import stream_generate
 from mlx_vlm.prompt_utils import apply_chat_template
-
 
 SYSTEM = "You are a careful technical writer. Answer in clear prose."
 UNIT = (
@@ -73,9 +71,7 @@ def make_cache(model):
 def embed(model, ids):
     out = model.get_input_embeddings(ids, None, mask=None)
     kwargs = {
-        k: v
-        for k, v in out.to_dict().items()
-        if k != "inputs_embeds" and v is not None
+        k: v for k, v in out.to_dict().items() if k != "inputs_embeds" and v is not None
     }
     return out.inputs_embeds, kwargs
 
@@ -234,9 +230,7 @@ def main() -> int:
     reset_rope(model)
     split_cache = make_cache(model)
     feed_all(model, ids[:, :prefix_len], split_cache, args.chunk_size)
-    split_logprobs, split_cache = tail_logprobs(
-        model, ids[:, prefix_len:], split_cache
-    )
+    split_logprobs, split_cache = tail_logprobs(model, ids[:, prefix_len:], split_cache)
 
     matched_tokens, warm_cache = store_apc_prefix(
         ids_list,
@@ -247,7 +241,9 @@ def main() -> int:
     warm_logprobs, warm_cache = tail_logprobs(model, ids[:, prefix_len:], warm_cache)
 
     print("\nLogprob comparisons")
-    print_logprob_comparison("full/chunked vs split-recompute", full_logprobs, split_logprobs)
+    print_logprob_comparison(
+        "full/chunked vs split-recompute", full_logprobs, split_logprobs
+    )
     exact_max, _, _ = print_logprob_comparison(
         "split-recompute vs APC warm", split_logprobs, warm_logprobs
     )

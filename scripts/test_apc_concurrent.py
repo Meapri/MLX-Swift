@@ -7,17 +7,16 @@ verifies:
   3. Generated text is consistent across requests sharing identical prompts
      (deterministic with temperature=0).
 """
+
 from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import sys
 import time
 from typing import List, Tuple
 
 import httpx
-
 
 SHARED_SYSTEM = (
     "You are a careful technical writer producing reference material. "
@@ -104,9 +103,18 @@ async def main():
         # Concurrent rounds: each round fires N requests in parallel
         all_texts: List[str] = [warm_text]
         for round_idx in range(args.n_rounds):
-            print(f"\nRound {round_idx + 1}: firing {args.n_concurrent} concurrent requests…")
+            print(
+                f"\nRound {round_idx + 1}: firing {args.n_concurrent} concurrent requests…"
+            )
             tasks = [
-                fire(client, url, args.model, VARIANTS[i % len(VARIANTS)], i, max_tokens=args.max_tokens)
+                fire(
+                    client,
+                    url,
+                    args.model,
+                    VARIANTS[i % len(VARIANTS)],
+                    i,
+                    max_tokens=args.max_tokens,
+                )
                 for i in range(args.n_concurrent)
             ]
             t0 = time.perf_counter()
@@ -156,6 +164,7 @@ async def main():
         ] * args.n_rounds
         warm_texts = all_texts[1:]  # drop the cold warm-up entry
         from collections import defaultdict
+
         by_prompt = defaultdict(list)
         for t, v in zip(warm_texts, warm_variants_per_round):
             by_prompt[v].append(t)

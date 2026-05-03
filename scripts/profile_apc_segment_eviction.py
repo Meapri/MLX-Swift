@@ -26,12 +26,11 @@ import psutil
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mlx_vlm.apc import (  # noqa: E402
+    SEED_PARENT_HASH,
     APCManager,
     DiskBlockStore,
-    SEED_PARENT_HASH,
     _hash_tokens,
 )
-
 
 N_LAYERS = 36
 N_KV_HEADS = 8
@@ -192,8 +191,10 @@ def main() -> None:
 
     os.environ["APC_DISK_SHARD_MAX_BLOCKS"] = str(max(1, args.shard_max_blocks))
     max_bytes = int(args.disk_cap_gb * (1 << 30)) if args.disk_cap_gb > 0 else None
-    root = Path(args.disk_path) if args.disk_path else Path(
-        tempfile.mkdtemp(prefix="apc-segment-profile-")
+    root = (
+        Path(args.disk_path)
+        if args.disk_path
+        else Path(tempfile.mkdtemp(prefix="apc-segment-profile-"))
     )
     root.mkdir(parents=True, exist_ok=True)
 

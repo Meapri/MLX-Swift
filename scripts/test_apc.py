@@ -23,20 +23,18 @@ import shutil
 import sys
 import tempfile
 import time
-from typing import List
 
 import mlx.core as mx
 import numpy as np
-
 
 # Make the repo importable when run directly.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mlx_vlm.apc import (  # noqa: E402
+    SEED_PARENT_HASH,
     APCBlock,
     APCManager,
     DiskBlockStore,
-    SEED_PARENT_HASH,
     _hash_tokens,
     hash_image_payload,
     make_warm_kv_cache,
@@ -103,7 +101,8 @@ def test_image_hash() -> None:
     _info("zero hash for empty input", hash_image_payload(None, None) == 0)
     _info(
         "same path → same hash",
-        hash_image_payload(image_ref="cat.jpg") == hash_image_payload(image_ref="cat.jpg"),
+        hash_image_payload(image_ref="cat.jpg")
+        == hash_image_payload(image_ref="cat.jpg"),
     )
 
 
@@ -122,7 +121,9 @@ def test_lookup_and_store() -> None:
     _info("first lookup misses", n == 0 and m == [])
 
     # Store
-    new_blocks = mgr.store_kv_blocks(tokens, layer_keys, layer_values, skip_first_n_tokens=0)
+    new_blocks = mgr.store_kv_blocks(
+        tokens, layer_keys, layer_values, skip_first_n_tokens=0
+    )
     _info("3 blocks stored", len(new_blocks) == 3)
     mgr.release(new_blocks)
 
@@ -144,10 +145,7 @@ def test_lookup_and_store() -> None:
     warm_padded = make_warm_kv_cache(m2, min_capacity_tokens=3 * bs + 17)
     _info(
         "warm cache can preserve spare capacity",
-        all(
-            c.offset == 3 * bs and c.keys.shape[2] >= 3 * bs + 17
-            for c in warm_padded
-        ),
+        all(c.offset == 3 * bs and c.keys.shape[2] >= 3 * bs + 17 for c in warm_padded),
     )
 
     # Partial-prefix mismatch: alter the 3rd block's tokens → should match 2 blocks
@@ -324,8 +322,7 @@ def test_disk_layer_major_warm_prefix() -> None:
         warm_after_evict, matched_after_evict = mgr.lookup_prefix_disk_cache(toks)
         _info(
             "segment eviction preserves usable prefix",
-            warm_after_evict is not None
-            and 0 < matched_after_evict < seq_len,
+            warm_after_evict is not None and 0 < matched_after_evict < seq_len,
         )
         disk.close()
     finally:

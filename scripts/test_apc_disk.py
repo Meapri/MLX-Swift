@@ -22,7 +22,6 @@ from pathlib import Path
 
 import httpx
 
-
 PROMPT = (
     "You are a careful technical writer producing reference material. "
     "Always reply with a multi-paragraph explanation: at least three paragraphs, "
@@ -62,7 +61,15 @@ def start_server(model: str, port: int, disk_path: Path) -> subprocess.Popen:
     env["APC_DISK_PATH"] = str(disk_path)
     env["MLX_VLM_PRELOAD_MODEL"] = model
     proc = subprocess.Popen(
-        [sys.executable, "-m", "mlx_vlm.server", "--host", "127.0.0.1", "--port", str(port)],
+        [
+            sys.executable,
+            "-m",
+            "mlx_vlm.server",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ],
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -97,7 +104,9 @@ def main():
     p.add_argument("--model", default="mlx-community/SmolVLM-Instruct-bf16")
     p.add_argument("--port", type=int, default=8089)
     p.add_argument("--max-tokens", type=int, default=8)
-    p.add_argument("--keep-disk", action="store_true", help="don't delete the disk dir at the end")
+    p.add_argument(
+        "--keep-disk", action="store_true", help="don't delete the disk dir at the end"
+    )
     args = p.parse_args()
 
     disk_root = Path(tempfile.mkdtemp(prefix="apc-disk-"))
@@ -114,7 +123,9 @@ def main():
                 reset(c, base)
                 chat(c, base, args.model, args.max_tokens)
                 s1 = stats(c, base)
-                print(f"  after request: stores={s1['stores']} disk_writes={s1.get('disk_writes', '?')}")
+                print(
+                    f"  after request: stores={s1['stores']} disk_writes={s1.get('disk_writes', '?')}"
+                )
                 if s1.get("disk_writes", 0) <= 0:
                     failures.append("phase 1 should have written to disk")
         finally:

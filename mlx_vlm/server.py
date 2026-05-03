@@ -27,6 +27,7 @@ from huggingface_hub import scan_cache_dir
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import Required, TypeAlias, TypedDict
 
+from . import apc as _apc
 from .generate import (
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
@@ -48,7 +49,6 @@ from .prompt_utils import apply_chat_template
 from .sample_utils import top_p_sampling
 from .structured import build_json_schema_logits_processor
 from .tool_parsers import _infer_tool_parser, load_tool_module
-from . import apc as _apc
 from .utils import load, prepare_inputs
 from .version import __version__
 from .vision_cache import VisionFeatureCache
@@ -1963,6 +1963,7 @@ async def responses_endpoint(request: Request):
                 output_tokens = 0
 
                 if response_generator is not None:
+
                     def _blocking_resp():
                         ctx_, ti = response_generator.generate(
                             prompt=formatted_prompt,

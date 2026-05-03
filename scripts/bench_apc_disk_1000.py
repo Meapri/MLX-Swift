@@ -25,7 +25,6 @@ import json
 import os
 import shutil
 import signal
-import statistics
 import subprocess
 import sys
 import tempfile
@@ -33,7 +32,6 @@ import time
 from pathlib import Path
 
 import httpx
-
 
 SYSTEM = (
     "You are a careful technical writer producing detailed reference "
@@ -66,9 +64,7 @@ def chat(client, base, system, user, max_tokens=4, model: str = ""):
         "temperature": 0.0,
     }
     t0 = time.perf_counter()
-    r = client.post(
-        f"{base}/v1/chat/completions", json=payload, timeout=300.0
-    )
+    r = client.post(f"{base}/v1/chat/completions", json=payload, timeout=300.0)
     elapsed = time.perf_counter() - t0
     r.raise_for_status()
     data = r.json()
@@ -124,8 +120,13 @@ def reset_stats(client, base):
     client.post(f"{base}/v1/cache/reset", timeout=10.0)
 
 
-def start_server(model, port, disk_path: Path | None, disk_max_gb: float | None,
-                 num_blocks: int = 4096) -> subprocess.Popen:
+def start_server(
+    model,
+    port,
+    disk_path: Path | None,
+    disk_max_gb: float | None,
+    num_blocks: int = 4096,
+) -> subprocess.Popen:
     env = os.environ.copy()
     env["APC_ENABLED"] = "1"
     env["APC_NUM_BLOCKS"] = str(num_blocks)
@@ -135,9 +136,18 @@ def start_server(model, port, disk_path: Path | None, disk_max_gb: float | None,
         env["APC_DISK_MAX_GB"] = str(disk_max_gb)
     env["MLX_VLM_PRELOAD_MODEL"] = model
     proc = subprocess.Popen(
-        [sys.executable, "-m", "mlx_vlm.server",
-         "--host", "127.0.0.1", "--port", str(port)],
-        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        [
+            sys.executable,
+            "-m",
+            "mlx_vlm.server",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     base = f"http://127.0.0.1:{port}"
     deadline = time.time() + 600.0  # gemma 12B can be slow to load
@@ -192,9 +202,15 @@ def _make_test_user(target_tokens: int) -> str:
     return out
 
 
-def run_for_model(model: str, port: int, target_blocks: int, fill_prompts: int,
-                  disk_max_gb: float, no_apc: bool = False,
-                  test_prompt_tokens: int = 500) -> dict:
+def run_for_model(
+    model: str,
+    port: int,
+    target_blocks: int,
+    fill_prompts: int,
+    disk_max_gb: float,
+    no_apc: bool = False,
+    test_prompt_tokens: int = 500,
+) -> dict:
     print(f"\n{'=' * 70}\nModel: {model}\n{'=' * 70}")
     test_user = _make_test_user(test_prompt_tokens)
 
@@ -212,12 +228,13 @@ def run_for_model(model: str, port: int, target_blocks: int, fill_prompts: int,
                 stream_ttft(c, base, "warmup", "hi", max_tokens=1, model=model)
                 # Cold measurement
                 r = stream_ttft(c, base, SYSTEM, test_user, max_tokens=2, model=model)
-                print(f"      cold TTFT: {r['ttft_ms']:.0f}ms  "
-                      f"prompt_tokens: {r['prompt_tokens']}")
+                print(
+                    f"      cold TTFT: {r['ttft_ms']:.0f}ms  "
+                    f"prompt_tokens: {r['prompt_tokens']}"
+                )
                 result["cold_ttft_ms"] = r["ttft_ms"]
                 result["cold_prompt_tokens"] = r["prompt_tokens"]
-                cold_prompt_tps = (r["prompt_tokens"] /
-                                   ((r["ttft_ms"] / 1000.0) or 1.0))
+                cold_prompt_tps = r["prompt_tokens"] / ((r["ttft_ms"] / 1000.0) or 1.0)
                 result["cold_prompt_tps"] = cold_prompt_tps
                 print(f"      cold prompt_tps ≈ {cold_prompt_tps:.0f}")
         finally:
@@ -227,10 +244,11 @@ def run_for_model(model: str, port: int, target_blocks: int, fill_prompts: int,
             return result
 
         # ---- Step B: fill phase ----
-        print(f"  [B] fill {fill_prompts} prompts → ~{target_blocks} blocks "
-              f"(disk cap {disk_max_gb} GB)…")
-        proc = start_server(model, port, disk_path=disk_root,
-                            disk_max_gb=disk_max_gb)
+        print(
+            f"  [B] fill {fill_prompts} prompts → ~{target_blocks} blocks "
+            f"(disk cap {disk_max_gb} GB)…"
+        )
+        proc = start_server(model, port, disk_path=disk_root, disk_max_gb=disk_max_gb)
         try:
             with httpx.Client() as c:
                 # Generate fill prompts
@@ -241,10 +259,12 @@ def run_for_model(model: str, port: int, target_blocks: int, fill_prompts: int,
                 fill_elapsed = time.perf_counter() - t0
                 fill_stats = stats(c, base)
                 print(f"      fill done in {fill_elapsed:.1f}s")
-                print(f"      stores={fill_stats['stores']} "
-                      f"disk_writes={fill_stats.get('disk_writes', 0)} "
-                      f"evictions={fill_stats['evictions']} "
-                      f"disk_bytes={fill_stats.get('disk_bytes', 0)/1e6:.1f}MB")
+                print(
+                    f"      stores={fill_stats['stores']} "
+                    f"disk_writes={fill_stats.get('disk_writes', 0)} "
+                    f"evictions={fill_stats['evictions']} "
+                    f"disk_bytes={fill_stats.get('disk_bytes', 0)/1e6:.1f}MB"
+                )
                 result["fill_stats"] = fill_stats
                 result["fill_elapsed_s"] = fill_elapsed
 
@@ -259,20 +279,17 @@ def run_for_model(model: str, port: int, target_blocks: int, fill_prompts: int,
         # Count files on disk now
         ns_dirs = [d for d in disk_root.iterdir() if d.is_dir()]
         if ns_dirs:
-            files = [f for f in ns_dirs[0].glob("*.safetensors")
-                     if len(f.stem) == 16]
+            files = [f for f in ns_dirs[0].glob("*.safetensors") if len(f.stem) == 16]
             disk_size = sum(f.stat().st_size for f in files)
             result["files_on_disk"] = len(files)
             result["bytes_on_disk"] = disk_size
-            print(f"      files on disk: {len(files)}, "
-                  f"size: {disk_size/1e6:.1f}MB")
+            print(f"      files on disk: {len(files)}, " f"size: {disk_size/1e6:.1f}MB")
 
         time.sleep(1.5)
 
         # ---- Step C: restart, warm rounds ----
         print(f"  [C] restart + 2 warm rounds…")
-        proc = start_server(model, port, disk_path=disk_root,
-                            disk_max_gb=disk_max_gb)
+        proc = start_server(model, port, disk_path=disk_root, disk_max_gb=disk_max_gb)
         try:
             with httpx.Client() as c:
                 # Tiny prompt to warm JIT before measuring
@@ -289,18 +306,26 @@ def run_for_model(model: str, port: int, target_blocks: int, fill_prompts: int,
                 w1_tps = r1["prompt_tokens"] / ((r1["ttft_ms"] / 1000.0) or 1.0)
                 w2_tps = r2["prompt_tokens"] / ((r2["ttft_ms"] / 1000.0) or 1.0)
 
-                print(f"      warm-1 TTFT: {r1['ttft_ms']:.0f}ms  "
-                      f"prompt_tokens: {r1['prompt_tokens']}  "
-                      f"prompt_tps≈{w1_tps:.0f}")
-                print(f"        stats: hits={s1['lookups_hit']} "
-                      f"disk_hits={s1.get('disk_hits',0)} "
-                      f"matched_tokens={s1['matched_tokens']}")
-                print(f"      warm-2 TTFT: {r2['ttft_ms']:.0f}ms  "
-                      f"prompt_tokens: {r2['prompt_tokens']}  "
-                      f"prompt_tps≈{w2_tps:.0f}")
-                print(f"        stats: hits={s2['lookups_hit']} "
-                      f"disk_hits={s2.get('disk_hits',0)} "
-                      f"matched_tokens={s2['matched_tokens']}")
+                print(
+                    f"      warm-1 TTFT: {r1['ttft_ms']:.0f}ms  "
+                    f"prompt_tokens: {r1['prompt_tokens']}  "
+                    f"prompt_tps≈{w1_tps:.0f}"
+                )
+                print(
+                    f"        stats: hits={s1['lookups_hit']} "
+                    f"disk_hits={s1.get('disk_hits',0)} "
+                    f"matched_tokens={s1['matched_tokens']}"
+                )
+                print(
+                    f"      warm-2 TTFT: {r2['ttft_ms']:.0f}ms  "
+                    f"prompt_tokens: {r2['prompt_tokens']}  "
+                    f"prompt_tps≈{w2_tps:.0f}"
+                )
+                print(
+                    f"        stats: hits={s2['lookups_hit']} "
+                    f"disk_hits={s2.get('disk_hits',0)} "
+                    f"matched_tokens={s2['matched_tokens']}"
+                )
 
                 result["warm1_ttft_ms"] = r1["ttft_ms"]
                 result["warm1_prompt_tps"] = w1_tps
@@ -330,14 +355,26 @@ def main():
         ],
     )
     ap.add_argument("--target-blocks", type=int, default=1000)
-    ap.add_argument("--fill-prompts", type=int, default=120,
-                    help="number of varied prompts to submit during fill")
-    ap.add_argument("--disk-cap-gb", type=float, default=2.0,
-                    help="set lower than full to force eviction")
+    ap.add_argument(
+        "--fill-prompts",
+        type=int,
+        default=120,
+        help="number of varied prompts to submit during fill",
+    )
+    ap.add_argument(
+        "--disk-cap-gb",
+        type=float,
+        default=2.0,
+        help="set lower than full to force eviction",
+    )
     ap.add_argument("--port-base", type=int, default=8089)
-    ap.add_argument("--test-prompt-tokens", type=int, default=500,
-                    help="size of the test prompt — longer surfaces "
-                         "more prefill savings from disk-restore")
+    ap.add_argument(
+        "--test-prompt-tokens",
+        type=int,
+        default=500,
+        help="size of the test prompt — longer surfaces "
+        "more prefill savings from disk-restore",
+    )
     args = ap.parse_args()
 
     # gemma3 has custom make_cache (Mamba-hybrid), so APC opts out — only
@@ -348,10 +385,15 @@ def main():
     for i, model in enumerate(args.models):
         no_apc = any(s in model.lower() for s in NO_APC)
         try:
-            r = run_for_model(model, args.port_base + i,
-                              args.target_blocks, args.fill_prompts,
-                              args.disk_cap_gb, no_apc=no_apc,
-                              test_prompt_tokens=args.test_prompt_tokens)
+            r = run_for_model(
+                model,
+                args.port_base + i,
+                args.target_blocks,
+                args.fill_prompts,
+                args.disk_cap_gb,
+                no_apc=no_apc,
+                test_prompt_tokens=args.test_prompt_tokens,
+            )
             results.append(r)
         except Exception as e:
             print(f"  ✗ {model} bench failed: {e}")
@@ -396,8 +438,8 @@ def main():
         ttft_save_disk = r["cold_ttft_ms"] - r["warm1_ttft_ms"]
         ttft_save_mem = r["cold_ttft_ms"] - r["warm2_ttft_ms"]
         prefill_save_disk = (
-            r["cold_prompt_tokens"] / max(r["cold_prompt_tps"], 1) -
-            r["cold_prompt_tokens"] / max(r["warm1_prompt_tps"], 1)
+            r["cold_prompt_tokens"] / max(r["cold_prompt_tps"], 1)
+            - r["cold_prompt_tokens"] / max(r["warm1_prompt_tps"], 1)
         ) * 1000.0
         print(
             f"  {r['model']}\n"
