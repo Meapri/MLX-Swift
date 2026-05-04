@@ -97,6 +97,11 @@ def tenant_scoped_hash(tenant: Optional[str], payload_hash: int = 0) -> int:
     return int.from_bytes(h.digest()[:8], "little", signed=True)
 
 
+def _copy_mlx_array(x: mx.array) -> mx.array:
+    """Materialize ``x`` into a fresh MLX-owned contiguous buffer."""
+    return mx.contiguous(mx.array(x, dtype=x.dtype))
+
+
 def hash_image_payload(
     pixel_values: Optional[mx.array] = None,
     image_ref: Any = None,
@@ -1299,9 +1304,9 @@ class DiskBlockStore:
         if v_bitcast_to is not None:
             values = [v.view(v_bitcast_to) for v in values]
         if k_bitcast_to is not None:
-            keys = [mx.contiguous(k + mx.array(0, dtype=k.dtype)) for k in keys]
+            keys = [_copy_mlx_array(k) for k in keys]
         if v_bitcast_to is not None:
-            values = [mx.contiguous(v + mx.array(0, dtype=v.dtype)) for v in values]
+            values = [_copy_mlx_array(v) for v in values]
         mx.eval(keys + values)
         return keys, values, metadata
 
@@ -2090,6 +2095,10 @@ class APCManager:
                 return None, 0
 
         warm_cache = make_warm_kv_cache_from_layers(keys, values, matched_tokens)
+        # Disk reads and warm-cache construction intentionally happen outside
+        # the manager lock. If clear()/reset_stats() races here, the restored
+        # tensors are still valid; only the hit counter lands in the new stats
+        # window.
         with self.lock:
             self.stats.disk_hits += len(block_hashes)
             self.stats.hits += 1
@@ -2211,15 +2220,14 @@ class APCManager:
                 end = start + self.block_size
                 # Deep-copy each slice into its own buffer so the block tensor
                 # is decoupled from the caller's cache, which mlx.clear_cache
-                # may release after generation. mx.contiguous alone returns a
-                # view when the source is already row-contiguous, so we add a
-                # zero to force a fresh allocation through the graph.
+                # may release after generation. mx.contiguous alone can return
+                # a view when the source is already row-contiguous.
                 k_slabs = [
-                    mx.contiguous(k[..., start:end, :] + mx.array(0, dtype=k.dtype))
+                    _copy_mlx_array(k[..., start:end, :])
                     for k in layer_keys
                 ]
                 v_slabs = [
-                    mx.contiguous(v[..., start:end, :] + mx.array(0, dtype=v.dtype))
+                    _copy_mlx_array(v[..., start:end, :])
                     for v in layer_values
                 ]
                 mx.eval(k_slabs + v_slabs)
@@ -2308,7 +2316,8 @@ def make_warm_kv_cache(
     num_layers = len(matched_blocks[0].keys)
     out: List[Any] = []
     prefix_len = sum(b.keys[0].shape[-2] for b in matched_blocks)
-    kv_step = int(getattr(KVCache, "step", 256))
+    step_probe = KVCache()
+    kv_step = int(getattr(step_probe, "step", getattr(KVCache, "step", 256)))
     capacity = prefix_len
     if min_capacity_tokens is not None:
         capacity = max(prefix_len, int(min_capacity_tokens))
@@ -2329,7 +2338,7 @@ def make_warm_kv_cache(
             merged_v = mx.concatenate(
                 [merged_v, mx.zeros(v_pad_shape, dtype=merged_v.dtype)], axis=2
             )
-        c = KVCache()
+        c = step_probe if layer_idx == 0 else KVCache()
         c.keys = merged_k
         c.values = merged_v
         c.offset = prefix_len

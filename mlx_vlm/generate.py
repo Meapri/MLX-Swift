@@ -2090,7 +2090,7 @@ class PromptProcessingBatch:
                         "APC mixed prefill requires a prompt cache with finalize()"
                     )
                 finalize()
-        if os.environ.get("APC_DEBUG"):
+        if logger.isEnabledFor(logging.DEBUG) and os.environ.get("APC_DEBUG"):
             c0 = self.prompt_cache[0] if self.prompt_cache else None
             if c0 is not None:
                 off = getattr(c0, "offset", None)
@@ -2648,7 +2648,7 @@ class BatchGenerator:
             # warm and cold rows prefill in a single forward pass.
             n = min(self.prefill_batch_size, len(self._unprocessed_sequences))
             sequences = self._unprocessed_sequences[:n]
-            if os.environ.get("APC_DEBUG"):
+            if logger.isEnabledFor(logging.DEBUG) and os.environ.get("APC_DEBUG"):
                 logger.warning(
                     "APC admit n=%d (pending=%d)",
                     n,

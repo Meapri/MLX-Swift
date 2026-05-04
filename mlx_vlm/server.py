@@ -535,8 +535,17 @@ class ResponseGenerator:
                 self._step(batch_gen, active)
 
             except Exception as e:
-                print(f"Error in generation thread: {e}")
-                traceback.print_exc()
+                logger.exception("Error in generation thread")
+                for info in list(active.values()):
+                    try:
+                        info["rqueue"].put(e)
+                        info["rqueue"].put(None)
+                    except Exception:
+                        pass
+                active.clear()
+                batch_gen = None
+                mx.clear_cache()
+                gc.collect()
 
     def _run_speculative(self):
         """GPU thread loop with DFlash speculative decoding.

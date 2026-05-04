@@ -1,9 +1,11 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import mlx.core as mx
 import pytest
 from fastapi.testclient import TestClient
 
+from mlx_vlm.apc import hash_image_payload
 import mlx_vlm.server as server
 
 
@@ -219,6 +221,32 @@ class TestResponseGenerator:
         args = server._build_gen_args(req)
         assert args.max_tokens == 256
         assert args.enable_thinking is True
+
+    def test_gpu_embed_hashes_pixel_values_without_image_ref(self):
+        class Embed:
+            def to_dict(self):
+                return {"inputs_embeds": mx.zeros((1, 2, 4))}
+
+        class Model:
+            def get_input_embeddings(self, input_ids, pixel_values, mask=None, **kwargs):
+                return Embed()
+
+        response_generator = SimpleNamespace(model=Model(), vision_cache=None)
+        pixel_values = mx.array([[[[1.0, 2.0]]]])
+
+        _, gen_kwargs = server.ResponseGenerator._gpu_embed(
+            response_generator,
+            {
+                "input_ids": mx.array([[1, 2]]),
+                "pixel_values": pixel_values,
+                "attention_mask": mx.array([[1, 1]]),
+            },
+            images=None,
+        )
+
+        assert gen_kwargs["_apc_image_hash"] == hash_image_payload(
+            pixel_values=pixel_values
+        )
 
     def test_extract_chat_response_format_json_schema(self):
         req = SimpleNamespace(

@@ -1147,11 +1147,15 @@ def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
     class BrokenRopeLanguageModel:
         def __init__(self):
             self._rope_deltas = mx.array([1])
+            self._position_ids = mx.array([[0, 1, 2]])
 
         def get_rope_index(self, *args, **kwargs):
             raise ValueError("bad grid")
 
-    model = SimpleNamespace(language_model=BrokenRopeLanguageModel())
+    language_model = BrokenRopeLanguageModel()
+    model = SimpleNamespace(language_model=language_model)
+    rope_deltas_before = language_model._rope_deltas
+    position_ids_before = language_model._position_ids
     kwargs = {}
 
     with caplog.at_level(logging.WARNING, logger="mlx_vlm.generate"):
@@ -1164,6 +1168,8 @@ def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
 
     assert ok is False
     assert "rope_deltas" not in kwargs
+    assert bool(mx.array_equal(language_model._rope_deltas, rope_deltas_before))
+    assert bool(mx.array_equal(language_model._position_ids, position_ids_before))
     assert "falling back to cold prefill" in caplog.text
 
 
