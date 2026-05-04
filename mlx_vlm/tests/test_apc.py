@@ -10,6 +10,7 @@ import numpy as np
 from mlx_vlm.apc import (
     APCManager,
     DiskBlockStore,
+    _copy_mlx_array,
     _hash_tokens,
     harvest_blocks_from_batch_cache,
     hash_image_payload,
@@ -190,6 +191,15 @@ def test_stored_block_tensors_are_decoupled_from_source_cache():
 
     _assert_allclose(stored[0].keys[0], expected_key)
     manager.release(stored)
+
+
+def test_copy_mlx_array_returns_a_distinct_materialized_array():
+    source = mx.arange(8).reshape(1, 1, 8, 1)
+    copied = _copy_mlx_array(source)
+    mx.eval(source, copied)
+
+    assert copied is not source
+    _assert_allclose(copied, source)
 
 
 def test_apc_max_pool_tensors_keeps_disk_persistence(tmp_path, monkeypatch):
