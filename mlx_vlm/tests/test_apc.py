@@ -392,6 +392,57 @@ def test_exact_cache_supports_mixed_kv_and_arrays_cache():
     )
 
 
+def test_exact_cache_supports_rotating_and_chunked_kv_cache():
+    from mlx_lm.models.cache import ChunkedKVCache, KVCache, RotatingKVCache
+
+    block_size = 16
+    manager = APCManager(num_blocks=4, block_size=block_size)
+    token_ids = list(range(48))
+
+    kv = KVCache()
+    kv.keys = mx.ones((1, 1, len(token_ids), 2))
+    kv.values = mx.ones((1, 1, len(token_ids), 2)) * 2
+    kv.offset = len(token_ids)
+
+    rotating = RotatingKVCache(max_size=8, keep=2)
+    rotating.keys = mx.arange(1 * 1 * 8 * 2, dtype=mx.float32).reshape(1, 1, 8, 2)
+    rotating.values = rotating.keys + 100
+    rotating.offset = len(token_ids)
+    rotating._idx = 5
+
+    chunked = ChunkedKVCache(chunk_size=12)
+    chunked.keys = mx.ones((1, 1, 12, 2)) * 3
+    chunked.values = mx.ones((1, 1, 12, 2)) * 4
+    chunked.offset = len(token_ids)
+    chunked.start_position = len(token_ids) - 12
+
+    assert manager.store_exact_cache(
+        token_ids,
+        [kv, rotating, chunked],
+        extra_hash=13,
+    )
+    warm, matched_tokens = manager.lookup_exact_cache(
+        token_ids + [999],
+        extra_hash=13,
+    )
+
+    assert matched_tokens == len(token_ids)
+    assert warm is not None
+    assert isinstance(warm[1], RotatingKVCache)
+    assert warm[1].max_size == rotating.max_size
+    assert warm[1].keep == rotating.keep
+    assert warm[1].offset == rotating.offset
+    assert warm[1]._idx == rotating._idx
+    _assert_allclose(warm[1].keys, rotating.keys)
+    _assert_allclose(warm[1].values, rotating.values)
+    assert isinstance(warm[2], ChunkedKVCache)
+    assert warm[2].chunk_size == chunked.chunk_size
+    assert warm[2].offset == chunked.offset
+    assert warm[2].start_position == chunked.start_position
+    _assert_allclose(warm[2].keys, chunked.keys)
+    _assert_allclose(warm[2].values, chunked.values)
+
+
 def test_exact_cache_disk_restore_rebuilds_index(tmp_path, monkeypatch):
     from mlx_lm.models.cache import ArraysCache, KVCache
 
@@ -432,8 +483,50 @@ def test_exact_cache_disk_restore_rebuilds_index(tmp_path, monkeypatch):
     manager.close()
 
 
+def test_exact_cache_disk_restore_preserves_rotating_kv(tmp_path, monkeypatch):
+    from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+
+    token_ids = list(range(40))
+    kv = KVCache()
+    kv.keys = mx.ones((1, 1, len(token_ids), 2))
+    kv.values = mx.ones((1, 1, len(token_ids), 2)) * 2
+    kv.offset = len(token_ids)
+    rotating = RotatingKVCache(max_size=8, keep=0)
+    rotating.keys = mx.arange(1 * 1 * 8 * 2, dtype=mx.float32).reshape(1, 1, 8, 2)
+    rotating.values = rotating.keys + 10
+    rotating.offset = len(token_ids)
+    rotating._idx = 3
+
+    disk = DiskBlockStore(tmp_path, namespace="rotating-exact")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    assert manager.store_exact_cache(token_ids, [kv, rotating], extra_hash=17)
+    disk._q.join()
+    manager.close()
+
+    disk = DiskBlockStore(tmp_path, namespace="rotating-exact")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    warm, matched_tokens = manager.lookup_exact_cache(
+        token_ids + [999],
+        extra_hash=17,
+    )
+
+    assert matched_tokens == len(token_ids)
+    assert warm is not None
+    assert manager.stats_snapshot()["disk_hits"] == 1
+    assert isinstance(warm[1], RotatingKVCache)
+    assert warm[1].max_size == rotating.max_size
+    assert warm[1].keep == rotating.keep
+    assert warm[1].offset == rotating.offset
+    assert warm[1]._idx == rotating._idx
+    _assert_allclose(warm[1].keys, rotating.keys)
+    _assert_allclose(warm[1].values, rotating.values)
+    manager.close()
+
+
 def test_model_apc_mode_distinguishes_block_and_exact_custom_cache():
-    from mlx_lm.models.cache import ArraysCache, KVCache
+    from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
 
     assert model_apc_mode(object()) == "block"
 
@@ -445,12 +538,17 @@ def test_model_apc_mode_distinguishes_block_and_exact_custom_cache():
         def make_cache(self):
             return [ArraysCache(size=2), KVCache()]
 
+    class SlidingMixed:
+        def make_cache(self):
+            return [RotatingKVCache(max_size=8), KVCache()]
+
     class Unsupported:
         def make_cache(self):
             return [object()]
 
     assert model_apc_mode(KVOnly()) == "block"
     assert model_apc_mode(Mixed()) == "exact"
+    assert model_apc_mode(SlidingMixed()) == "exact"
     assert model_apc_mode(Unsupported()) is None
 
 

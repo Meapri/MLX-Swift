@@ -154,6 +154,29 @@ def _clone_cache_entry_for_apc(
             eval_targets.extend([keys, values])
         return out
 
+    if isinstance(c, lm_cache.RotatingKVCache):
+        out = type(c)(
+            max_size=int(getattr(c, "max_size")),
+            keep=int(getattr(c, "keep", 0)),
+        )
+        out.offset = int(getattr(c, "offset", 0) or 0)
+        out._idx = int(getattr(c, "_idx", 0) or 0)
+        if c.keys is not None and c.values is not None:
+            out.keys = _copy_mlx_array(c.keys)
+            out.values = _copy_mlx_array(c.values)
+            eval_targets.extend([out.keys, out.values])
+        return out
+
+    if isinstance(c, lm_cache.ChunkedKVCache):
+        out = type(c)(chunk_size=int(getattr(c, "chunk_size")))
+        out.offset = int(getattr(c, "offset", 0) or 0)
+        out.start_position = int(getattr(c, "start_position", 0) or 0)
+        if c.keys is not None and c.values is not None:
+            out.keys = _copy_mlx_array(c.keys)
+            out.values = _copy_mlx_array(c.values)
+            eval_targets.extend([out.keys, out.values])
+        return out
+
     if isinstance(c, lm_cache.ArraysCache):
         out = lm_cache.ArraysCache(len(c.cache))
         out.cache = []
@@ -225,7 +248,15 @@ def _clone_prompt_cache_for_apc(
 def _cache_entry_supports_exact_apc(c: Any) -> bool:
     from mlx_lm.models import cache as lm_cache
 
-    if isinstance(c, (lm_cache.KVCache, lm_cache.ArraysCache)):
+    if isinstance(
+        c,
+        (
+            lm_cache.KVCache,
+            lm_cache.RotatingKVCache,
+            lm_cache.ChunkedKVCache,
+            lm_cache.ArraysCache,
+        ),
+    ):
         return True
     if isinstance(c, lm_cache.CacheList):
         return all(_cache_entry_supports_exact_apc(sub_c) for sub_c in c.caches)
@@ -1154,6 +1185,57 @@ class DiskBlockStore:
             c.keys = k
             c.values = v
             c.offset = off
+            eval_targets.extend([k, v])
+            return c
+
+        if kind == "rotating_kv":
+            try:
+                keep = int(metadata.get(f"{prefix}_keep", "0"))
+                max_size = int(metadata[f"{prefix}_max_size"])
+                offset = int(metadata.get(f"{prefix}_offset", "0"))
+                idx = int(metadata.get(f"{prefix}_idx", "0"))
+            except (KeyError, TypeError, ValueError):
+                return None
+            c = lm_cache.RotatingKVCache(max_size=max_size, keep=keep)
+            c.offset = offset
+            c._idx = idx
+            if metadata.get(f"{prefix}_empty", "0") == "1":
+                return c
+            k_entry = tensor_entries.get(f"{prefix}_k")
+            v_entry = tensor_entries.get(f"{prefix}_v")
+            if k_entry is None or v_entry is None:
+                return None
+            k = _read_safetensors_tensor(path, data_start, k_entry)
+            v = _read_safetensors_tensor(path, data_start, v_entry)
+            if k is None or v is None:
+                return None
+            c.keys = k
+            c.values = v
+            eval_targets.extend([k, v])
+            return c
+
+        if kind == "chunked_kv":
+            try:
+                chunk_size = int(metadata[f"{prefix}_chunk_size"])
+                offset = int(metadata.get(f"{prefix}_offset", "0"))
+                start_position = int(metadata.get(f"{prefix}_start_position", "0"))
+            except (KeyError, TypeError, ValueError):
+                return None
+            c = lm_cache.ChunkedKVCache(chunk_size=chunk_size)
+            c.offset = offset
+            c.start_position = start_position
+            if metadata.get(f"{prefix}_empty", "0") == "1":
+                return c
+            k_entry = tensor_entries.get(f"{prefix}_k")
+            v_entry = tensor_entries.get(f"{prefix}_v")
+            if k_entry is None or v_entry is None:
+                return None
+            k = _read_safetensors_tensor(path, data_start, k_entry)
+            v = _read_safetensors_tensor(path, data_start, v_entry)
+            if k is None or v is None:
+                return None
+            c.keys = k
+            c.values = v
             eval_targets.extend([k, v])
             return c
 
@@ -2240,6 +2322,33 @@ class DiskBlockStore:
                 return True
             arrays[f"{prefix}_k"] = c.keys[..., :off, :]
             arrays[f"{prefix}_v"] = c.values[..., :off, :]
+            return True
+
+        if isinstance(c, lm_cache.RotatingKVCache):
+            metadata[f"{prefix}_kind"] = "rotating_kv"
+            metadata[f"{prefix}_keep"] = str(int(getattr(c, "keep", 0) or 0))
+            metadata[f"{prefix}_max_size"] = str(int(getattr(c, "max_size")))
+            metadata[f"{prefix}_offset"] = str(int(getattr(c, "offset", 0) or 0))
+            metadata[f"{prefix}_idx"] = str(int(getattr(c, "_idx", 0) or 0))
+            if c.keys is None or c.values is None:
+                metadata[f"{prefix}_empty"] = "1"
+                return True
+            arrays[f"{prefix}_k"] = c.keys
+            arrays[f"{prefix}_v"] = c.values
+            return True
+
+        if isinstance(c, lm_cache.ChunkedKVCache):
+            metadata[f"{prefix}_kind"] = "chunked_kv"
+            metadata[f"{prefix}_chunk_size"] = str(int(getattr(c, "chunk_size")))
+            metadata[f"{prefix}_offset"] = str(int(getattr(c, "offset", 0) or 0))
+            metadata[f"{prefix}_start_position"] = str(
+                int(getattr(c, "start_position", 0) or 0)
+            )
+            if c.keys is None or c.values is None:
+                metadata[f"{prefix}_empty"] = "1"
+                return True
+            arrays[f"{prefix}_k"] = c.keys
+            arrays[f"{prefix}_v"] = c.values
             return True
 
         if isinstance(c, lm_cache.ArraysCache):
