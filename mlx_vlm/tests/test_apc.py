@@ -181,14 +181,15 @@ def test_extra_hash_isolates_image_and_tenant_prefixes():
 def test_stored_block_tensors_are_decoupled_from_source_cache():
     block_size = 16
     manager = APCManager(num_blocks=4, block_size=block_size)
-    token_ids = list(range(block_size))
-    layer_keys, layer_values = _make_fake_kv(seq_len=block_size)
+    token_ids = list(range(2 * block_size))
+    layer_keys, layer_values = _make_fake_kv(seq_len=2 * block_size)
     expected_key = mx.array(layer_keys[0][..., :block_size, :], dtype=layer_keys[0].dtype)
 
     stored = manager.store_kv_blocks(token_ids, layer_keys, layer_values)
     layer_keys[0][..., :block_size, :] = mx.zeros_like(layer_keys[0][..., :block_size, :])
     mx.eval(layer_keys[0], stored[0].keys[0])
 
+    assert stored[0].keys[0].shape == expected_key.shape
     _assert_allclose(stored[0].keys[0], expected_key)
     manager.release(stored)
 
@@ -292,26 +293,37 @@ def test_harvest_blocks_from_batch_cache_drops_left_padding():
     block_size = 16
     source_manager = APCManager(num_blocks=8, block_size=block_size)
     harvest_manager = APCManager(num_blocks=8, block_size=block_size)
-    token_ids = list(range(block_size))
-    layer_keys, layer_values = _make_fake_kv(seq_len=block_size)
-    blocks = source_manager.store_kv_blocks(token_ids, layer_keys, layer_values)
+    full_token_ids = list(range(2 * block_size))
+    short_token_ids = list(range(100, 100 + block_size))
+    full_keys, full_values = _make_fake_kv(seq_len=len(full_token_ids))
+    short_keys, short_values = _make_fake_kv(seq_len=len(short_token_ids))
+    full_blocks = source_manager.store_kv_blocks(
+        full_token_ids, full_keys, full_values
+    )
+    short_blocks = source_manager.store_kv_blocks(
+        short_token_ids, short_keys, short_values
+    )
     caches, _ = make_warm_batch_kv_cache_multi(
-        [{"matched_blocks": blocks, "prefix_len": block_size}, None],
+        [
+            {"matched_blocks": full_blocks, "prefix_len": 2 * block_size},
+            {"matched_blocks": short_blocks, "prefix_len": block_size},
+        ],
         num_layers=2,
     )
 
     harvested = harvest_blocks_from_batch_cache(
         harvest_manager,
         caches,
-        batch_idx=0,
-        full_token_ids=token_ids,
+        batch_idx=1,
+        full_token_ids=short_token_ids,
     )
 
     assert len(harvested) == 1
-    matched, matched_tokens = harvest_manager.lookup_prefix(token_ids)
+    _assert_allclose(harvested[0].keys[0], short_blocks[0].keys[0])
+    matched, matched_tokens = harvest_manager.lookup_prefix(short_token_ids)
     assert matched_tokens == block_size
     harvest_manager.release(matched + harvested)
-    source_manager.release(blocks)
+    source_manager.release(full_blocks + short_blocks)
 
 
 def test_disk_metadata_mismatch_is_a_miss(tmp_path):
@@ -330,6 +342,13 @@ def test_disk_metadata_mismatch_is_a_miss(tmp_path):
     manager = APCManager(num_blocks=1, block_size=block_size, disk=disk)
     warm, matched_tokens = manager.lookup_prefix_disk_cache(token_ids, extra_hash=2)
 
+    assert warm is None
+    assert matched_tokens == 0
+
+    wrong_hash = _hash_tokens(0, tuple(token_ids), 2)
+    real_hash = _hash_tokens(0, tuple(token_ids), 1)
+    disk._index[wrong_hash] = disk._index[real_hash]
+    warm, matched_tokens = manager.lookup_prefix_disk_cache(token_ids, extra_hash=2)
     assert warm is None
     assert matched_tokens == 0
     manager.close()
