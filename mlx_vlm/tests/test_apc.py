@@ -7,15 +7,19 @@ import sys
 import mlx.core as mx
 import numpy as np
 
+from mlx_vlm import apc as apc_module
 from mlx_vlm.apc import (
     APCManager,
     DiskBlockStore,
     _copy_mlx_array,
     _hash_tokens,
+    from_env,
     harvest_blocks_from_batch_cache,
     hash_image_payload,
+    make_warm_batch_kv_cache,
     make_warm_batch_kv_cache_multi,
     make_warm_kv_cache,
+    model_apc_mode,
     tenant_scoped_hash,
 )
 
@@ -227,6 +231,227 @@ def test_apc_max_pool_tensors_keeps_disk_persistence(tmp_path, monkeypatch):
     assert matched_tokens == len(token_ids)
     assert manager.stats_snapshot()["pool_used"] == 0
     manager.close()
+
+
+def test_from_env_respects_opt_in_and_disk_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("APC_ENABLED", raising=False)
+    monkeypatch.delenv("APC_DISK_PATH", raising=False)
+    assert from_env() is None
+
+    monkeypatch.setenv("APC_ENABLED", "1")
+    monkeypatch.setenv("APC_BLOCK_SIZE", "8")
+    monkeypatch.setenv("APC_NUM_BLOCKS", "3")
+
+    manager = from_env()
+    assert manager is not None
+    assert manager.block_size == 8
+    assert manager.num_blocks == 3
+    assert manager.disk is None
+    manager.close()
+
+    monkeypatch.setenv("APC_DISK_PATH", str(tmp_path))
+    monkeypatch.setenv("APC_DISK_MAX_GB", "0.001")
+    monkeypatch.setenv("APC_DISK_WORKERS", "1")
+
+    manager = from_env("unit_model")
+    assert manager is not None
+    assert manager.disk is not None
+    assert manager.disk.dir == tmp_path / "unit_model"
+    assert manager.disk.max_bytes == int(0.001 * (1 << 30))
+    manager.close()
+
+
+def test_clear_and_reset_stats_keep_cache_semantics():
+    block_size = 16
+    manager = APCManager(num_blocks=4, block_size=block_size)
+    token_ids = list(range(block_size))
+    layer_keys, layer_values = _make_fake_kv(seq_len=block_size)
+
+    stored = manager.store_kv_blocks(token_ids, layer_keys, layer_values)
+    manager.release(stored)
+
+    matched, matched_tokens = manager.lookup_prefix(token_ids)
+    assert matched_tokens == block_size
+    manager.release(matched)
+    assert manager.stats_snapshot()["lookups_hit"] == 1
+
+    manager.reset_stats()
+    assert manager.stats_snapshot()["lookups_hit"] == 0
+    matched, matched_tokens = manager.lookup_prefix(token_ids)
+    assert matched_tokens == block_size
+    manager.release(matched)
+    assert manager.stats_snapshot()["lookups_hit"] == 1
+
+    manager.clear()
+    assert manager.stats_snapshot()["lookups_hit"] == 0
+    assert manager.stats_snapshot()["pool_used"] == 0
+    matched, matched_tokens = manager.lookup_prefix(token_ids)
+    assert matched == []
+    assert matched_tokens == 0
+
+
+def test_lookup_prefix_disk_cache_policy_gates(tmp_path, monkeypatch):
+    monkeypatch.setenv("APC_DISK_SHARD_MAX_BLOCKS", "3")
+    block_size = 16
+    token_ids = list(range(3 * block_size))
+    layer_keys, layer_values = _make_fake_kv(seq_len=len(token_ids))
+
+    disk = DiskBlockStore(tmp_path, namespace="unit")
+    manager = APCManager(num_blocks=8, block_size=block_size, disk=disk)
+    stored = manager.store_kv_blocks(token_ids, layer_keys, layer_values)
+    manager.release(stored)
+    disk._q.join()
+
+    warm, matched_tokens = manager.lookup_prefix_disk_cache(token_ids)
+    assert warm is None
+    assert matched_tokens == 0
+
+    warm, matched_tokens = manager.lookup_prefix_disk_cache(
+        token_ids,
+        allow_memory_overlap=True,
+        max_prefix_tokens=2 * block_size,
+        min_prefix_tokens=block_size,
+    )
+    assert warm is not None
+    assert matched_tokens == 2 * block_size
+
+    warm, matched_tokens = manager.lookup_prefix_disk_cache(
+        token_ids,
+        allow_memory_overlap=True,
+        max_prefix_tokens=2 * block_size,
+        min_prefix_tokens=2 * block_size,
+    )
+    assert warm is None
+    assert matched_tokens == 0
+
+    manager._disk_min_free_ram_bytes = 2
+    monkeypatch.setattr(apc_module, "_free_ram_bytes", lambda: 1)
+    warm, matched_tokens = manager.lookup_prefix_disk_cache(
+        token_ids,
+        allow_memory_overlap=True,
+    )
+    assert warm is None
+    assert matched_tokens == 0
+    manager.close()
+
+
+def test_make_warm_batch_kv_cache_single_row_shapes():
+    block_size = 16
+    manager = APCManager(num_blocks=4, block_size=block_size)
+    token_ids = list(range(2 * block_size))
+    layer_keys, layer_values = _make_fake_kv(seq_len=len(token_ids))
+    blocks = manager.store_kv_blocks(token_ids, layer_keys, layer_values)
+
+    caches = make_warm_batch_kv_cache(blocks)
+
+    assert len(caches) == 2
+    assert caches[0].keys.shape == (1, 1, 2 * block_size, 4)
+    assert caches[0]._idx == 2 * block_size
+    assert caches[0].offset.tolist() == [2 * block_size]
+    assert caches[0].left_padding.tolist() == [0]
+    manager.release(blocks)
+
+
+def test_exact_cache_supports_mixed_kv_and_arrays_cache():
+    from mlx_lm.models.cache import ArraysCache, KVCache
+
+    block_size = 16
+    manager = APCManager(num_blocks=4, block_size=block_size)
+    token_ids = list(range(2 * block_size))
+
+    kv = KVCache()
+    kv.keys = mx.ones((1, 1, len(token_ids), 2))
+    kv.values = mx.ones((1, 1, len(token_ids), 2)) * 2
+    kv.offset = len(token_ids)
+    arrays = ArraysCache(size=2)
+    arrays[0] = mx.ones((1, 3, 4))
+    arrays[1] = mx.ones((1, 2, 3)) * 3
+
+    assert manager.store_exact_cache(token_ids, [arrays, kv], extra_hash=7)
+    warm, matched_tokens = manager.lookup_exact_cache(
+        token_ids + [999],
+        extra_hash=7,
+    )
+
+    assert matched_tokens == len(token_ids)
+    assert warm is not None
+    assert warm[0] is not arrays
+    assert warm[1] is not kv
+    _assert_allclose(warm[0][0], arrays[0])
+    _assert_allclose(warm[0][1], arrays[1])
+    _assert_allclose(warm[1].keys[..., : len(token_ids), :], kv.keys)
+    assert warm[1].offset == len(token_ids)
+    assert warm[1].keys.shape[2] >= len(token_ids) + 1
+
+    arrays[0] = mx.zeros_like(arrays[0])
+    kv.keys[..., :, :] = mx.zeros_like(kv.keys)
+    _assert_allclose(warm[0][0], mx.ones((1, 3, 4)))
+    _assert_allclose(
+        warm[1].keys[..., : len(token_ids), :],
+        mx.ones((1, 1, len(token_ids), 2)),
+    )
+
+
+def test_exact_cache_disk_restore_rebuilds_index(tmp_path, monkeypatch):
+    from mlx_lm.models.cache import ArraysCache, KVCache
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+
+    token_ids = list(range(40))
+    kv = KVCache()
+    kv.keys = mx.ones((1, 1, len(token_ids), 2))
+    kv.values = mx.ones((1, 1, len(token_ids), 2)) * 2
+    kv.offset = len(token_ids)
+    arrays = ArraysCache(size=2)
+    arrays[0] = mx.ones((1, 3, 4))
+    arrays[1] = mx.ones((1, 2, 3)) * 3
+
+    disk = DiskBlockStore(tmp_path, namespace="exact")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    assert manager.store_exact_cache(token_ids, [arrays, kv], extra_hash=11)
+    disk._q.join()
+    assert disk.num_exact_indexed == 1
+    manager.close()
+
+    disk = DiskBlockStore(tmp_path, namespace="exact")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    warm, matched_tokens = manager.lookup_exact_cache(
+        token_ids + [999],
+        extra_hash=11,
+    )
+
+    assert matched_tokens == len(token_ids)
+    assert warm is not None
+    assert manager.stats_snapshot()["disk_hits"] == 1
+    assert manager.stats_snapshot()["disk_exact_indexed"] == 1
+    _assert_allclose(warm[0][0], arrays[0])
+    _assert_allclose(warm[0][1], arrays[1])
+    _assert_allclose(warm[1].keys[..., : len(token_ids), :], kv.keys)
+    assert warm[1].offset == len(token_ids)
+    assert warm[1].keys.shape[2] >= len(token_ids) + 1
+    manager.close()
+
+
+def test_model_apc_mode_distinguishes_block_and_exact_custom_cache():
+    from mlx_lm.models.cache import ArraysCache, KVCache
+
+    assert model_apc_mode(object()) == "block"
+
+    class KVOnly:
+        def make_cache(self):
+            return [KVCache(), KVCache()]
+
+    class Mixed:
+        def make_cache(self):
+            return [ArraysCache(size=2), KVCache()]
+
+    class Unsupported:
+        def make_cache(self):
+            return [object()]
+
+    assert model_apc_mode(KVOnly()) == "block"
+    assert model_apc_mode(Mixed()) == "exact"
+    assert model_apc_mode(Unsupported()) is None
 
 
 def test_disk_restore_rebuilds_index_and_segment_eviction_preserves_prefix(

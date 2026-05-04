@@ -64,6 +64,7 @@ class RunMetrics:
     disk_hits: int = 0
     disk_files: int = 0
     disk_bytes: int = 0
+    disk_exact: int = 0
 
 
 def make_test_user(target_tokens: int) -> str:
@@ -179,6 +180,7 @@ def run_one(
         disk_hits=int(end_stats.get("disk_hits", 0) - start_stats.get("disk_hits", 0)),
         disk_files=int(end_stats.get("disk_files", 0) or 0),
         disk_bytes=int(end_stats.get("disk_bytes", 0) or 0),
+        disk_exact=int(end_stats.get("disk_exact_indexed", 0) or 0),
     )
 
 
@@ -326,6 +328,7 @@ def main() -> None:
                 print(
                     f"    disk seed files={seed_stats.get('disk_files')} "
                     f"blocks={seed_stats.get('disk_blocks_indexed')} "
+                    f"exact={seed_stats.get('disk_exact_indexed')} "
                     f"bytes={seed_stats.get('disk_bytes', 0) / (1 << 30):.2f}GB",
                     flush=True,
                 )
@@ -389,6 +392,7 @@ def main() -> None:
                 f"  {row.context_label} {row.phase}: "
                 f"matched={row.matched_tokens:,} "
                 f"disk_hits={row.disk_hits:,} disk_files={row.disk_files} "
+                f"disk_exact={row.disk_exact} "
                 f"disk={row.disk_bytes / (1 << 30):.2f}GB"
             )
     finally:
