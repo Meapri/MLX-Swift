@@ -13,80 +13,33 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, KVCache
+from ..rope_utils import MRoPERotaryEmbedding
+from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
 from .config import ModelConfig, TextConfig
 
 
-class Qwen3_5RotaryEmbedding:
+class Qwen3_5RotaryEmbedding(MRoPERotaryEmbedding):
     def __init__(
-        self, dim, max_position_embeddings=2048, base=10000, mrope_section=[11, 11, 0]
+        self,
+        dim,
+        max_position_embeddings=2048,
+        base=10000,
+        mrope_section=[11, 11, 0],
     ):
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-
-        inv_freq = 1.0 / (
-            self.base ** (mx.arange(0, self.dim, 2).astype(mx.float32) / self.dim)
+        super().__init__(
+            dim,
+            max_position_embeddings=max_position_embeddings,
+            base=base,
+            mrope_section=mrope_section,
+            cast_output=False,
+            style="interleaved",
         )
-        self.inv_freq = inv_freq
-
-        self.mrope_section = mrope_section
-
-    def apply_interleaved_mrope(self, freqs, mrope_section):
-        freqs_t = freqs[0]
-        for dim, offset in enumerate((1, 2), start=1):
-            length = mrope_section[dim] * 3
-            idx = slice(offset, length, 3)
-            freqs_t[..., idx] = freqs[dim, ..., idx]
-        return freqs_t
-
-    def __call__(self, x, position_ids):
-        if position_ids.ndim == 2:
-            position_ids = mx.broadcast_to(
-                position_ids[None, ...],
-                (3, position_ids.shape[0], position_ids.shape[1]),
-            )
-
-        inv_freq_expanded = mx.broadcast_to(
-            self.inv_freq[None, None, :, None].astype(mx.float32),
-            (3, position_ids.shape[1], self.inv_freq.shape[0], 1),
-        )
-        position_ids_expanded = position_ids[:, :, None, :].astype(mx.float32)
-
-        freqs = inv_freq_expanded @ position_ids_expanded
-        freqs = mx.swapaxes(freqs, 2, 3)
-        freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
-        emb = mx.concatenate([freqs, freqs], axis=-1)
-        cos = mx.cos(emb)
-        sin = mx.sin(emb)
-
-        return cos, sin
-
-
-def rotate_half(x):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return mx.concatenate([-x2, x1], axis=-1)
 
 
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, unqueeze_dim=1):
-    cos = mx.expand_dims(cos, axis=unqueeze_dim)
-    sin = mx.expand_dims(sin, axis=unqueeze_dim)
-
-    rotary_dim = cos.shape[-1]
-    q_rot = q[..., :rotary_dim]
-    q_pass = q[..., rotary_dim:]
-
-    k_rot = k[..., :rotary_dim]
-    k_pass = k[..., rotary_dim:]
-
-    dtype = q.dtype
-    q_embed = ((q_rot * cos) + (rotate_half(q_rot) * sin)).astype(dtype)
-    k_embed = ((k_rot * cos) + (rotate_half(k_rot) * sin)).astype(dtype)
-
-    q_embed = mx.concatenate([q_embed, q_pass], axis=-1)
-    k_embed = mx.concatenate([k_embed, k_pass], axis=-1)
-
-    return q_embed, k_embed
+    return _apply_mrope(
+        q, k, cos, sin, style="interleaved", unsqueeze_dim=unqueeze_dim
+    )
 
 
 class Qwen3_5RMSNormGated(nn.Module):

@@ -2,13 +2,13 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
+from ..rope_utils import apply_mrope_frequency_layout
 from .config import ModelConfig, TextConfig
 
 
@@ -57,13 +57,11 @@ class GlmOcrRotaryEmbedding(nn.Module):
         self._original_inv_freq = mx.array(inv_freq, dtype=mx.float32)
 
     def apply_mrope(self, freqs, mrope_section):
-        """Apply M-RoPE by selecting different dimensions for T, H, W."""
-        split_indices = np.cumsum(mrope_section)[:-1].tolist()
-        chunks = mx.split(freqs, split_indices, axis=-1)
-        result = mx.concatenate(
-            [chunk[i % 3] for i, chunk in enumerate(chunks)], axis=-1
+        return apply_mrope_frequency_layout(
+            freqs,
+            mrope_section,
+            style="split_select",
         )
-        return result
 
     def __call__(self, x, position_ids):
         inv_freq_expanded = self._inv_freq[None, None, :, None].astype(mx.float32)
