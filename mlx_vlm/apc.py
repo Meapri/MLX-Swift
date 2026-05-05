@@ -2677,7 +2677,7 @@ class APCManager:
         # avoids Apple Metal's resource-count ceiling while preserving fast
         # warm-memory reuse for repeated long-document prompts.
         self._layer_major_memory_min_tokens = max(
-            0, int(os.environ.get("APC_LAYER_MAJOR_MEMORY_MIN_TOKENS", "0"))
+            0, int(os.environ.get("APC_LAYER_MAJOR_MEMORY_MIN_TOKENS", "50000"))
         )
 
     # ---------- LRU free queue (O(1)) ----------
