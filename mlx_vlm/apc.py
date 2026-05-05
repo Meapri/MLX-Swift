@@ -245,6 +245,30 @@ def _clone_prompt_cache_for_apc(
     return out
 
 
+def _clone_layer_major_kv_cache_for_apc(
+    layer_keys: Sequence[mx.array],
+    layer_values: Sequence[mx.array],
+    prefix_len: int,
+) -> Optional[List[Any]]:
+    """Deep-copy layer-major K/V tensors into compact ``KVCache`` entries."""
+    from mlx_lm.models.cache import KVCache
+
+    if prefix_len <= 0 or len(layer_keys) != len(layer_values):
+        return None
+    eval_targets: List[mx.array] = []
+    out: List[Any] = []
+    for k, v in zip(layer_keys, layer_values):
+        c = KVCache()
+        c.keys = _copy_mlx_array(k[..., :prefix_len, :])
+        c.values = _copy_mlx_array(v[..., :prefix_len, :])
+        c.offset = prefix_len
+        eval_targets.extend([c.keys, c.values])
+        out.append(c)
+    if eval_targets:
+        mx.eval(eval_targets)
+    return out
+
+
 def _cache_entry_supports_exact_apc(c: Any) -> bool:
     from mlx_lm.models import cache as lm_cache
 
@@ -2647,6 +2671,14 @@ class APCManager:
         self._max_pool_tensors = max(
             0, int(os.environ.get("APC_MAX_POOL_TENSORS", "450000"))
         )
+        # Optional compact warm-memory tier for long KV-only prefixes. When a
+        # prompt reaches this many full-block tokens, store one layer-major
+        # prompt-cache snapshot instead of thousands of per-block tensors. This
+        # avoids Apple Metal's resource-count ceiling while preserving fast
+        # warm-memory reuse for repeated long-document prompts.
+        self._layer_major_memory_min_tokens = max(
+            0, int(os.environ.get("APC_LAYER_MAJOR_MEMORY_MIN_TOKENS", "0"))
+        )
 
     # ---------- LRU free queue (O(1)) ----------
     def _free_push(self, b: APCBlock) -> None:
@@ -2993,9 +3025,42 @@ class APCManager:
         with self.lock:
             n_full = len(token_ids) // self.block_size
             skip_full = skip_first_n_tokens // self.block_size
+            full_prefix_tokens = n_full * self.block_size
+            guarded_prefix_tokens = max(
+                0, len(token_ids) - self.exact_cache_guard_tokens
+            )
+            layer_major_prefix_tokens = min(
+                full_prefix_tokens,
+                (guarded_prefix_tokens // self.block_size) * self.block_size,
+            )
             new_blocks: List[APCBlock] = []
             disk_blocks: List[_DiskLayerMajorBlock] = []
             per_block_tensors = len(layer_keys) + len(layer_values)
+            token_tuple = tuple(int(t) for t in token_ids[:layer_major_prefix_tokens])
+            layer_major_stored = False
+            if (
+                self._layer_major_memory_min_tokens > 0
+                and self._exact_cache_max > 0
+                and layer_major_prefix_tokens >= self._layer_major_memory_min_tokens
+            ):
+                copied = _clone_layer_major_kv_cache_for_apc(
+                    layer_keys,
+                    layer_values,
+                    layer_major_prefix_tokens,
+                )
+                if copied is not None:
+                    key = _sequence_hash(token_tuple, extra_hash, self.block_size)
+                    self._exact_cache[key] = APCExactCacheEntry(
+                        token_ids=token_tuple,
+                        extra_hash=int(extra_hash),
+                        prompt_cache=copied,
+                        last_used=time.time(),
+                    )
+                    self._exact_cache.move_to_end(key)
+                    while len(self._exact_cache) > self._exact_cache_max:
+                        self._exact_cache.popitem(last=False)
+                    self.stats.exact_stores += 1
+                    layer_major_stored = True
             parent = SEED_PARENT_HASH
             # Recompute hash chain over already-cached prefix to get parent for first new block.
             for i in range(skip_full):
@@ -3021,6 +3086,9 @@ class APCManager:
                             source_block_idx=i,
                         )
                     )
+                if layer_major_stored:
+                    parent = h
+                    continue
                 existing = self.hash_table.get(h)
                 if existing is not None and existing.token_ids == chunk:
                     acquired = self._acquire_existing(existing)

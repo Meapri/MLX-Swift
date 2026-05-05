@@ -207,6 +207,34 @@ def test_copy_mlx_array_returns_a_distinct_materialized_array():
     _assert_allclose(copied, source)
 
 
+def test_layer_major_memory_threshold_skips_block_pool(monkeypatch):
+    monkeypatch.setenv("APC_LAYER_MAJOR_MEMORY_MIN_TOKENS", "1")
+    block_size = 16
+    manager = APCManager(num_blocks=16, block_size=block_size)
+    token_ids = list(range(4 * block_size))
+    layer_keys, layer_values = _make_fake_kv(seq_len=len(token_ids))
+
+    stored = manager.store_kv_blocks(token_ids, layer_keys, layer_values)
+
+    assert stored == []
+    assert manager.lookup_prefix(token_ids)[1] == 0
+    warm, matched_tokens = manager.lookup_exact_cache(token_ids + [999])
+    expected_tokens = len(token_ids) - block_size
+    assert matched_tokens == expected_tokens
+    assert warm is not None
+    assert len(warm) == len(layer_keys)
+    assert warm[0].offset == expected_tokens
+    assert warm[0].keys.shape[2] >= len(token_ids) + 1
+    _assert_allclose(
+        warm[0].keys[..., :expected_tokens, :],
+        layer_keys[0][..., :expected_tokens, :],
+    )
+    _assert_allclose(
+        warm[1].values[..., :expected_tokens, :],
+        layer_values[1][..., :expected_tokens, :],
+    )
+
+
 def test_apc_max_pool_tensors_keeps_disk_persistence(tmp_path, monkeypatch):
     monkeypatch.setenv("APC_MAX_POOL_TENSORS", "2")
     monkeypatch.setenv("APC_DISK_SHARD_MAX_BLOCKS", "2")

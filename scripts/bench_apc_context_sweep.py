@@ -229,6 +229,7 @@ def main() -> None:
     ap.add_argument("--suffix-tokens", type=int, default=256)
     ap.add_argument("--disk-cap-gb", type=float, default=0.0)
     ap.add_argument("--shard-max-blocks", type=int, default=256)
+    ap.add_argument("--block-size", type=int, default=16)
     args = ap.parse_args()
 
     os.environ["APC_DISK_SHARD_MAX_BLOCKS"] = str(max(1, args.shard_max_blocks))
@@ -286,8 +287,9 @@ def main() -> None:
                 flush=True,
             )
 
-            n_blocks_est = max(64, cold.prompt_tokens // 16 + 256)
-            mem_mgr = APCManager(num_blocks=n_blocks_est, block_size=16)
+            block_size = max(1, args.block_size)
+            n_blocks_est = max(64, cold.prompt_tokens // block_size + 256)
+            mem_mgr = APCManager(num_blocks=n_blocks_est, block_size=block_size)
             try:
                 seed_apc("warm-mem", model, processor, seed_prompt, mem_mgr)
                 warm_mem = run_one(
@@ -320,7 +322,7 @@ def main() -> None:
                 namespace=args.model,
                 max_bytes=disk_cap,
             )
-            disk_seed_mgr = APCManager(num_blocks=1, block_size=16, disk=disk)
+            disk_seed_mgr = APCManager(num_blocks=1, block_size=block_size, disk=disk)
             try:
                 seed_apc("warm-disk", model, processor, seed_prompt, disk_seed_mgr)
                 disk._q.join()
@@ -343,7 +345,7 @@ def main() -> None:
                 namespace=args.model,
                 max_bytes=disk_cap,
             )
-            disk_mgr = APCManager(num_blocks=1, block_size=16, disk=disk2)
+            disk_mgr = APCManager(num_blocks=1, block_size=block_size, disk=disk2)
             try:
                 warm_disk = run_one(
                     "warm-disk",

@@ -1213,18 +1213,29 @@ def stream_generate(
             matched_blocks, prefix_len = apc_manager.lookup_prefix(
                 full_input_ids_list, extra_hash=apc_extra_hash
             )
+            exact_prompt_cache = None
+            exact_prefix_len = 0
+            if prefix_len < input_ids.shape[1]:
+                exact_prompt_cache, exact_prefix_len = apc_manager.lookup_exact_cache(
+                    full_input_ids_list,
+                    extra_hash=apc_extra_hash,
+                    min_prefix_tokens=prefix_len,
+                )
             disk_prompt_cache = None
             disk_prefix_len = 0
-            if prefix_len < input_ids.shape[1]:
+            if max(prefix_len, exact_prefix_len) < input_ids.shape[1]:
                 disk_prompt_cache, disk_prefix_len = (
                     apc_manager.lookup_prefix_disk_cache(
                         full_input_ids_list,
                         extra_hash=apc_extra_hash,
-                        min_prefix_tokens=prefix_len,
-                        allow_memory_overlap=prefix_len > 0,
+                        min_prefix_tokens=max(prefix_len, exact_prefix_len),
+                        allow_memory_overlap=max(prefix_len, exact_prefix_len) > 0,
                     )
                 )
-            if disk_prefix_len > prefix_len and disk_prefix_len < input_ids.shape[1]:
+            if (
+                disk_prefix_len > max(prefix_len, exact_prefix_len)
+                and disk_prefix_len < input_ids.shape[1]
+            ):
                 if matched_blocks:
                     apc_manager.release(matched_blocks)
                 if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
@@ -1238,6 +1249,20 @@ def stream_generate(
                         pixel_values = None
                         kwargs.pop("cached_image_features", None)
                     kwargs["prompt_cache"] = disk_prompt_cache
+            elif exact_prefix_len > prefix_len and exact_prefix_len < input_ids.shape[1]:
+                if matched_blocks:
+                    apc_manager.release(matched_blocks)
+                if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
+                    reused_prefix_len = exact_prefix_len
+                    input_ids = input_ids[:, exact_prefix_len:]
+                    image_token_id = getattr(
+                        model.config, "image_token_id", None
+                    ) or getattr(model.config, "image_token_index", None)
+                    new_ids = input_ids.flatten().tolist()
+                    if image_token_id is None or image_token_id not in new_ids:
+                        pixel_values = None
+                        kwargs.pop("cached_image_features", None)
+                    kwargs["prompt_cache"] = exact_prompt_cache
             elif prefix_len > 0 and prefix_len < input_ids.shape[1]:
                 if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
                     apc_blocks_in_use = matched_blocks
@@ -2418,16 +2443,27 @@ class BatchGenerator:
         matched, prefix_len = self.apc_manager.lookup_prefix(
             ids_list, extra_hash=extra_hash
         )
-        warm_cache = None
-        disk_prefix_len = 0
+        exact_cache = None
+        exact_prefix_len = 0
         if prefix_len < len(ids_list):
-            warm_cache, disk_prefix_len = self.apc_manager.lookup_prefix_disk_cache(
+            exact_cache, exact_prefix_len = self.apc_manager.lookup_exact_cache(
                 ids_list,
                 extra_hash=extra_hash,
                 min_prefix_tokens=prefix_len,
-                allow_memory_overlap=prefix_len > 0,
             )
-        if disk_prefix_len > prefix_len and disk_prefix_len < len(ids_list):
+        warm_cache = None
+        disk_prefix_len = 0
+        if max(prefix_len, exact_prefix_len) < len(ids_list):
+            warm_cache, disk_prefix_len = self.apc_manager.lookup_prefix_disk_cache(
+                ids_list,
+                extra_hash=extra_hash,
+                min_prefix_tokens=max(prefix_len, exact_prefix_len),
+                allow_memory_overlap=max(prefix_len, exact_prefix_len) > 0,
+            )
+        if (
+            disk_prefix_len > max(prefix_len, exact_prefix_len)
+            and disk_prefix_len < len(ids_list)
+        ):
             if matched:
                 self.apc_manager.release(matched)
             if (
@@ -2439,6 +2475,21 @@ class BatchGenerator:
                 "matched_blocks": [],
                 "warm_cache": warm_cache,
                 "prefix_len": disk_prefix_len,
+                "extra_hash": extra_hash,
+                "full_input_ids": list(ids_list),
+            }
+        if exact_prefix_len > prefix_len and exact_prefix_len < len(ids_list):
+            if matched:
+                self.apc_manager.release(matched)
+            if (
+                image_token_id is not None
+                and image_token_id in ids_list[:exact_prefix_len]
+            ):
+                return None
+            return {
+                "matched_blocks": [],
+                "warm_cache": exact_cache,
+                "prefix_len": exact_prefix_len,
                 "extra_hash": extra_hash,
                 "full_input_ids": list(ids_list),
             }
