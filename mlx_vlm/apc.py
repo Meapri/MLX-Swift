@@ -2222,14 +2222,8 @@ class APCManager:
                 # is decoupled from the caller's cache, which mlx.clear_cache
                 # may release after generation. mx.contiguous alone can return
                 # a view when the source is already row-contiguous.
-                k_slabs = [
-                    _copy_mlx_array(k[..., start:end, :])
-                    for k in layer_keys
-                ]
-                v_slabs = [
-                    _copy_mlx_array(v[..., start:end, :])
-                    for v in layer_values
-                ]
+                k_slabs = [_copy_mlx_array(k[..., start:end, :]) for k in layer_keys]
+                v_slabs = [_copy_mlx_array(v[..., start:end, :]) for v in layer_values]
                 mx.eval(k_slabs + v_slabs)
                 b.block_hash = h
                 b.parent_hash = parent

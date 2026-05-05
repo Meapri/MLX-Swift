@@ -5,8 +5,8 @@ import mlx.core as mx
 import pytest
 from fastapi.testclient import TestClient
 
-from mlx_vlm.apc import hash_image_payload
 import mlx_vlm.server as server
+from mlx_vlm.apc import hash_image_payload
 
 
 @pytest.fixture
@@ -228,7 +228,9 @@ class TestResponseGenerator:
                 return {"inputs_embeds": mx.zeros((1, 2, 4))}
 
         class Model:
-            def get_input_embeddings(self, input_ids, pixel_values, mask=None, **kwargs):
+            def get_input_embeddings(
+                self, input_ids, pixel_values, mask=None, **kwargs
+            ):
                 return Embed()
 
         response_generator = SimpleNamespace(model=Model(), vision_cache=None)

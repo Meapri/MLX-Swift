@@ -1501,9 +1501,7 @@ def stream_generate(
         apc_manager = None
 
     if apc_manager is not None:
-        image_hash = _apc.hash_image_payload(
-            pixel_values=pixel_values, image_ref=image
-        )
+        image_hash = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=image)
         apc_extra_hash = _apc.tenant_scoped_hash(apc_tenant, image_hash)
 
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
