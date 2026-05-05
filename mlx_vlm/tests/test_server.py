@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from mlx_vlm.apc import hash_image_payload
 import mlx_vlm.server as server
+from mlx_vlm.apc import hash_image_payload
 
 
 @pytest.fixture
