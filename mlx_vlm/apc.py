@@ -1115,7 +1115,9 @@ class DiskBlockStore:
                         path = self._exact_index.get(cache_hash)
             if path is None:
                 return None
-        return self._load_exact_cache_file(path, min_capacity_tokens=min_capacity_tokens)
+        return self._load_exact_cache_file(
+            path, min_capacity_tokens=min_capacity_tokens
+        )
 
     def _load_exact_cache_file(
         self,
@@ -2791,8 +2793,7 @@ class APCManager:
             free_now = _free_ram_bytes()
             if free_now is not None and free_now < self._disk_min_free_ram_bytes:
                 logger.info(
-                    "APC: skipping exact disk restore "
-                    "(free RAM %.1f GB < %.1f GB)",
+                    "APC: skipping exact disk restore " "(free RAM %.1f GB < %.1f GB)",
                     free_now / (1 << 30),
                     self._disk_min_free_ram_bytes / (1 << 30),
                 )
@@ -3128,14 +3129,8 @@ class APCManager:
                 # is decoupled from the caller's cache, which mlx.clear_cache
                 # may release after generation. mx.contiguous alone can return
                 # a view when the source is already row-contiguous.
-                k_slabs = [
-                    _copy_mlx_array(k[..., start:end, :])
-                    for k in layer_keys
-                ]
-                v_slabs = [
-                    _copy_mlx_array(v[..., start:end, :])
-                    for v in layer_values
-                ]
+                k_slabs = [_copy_mlx_array(k[..., start:end, :]) for k in layer_keys]
+                v_slabs = [_copy_mlx_array(v[..., start:end, :]) for v in layer_values]
                 mx.eval(k_slabs + v_slabs)
                 b.block_hash = h
                 b.parent_hash = parent

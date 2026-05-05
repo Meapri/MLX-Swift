@@ -1272,11 +1272,9 @@ def generate_step(
         )
         checkpoint_done = False
         should_chunk = (
-            prefill_step_size is not None
-            and inputs_embeds.shape[1] > prefill_step_size
+            prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size
         ) or (
-            checkpoint_len is not None
-            and 0 < checkpoint_len < inputs_embeds.shape[1]
+            checkpoint_len is not None and 0 < checkpoint_len < inputs_embeds.shape[1]
         )
         if prefill_step_size is not None and should_chunk:
             # Chunked prefill with embeddings
@@ -1535,9 +1533,7 @@ def stream_generate(
             apc_manager = None
 
     if apc_manager is not None:
-        image_hash = _apc.hash_image_payload(
-            pixel_values=pixel_values, image_ref=image
-        )
+        image_hash = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=image)
         apc_extra_hash = _apc.tenant_scoped_hash(apc_tenant, image_hash)
 
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
@@ -1635,7 +1631,9 @@ def stream_generate(
                         pixel_values = None
                         kwargs.pop("cached_image_features", None)
                     kwargs["prompt_cache"] = disk_prompt_cache
-            elif exact_prefix_len > prefix_len and exact_prefix_len < input_ids.shape[1]:
+            elif (
+                exact_prefix_len > prefix_len and exact_prefix_len < input_ids.shape[1]
+            ):
                 if matched_blocks:
                     apc_manager.release(matched_blocks)
                 if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
@@ -3008,10 +3006,9 @@ class BatchGenerator:
                 min_prefix_tokens=max(prefix_len, exact_prefix_len),
                 allow_memory_overlap=max(prefix_len, exact_prefix_len) > 0,
             )
-        if (
-            disk_prefix_len > max(prefix_len, exact_prefix_len)
-            and disk_prefix_len < len(ids_list)
-        ):
+        if disk_prefix_len > max(
+            prefix_len, exact_prefix_len
+        ) and disk_prefix_len < len(ids_list):
             if matched:
                 self.apc_manager.release(matched)
             if (
@@ -3214,8 +3211,7 @@ class BatchGenerator:
                     "checkpoint_len": (
                         max(
                             1,
-                            len(ids_list)
-                            - self.apc_manager.exact_cache_guard_tokens,
+                            len(ids_list) - self.apc_manager.exact_cache_guard_tokens,
                         )
                         if getattr(self, "apc_mode", "block") == "exact"
                         else 0

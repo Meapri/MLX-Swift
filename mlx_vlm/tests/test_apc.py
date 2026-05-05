@@ -64,15 +64,9 @@ def _make_exact_row_cache(prefix_len: int):
 
 
 def test_hash_chain_and_image_hash_are_deterministic():
-    assert _hash_tokens(0, tuple(range(16)), 0) == _hash_tokens(
-        0, tuple(range(16)), 0
-    )
-    assert _hash_tokens(0, tuple(range(16)), 0) != _hash_tokens(
-        0, tuple(range(16)), 42
-    )
-    assert _hash_tokens(7, tuple(range(16)), 0) != _hash_tokens(
-        8, tuple(range(16)), 0
-    )
+    assert _hash_tokens(0, tuple(range(16)), 0) == _hash_tokens(0, tuple(range(16)), 0)
+    assert _hash_tokens(0, tuple(range(16)), 0) != _hash_tokens(0, tuple(range(16)), 42)
+    assert _hash_tokens(7, tuple(range(16)), 0) != _hash_tokens(8, tuple(range(16)), 0)
 
     zeros = mx.zeros((1, 3, 8, 8))
     ones = mx.ones((1, 3, 8, 8))
@@ -186,7 +180,9 @@ def test_extra_hash_isolates_image_and_tenant_prefixes():
 
     tenant_a = tenant_scoped_hash("tenant-a", hash_image_payload(image_ref="cat.jpg"))
     tenant_b = tenant_scoped_hash("tenant-b", hash_image_payload(image_ref="cat.jpg"))
-    other_image = tenant_scoped_hash("tenant-a", hash_image_payload(image_ref="dog.jpg"))
+    other_image = tenant_scoped_hash(
+        "tenant-a", hash_image_payload(image_ref="dog.jpg")
+    )
 
     stored = manager.store_kv_blocks(
         token_ids, layer_keys, layer_values, extra_hash=tenant_a
@@ -205,10 +201,14 @@ def test_stored_block_tensors_are_decoupled_from_source_cache():
     manager = APCManager(num_blocks=4, block_size=block_size)
     token_ids = list(range(2 * block_size))
     layer_keys, layer_values = _make_fake_kv(seq_len=2 * block_size)
-    expected_key = mx.array(layer_keys[0][..., :block_size, :], dtype=layer_keys[0].dtype)
+    expected_key = mx.array(
+        layer_keys[0][..., :block_size, :], dtype=layer_keys[0].dtype
+    )
 
     stored = manager.store_kv_blocks(token_ids, layer_keys, layer_values)
-    layer_keys[0][..., :block_size, :] = mx.zeros_like(layer_keys[0][..., :block_size, :])
+    layer_keys[0][..., :block_size, :] = mx.zeros_like(
+        layer_keys[0][..., :block_size, :]
+    )
     mx.eval(layer_keys[0], stored[0].keys[0])
 
     assert stored[0].keys[0].shape == expected_key.shape
@@ -703,9 +703,7 @@ def test_harvest_blocks_from_batch_cache_drops_left_padding():
     short_token_ids = list(range(100, 100 + block_size))
     full_keys, full_values = _make_fake_kv(seq_len=len(full_token_ids))
     short_keys, short_values = _make_fake_kv(seq_len=len(short_token_ids))
-    full_blocks = source_manager.store_kv_blocks(
-        full_token_ids, full_keys, full_values
-    )
+    full_blocks = source_manager.store_kv_blocks(full_token_ids, full_keys, full_values)
     short_blocks = source_manager.store_kv_blocks(
         short_token_ids, short_keys, short_values
     )
