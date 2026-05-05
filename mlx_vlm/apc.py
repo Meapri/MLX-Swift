@@ -3389,6 +3389,134 @@ def make_warm_batch_kv_cache_multi(
     return out, max_prefix
 
 
+def _collect_mx_arrays(x: Any, out: List[mx.array]) -> None:
+    if isinstance(x, mx.array):
+        out.append(x)
+    elif isinstance(x, (list, tuple)):
+        for item in x:
+            _collect_mx_arrays(item, out)
+
+
+def _merge_arrays_cache_entries(
+    entries: Sequence[Any],
+    prefix_lens: Sequence[int],
+) -> Any:
+    from mlx_lm.models import cache as lm_cache
+
+    size = len(entries[0].cache)
+    out = lm_cache.ArraysCache(size)
+    merged_states: List[Optional[mx.array]] = []
+    for state_idx in range(size):
+        states = [entry.cache[state_idx] for entry in entries]
+        sample = next((s for s in states if s is not None), None)
+        if sample is None:
+            merged_states.append(None)
+            continue
+        rows = []
+        for state in states:
+            if state is None:
+                rows.append(mx.zeros((1,) + sample.shape[1:], dtype=sample.dtype))
+            else:
+                rows.append(state[:1])
+        merged_states.append(mx.concatenate(rows, axis=0))
+    out.cache = merged_states
+    return out
+
+
+def _merge_exact_cache_entries(
+    entries: Sequence[Any],
+    prefix_lens: Sequence[int],
+) -> Any:
+    from mlx_lm.models import cache as lm_cache
+
+    if not entries:
+        return None
+    first = entries[0]
+    if all(isinstance(c, lm_cache.KVCache) for c in entries):
+        return lm_cache.BatchKVCache.merge(entries)
+    if all(isinstance(c, lm_cache.ChunkedKVCache) for c in entries):
+        return lm_cache.BatchKVCache.merge(entries)
+    if all(isinstance(c, lm_cache.RotatingKVCache) for c in entries):
+        return lm_cache.BatchRotatingKVCache.merge(entries)
+    if all(isinstance(c, lm_cache.ArraysCache) for c in entries):
+        return _merge_arrays_cache_entries(entries, prefix_lens)
+    if all(isinstance(c, lm_cache.CacheList) for c in entries):
+        merged = [
+            _merge_exact_cache_entries(
+                [entry.caches[i] for entry in entries],
+                prefix_lens,
+            )
+            for i in range(len(first.caches))
+        ]
+        if any(c is None for c in merged):
+            return None
+        return lm_cache.CacheList(*merged)
+    if all(isinstance(c, tuple) for c in entries):
+        merged = [
+            _merge_exact_cache_entries(
+                [entry[i] for entry in entries],
+                prefix_lens,
+            )
+            for i in range(len(first))
+        ]
+        if any(c is None for c in merged):
+            return None
+        return lm_cache.CacheList(*merged)
+    return None
+
+
+def make_warm_batch_exact_cache_multi(
+    row_caches: Sequence[Sequence[Any]],
+    prefix_lens: Sequence[int],
+) -> Tuple[Optional[List[Any]], int]:
+    """Merge single-row exact-cache snapshots into batch-aware caches."""
+
+    if not row_caches:
+        return [], 0
+    if len(row_caches) != len(prefix_lens):
+        return None, 0
+    num_entries = len(row_caches[0])
+    if any(len(row) != num_entries for row in row_caches):
+        return None, 0
+
+    out: List[Any] = []
+    for entry_idx in range(num_entries):
+        merged = _merge_exact_cache_entries(
+            [row[entry_idx] for row in row_caches],
+            prefix_lens,
+        )
+        if merged is None:
+            return None, 0
+        out.append(merged)
+
+    eval_targets: List[mx.array] = []
+    for c in out:
+        _collect_mx_arrays(c.state, eval_targets)
+    if eval_targets:
+        mx.eval(eval_targets)
+    return out, max(prefix_lens) if prefix_lens else 0
+
+
+def extract_prompt_cache_from_batch(
+    batch_caches: Sequence[Any],
+    batch_idx: int,
+) -> Optional[List[Any]]:
+    """Extract one row from batch-aware caches as single-row cache objects."""
+
+    out: List[Any] = []
+    eval_targets: List[mx.array] = []
+    for c in batch_caches:
+        extract = getattr(c, "extract", None)
+        if not callable(extract):
+            return None
+        extracted = extract(batch_idx)
+        out.append(extracted)
+        _collect_mx_arrays(extracted.state, eval_targets)
+    if eval_targets:
+        mx.eval(eval_targets)
+    return out
+
+
 def harvest_blocks_from_batch_cache(
     apc_manager: "APCManager",
     batch_caches: List[Any],

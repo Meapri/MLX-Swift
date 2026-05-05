@@ -13,9 +13,11 @@ from mlx_vlm.apc import (
     DiskBlockStore,
     _copy_mlx_array,
     _hash_tokens,
+    extract_prompt_cache_from_batch,
     from_env,
     harvest_blocks_from_batch_cache,
     hash_image_payload,
+    make_warm_batch_exact_cache_multi,
     make_warm_batch_kv_cache,
     make_warm_batch_kv_cache_multi,
     make_warm_kv_cache,
@@ -43,6 +45,22 @@ def _make_fake_kv(
 
 def _assert_allclose(a: mx.array, b: mx.array) -> None:
     assert bool(mx.allclose(a, b).item())
+
+
+def _make_exact_row_cache(prefix_len: int):
+    from mlx_lm.models.cache import ArraysCache, KVCache
+
+    arrays = ArraysCache(size=2)
+    arrays.cache = [
+        mx.full((1, 3, 5), prefix_len, dtype=mx.float32),
+        mx.full((1, 2, 4, 6), prefix_len + 10, dtype=mx.float32),
+    ]
+    kv = KVCache()
+    kv.keys = mx.full((1, 1, prefix_len, 4), prefix_len + 20, dtype=mx.float32)
+    kv.values = mx.full((1, 1, prefix_len, 4), prefix_len + 30, dtype=mx.float32)
+    kv.offset = prefix_len
+    mx.eval(arrays.cache + [kv.keys, kv.values])
+    return [arrays, kv]
 
 
 def test_hash_chain_and_image_hash_are_deterministic():
@@ -233,6 +251,43 @@ def test_layer_major_memory_threshold_skips_block_pool(monkeypatch):
         warm[1].values[..., :expected_tokens, :],
         layer_values[1][..., :expected_tokens, :],
     )
+
+
+def test_exact_batch_cache_merge_and_extract_supports_arrays_and_kv():
+    from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache
+
+    warm = _make_exact_row_cache(12)
+    cold = _make_exact_row_cache(0)
+    cold[0].cache = [None, None]
+    cold[1].keys = None
+    cold[1].values = None
+    cold[1].offset = 0
+
+    batch_cache, max_prefix = make_warm_batch_exact_cache_multi(
+        [warm, cold],
+        [12, 0],
+    )
+
+    assert max_prefix == 12
+    assert batch_cache is not None
+    assert isinstance(batch_cache[0], ArraysCache)
+    assert isinstance(batch_cache[1], BatchKVCache)
+    assert batch_cache[0].left_padding is None
+    assert batch_cache[0].cache[0].shape == (2, 3, 5)
+    assert batch_cache[1].keys.shape == (2, 1, 12, 4)
+    _assert_allclose(batch_cache[0].cache[0][0:1], warm[0].cache[0])
+    _assert_allclose(batch_cache[0].cache[0][1:2], mx.zeros_like(warm[0].cache[0]))
+    _assert_allclose(batch_cache[1].keys[0:1], warm[1].keys)
+    _assert_allclose(batch_cache[1].keys[1:2], mx.zeros_like(warm[1].keys))
+
+    extracted = extract_prompt_cache_from_batch(batch_cache, 0)
+    assert extracted is not None
+    assert isinstance(extracted[0], ArraysCache)
+    assert isinstance(extracted[1], KVCache)
+    _assert_allclose(extracted[0].cache[1], warm[0].cache[1])
+    _assert_allclose(extracted[1].keys, warm[1].keys)
+    _assert_allclose(extracted[1].values, warm[1].values)
+    assert extracted[1].offset == 12
 
 
 def test_apc_max_pool_tensors_keeps_disk_persistence(tmp_path, monkeypatch):
