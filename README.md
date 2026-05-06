@@ -98,6 +98,14 @@ mlx_vlm.generate --model mlx-community/Qwen3.5-2B-4bit \
 
 When the budget is exceeded, the model is forced to emit `\n</think>` and transition to the answer. If `--enable-thinking` is passed but the model's chat template does not support it, the budget is applied only if the model generates the start token on its own.
 
+On the server, thinking mode is disabled by default. Start the server with `--enable-thinking` to make thinking mode the default for requests that do not specify it:
+
+```sh
+mlx_vlm.server --model MODEL_NAME --enable-thinking
+```
+
+Requests can override the server default with `enable_thinking: true` or `enable_thinking: false`.
+
 ### Speculative Decoding
 
 Speed up generation by drafting several candidate tokens with a small "drafter" model and verifying them in a single target forward pass. Two drafter families are supported.
@@ -268,6 +276,9 @@ mlx_vlm.server --model <hf_repo_or_local_path> --adapter-path <adapter_path>
 
 # With trust remote code enabled (required for some models)
 mlx_vlm.server --trust-remote-code
+
+# Enable thinking mode by default for requests that do not override it
+mlx_vlm.server --model Qwen/Qwen3.5-4B --enable-thinking
 ```
 
 #### Server Options
@@ -280,6 +291,7 @@ mlx_vlm.server --trust-remote-code
 - `--host`: Host address (default: `0.0.0.0`)
 - `--port`: Port number (default: `8080`)
 - `--trust-remote-code`: Trust remote code when loading models from Hugging Face Hub
+- `--enable-thinking`: Enable thinking mode by default for requests that do not set `enable_thinking`
 - `--kv-bits`: Number of bits for KV cache quantization (e.g. `8` for uniform, `3.5` for TurboQuant)
 - `--kv-quant-scheme`: KV cache quantization backend (`uniform` or `turboquant`)
 - `--kv-group-size`: Group size for uniform KV cache quantization (default: `64`)
@@ -749,6 +761,9 @@ curl -X POST "http://localhost:8080/responses" \
 - `top_k`: Top-k sampling cutoff
 - `min_p`: Min-p sampling threshold
 - `repetition_penalty`: Penalty applied to repeated tokens
+- `enable_thinking`: Override the server thinking-mode default for a request (`true` or `false`)
+- `thinking_budget`: Maximum tokens allowed inside the thinking block
+- `thinking_start_token`: Token that opens a thinking block
 - `stream`: Enable streaming responses
 
 
