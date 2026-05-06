@@ -143,6 +143,28 @@ def rotate_half_even_odd(x):
     return mx.flatten(mx.stack([-x2, x1], axis=-1), start_axis=-2, end_axis=-1)
 
 
+@mx.compile
+def _apply_interleaved_rotary_pos_emb_axis1(q, k, cos, sin):
+    cos = mx.expand_dims(cos, axis=1)
+    sin = mx.expand_dims(sin, axis=1)
+
+    rotary_dim = cos.shape[-1]
+    q_rot = q[..., :rotary_dim]
+    q_pass = q[..., rotary_dim:]
+    k_rot = k[..., :rotary_dim]
+    k_pass = k[..., rotary_dim:]
+
+    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+    q_embed = q_embed.astype(q.dtype)
+    k_embed = k_embed.astype(k.dtype)
+
+    return (
+        mx.concatenate([q_embed, q_pass], axis=-1),
+        mx.concatenate([k_embed, k_pass], axis=-1),
+    )
+
+
 def _section_cos_sin(cos, sin, mrope_section):
     split_indices = np.cumsum(list(mrope_section) * 2)[:-1].tolist()
     cos = mx.concatenate(
@@ -167,6 +189,9 @@ def apply_multimodal_rotary_pos_emb(
     style: str = "interleaved",
     cast_output: bool = True,
 ):
+    if style == "interleaved" and unsqueeze_dim == 1 and cast_output:
+        return _apply_interleaved_rotary_pos_emb_axis1(q, k, cos, sin)
+
     if style in {"sectioned_half_split", "sectioned_even_odd"}:
         if mrope_section is None:
             raise ValueError("mrope_section is required for sectioned MRoPE")
