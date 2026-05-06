@@ -12,6 +12,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
+from ..rope_utils import apply_rotary_pos_emb_even_odd
 from .config import ModelConfig, TextConfig
 
 
@@ -130,18 +131,6 @@ class Ernie4_5RotaryEmbedding:
         return cos.astype(x.dtype), sin.astype(x.dtype)
 
 
-def rotate_half_interleaved(x):
-    """Rotates using interleaved pattern: [-x1, x0, -x3, x2, ...].
-
-    This matches PyTorch's rotation: stack([-x[1::2], x[0::2]], dim=-1).reshape()
-    """
-    x_even = x[..., 0::2]  # [x0, x2, x4, ...]
-    x_odd = x[..., 1::2]  # [x1, x3, x5, ...]
-    # Stack as [-odd, even] and reshape
-    rotated = mx.stack([-x_odd, x_even], axis=-1)
-    return rotated.reshape(x.shape)
-
-
 def apply_rotary_pos_emb(q, k, cos_pos, sin_pos):
     """Apply rotary position embeddings to queries and keys.
 
@@ -153,24 +142,7 @@ def apply_rotary_pos_emb(q, k, cos_pos, sin_pos):
         cos_pos: [batch, seq_len, head_dim]
         sin_pos: [batch, seq_len, head_dim]
     """
-    orig_dtype = q.dtype
-    # Expand for heads dimension
-
-    cos_pos = mx.expand_dims(cos_pos, axis=1)  # [batch, 1, seq_len, head_dim]
-    sin_pos = mx.expand_dims(sin_pos, axis=1)
-
-    # Apply rotation: q_rotated = q * cos + rotate_half(q) * sin
-    q_rotated = rotate_half_interleaved(q)
-    k_rotated = rotate_half_interleaved(k)
-
-    q_embed = (q.astype(mx.float32) * cos_pos) + (
-        q_rotated.astype(mx.float32) * sin_pos
-    )
-    k_embed = (k.astype(mx.float32) * cos_pos) + (
-        k_rotated.astype(mx.float32) * sin_pos
-    )
-
-    return q_embed.astype(orig_dtype), k_embed.astype(orig_dtype)
+    return apply_rotary_pos_emb_even_odd(q, k, cos_pos, sin_pos, cos_layout="full")
 
 
 class Attention(nn.Module):
