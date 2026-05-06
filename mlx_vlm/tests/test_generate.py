@@ -1240,6 +1240,78 @@ def test_batch_apc_extra_hash_uses_precomputed_image_hash():
     assert got == apc_module.tenant_scoped_hash("tenant-a", 123)
 
 
+def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
+    class EmptyGenerationBatch:
+        def __len__(self):
+            return 0
+
+    bg = object.__new__(BatchGenerator)
+    bg._generation_batch = EmptyGenerationBatch()
+    bg._prompt_batch = None
+    bg._prompt_tokens_counter = 0
+    bg._prompt_time_counter = 0
+    bg._gen_tokens_counter = 0
+    bg._steps_counter = 0
+    bg.completion_batch_size = 4
+    bg.prefill_batch_size = 4
+    bg.prefill_step_size = 1
+    bg.kv_bits = None
+    bg.kv_group_size = 64
+    bg.kv_quant_scheme = "affine"
+    bg.apc_manager = None
+    bg.apc_mode = None
+    bg.model = SimpleNamespace()
+    bg._wire_stack = None
+    bg.compute_logprobs = False
+    bg.top_logprobs_k = 0
+    bg.sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+    bg.tokenizer = SimpleNamespace(stopping_criteria=object())
+
+    lengths = [2, 4, 3, 1]
+    bg._unprocessed_sequences = [
+        (
+            i,
+            list(range(length)),
+            1,
+            {
+                "inputs_embeds": mx.ones((1, length, 3)) * (i + 1),
+                "per_layer_inputs": mx.ones((1, length, 2, 5)) * (i + 1),
+                "attention_mask": mx.ones((1, length), dtype=mx.int32),
+                "pixel_values": mx.ones((1, 3, 2, 2)) * (i + 1),
+                "keep_tensor": mx.array([[i + 1]], dtype=mx.int32),
+                "rope_deltas": mx.array([[i + 10]], dtype=mx.int32),
+                "_apc_tenant": "tenant",
+            },
+            [],
+        )
+        for i, length in enumerate(lengths)
+    ]
+
+    captured = {}
+
+    def fake_prompt_batch(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            total_prompt_tokens=sum(len(ids) for ids in kwargs["input_ids"]),
+            needs_processing=lambda: True,
+            prompt_step=lambda: 0,
+        )
+
+    with patch.object(generate_module, "PromptProcessingBatch", fake_prompt_batch):
+        bg._next()
+
+    prompt_kwargs = captured["prompt_kwargs"]
+    assert captured["inputs_embeds"].shape == (4, 4, 3)
+    assert prompt_kwargs["per_layer_inputs"].shape == (4, 4, 2, 5)
+    assert prompt_kwargs["attention_mask"].shape == (4, 4)
+    assert prompt_kwargs["pixel_values"].shape == (4, 3, 2, 2)
+    assert prompt_kwargs["keep_tensor"].shape == (4, 1)
+    assert prompt_kwargs["rope_deltas"].shape == (4, 1)
+    assert "_apc_tenant" not in prompt_kwargs
+    assert prompt_kwargs["per_layer_inputs"][0, :, 0, 0].tolist() == [0, 0, 1, 1]
+    assert prompt_kwargs["per_layer_inputs"][3, :, 0, 0].tolist() == [0, 0, 0, 4]
+
+
 def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
     bg = object.__new__(BatchGenerator)
     bg.apc_manager = object()

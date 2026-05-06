@@ -1997,6 +1997,46 @@ def _right_pad_prompts(prompts, max_length=None):
     return mx.array([list(p) + [0] * (max_length - len(p)) for p in prompts])
 
 
+_SEQUENCE_ALIGNED_PROMPT_KWARGS = {
+    "attention_mask",
+    "decoder_inputs_embeds",
+    "deepstack_visual_embeds",
+    "visual_pos_masks",
+    "per_layer_inputs",
+    "full_text_row_masked_out_mask",
+    "position_ids",
+    "pos_hw",
+}
+
+
+def _prompt_kwarg_row(v: mx.array, row_idx: int, batch_size: int) -> mx.array:
+    if v.shape[0] == batch_size:
+        return v[row_idx : row_idx + 1]
+    return v[:1]
+
+
+def _is_sequence_aligned_prompt_kwarg(
+    key: str, v: mx.array, sequence_length: int
+) -> bool:
+    return (
+        key in _SEQUENCE_ALIGNED_PROMPT_KWARGS
+        and v.ndim >= 2
+        and v.shape[1] == sequence_length
+    )
+
+
+def _pad_sequence_aligned_prompt_kwarg(
+    v: mx.array, target_length: int, *, left: bool
+) -> mx.array:
+    pad = target_length - v.shape[1]
+    if pad <= 0:
+        return v
+    pad_shape = (v.shape[0], pad) + tuple(v.shape[2:])
+    pad_v = mx.zeros(pad_shape, dtype=v.dtype)
+    parts = [pad_v, v] if left else [v, pad_v]
+    return mx.concatenate(parts, axis=1)
+
+
 def _extend_cache(cache_a, cache_b):
     """Extend cache_a with cache_b along the batch dimension."""
     if not cache_a:
@@ -3142,6 +3182,7 @@ class BatchGenerator:
         # in _apc_extra_hash, never forwarded to the model.
         merged_kwargs: dict = {}
         per_row_keys: dict = {}
+        batch_size = len(prompt_kwargs_list)
         for i, kw in enumerate(prompt_kwargs_list):
             if not kw:
                 continue
@@ -3152,15 +3193,14 @@ class BatchGenerator:
                 if k == "inputs_embeds" or k in self._APC_PRIVATE_KEYS:
                     continue
                 if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
-                    row_v = v[:1]
-                    if v.shape[0] == 1 and v.ndim >= 2 and v.shape[1] == full_len:
+                    row_v = _prompt_kwarg_row(v, i, batch_size)
+                    if _is_sequence_aligned_prompt_kwarg(k, row_v, full_len):
                         row_v = row_v[:, prefix_len:, ...]
-                        if right_pad > 0:
-                            pad_shape = (row_v.shape[0], right_pad) + tuple(
-                                row_v.shape[2:]
-                            )
-                            row_pad = mx.zeros(pad_shape, dtype=row_v.dtype)
-                            row_v = mx.concatenate([row_v, row_pad], axis=1)
+                        row_v = _pad_sequence_aligned_prompt_kwarg(
+                            row_v,
+                            max_suffix_len,
+                            left=False,
+                        )
                     per_row_keys.setdefault(k, []).append(row_v)
                 elif k not in merged_kwargs:
                     merged_kwargs[k] = v
@@ -3472,14 +3512,20 @@ class BatchGenerator:
 
             merged_kwargs: dict = {}
             per_row_keys: dict = {}
-            for kw in prompt_kwargs_list:
+            batch_size = len(prompt_kwargs_list)
+            for i, (kw, l) in enumerate(zip(prompt_kwargs_list, lengths)):
                 if not kw:
                     continue
                 for k, v in kw.items():
                     if k == "inputs_embeds" or k in self._APC_PRIVATE_KEYS:
                         continue
                     if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
-                        per_row_keys.setdefault(k, []).append(v[:1])
+                        row_v = _prompt_kwarg_row(v, i, batch_size)
+                        if _is_sequence_aligned_prompt_kwarg(k, row_v, l):
+                            row_v = _pad_sequence_aligned_prompt_kwarg(
+                                row_v, max_length, left=True
+                            )
+                        per_row_keys.setdefault(k, []).append(row_v)
                     elif k not in merged_kwargs:
                         merged_kwargs[k] = v
             for k, vs in per_row_keys.items():
