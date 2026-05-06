@@ -50,6 +50,10 @@ def _selector_for_style(style: str, mrope_section: Sequence[int], freq_dim: int)
     return _chunked_position_selector(mrope_section, freq_dim)
 
 
+def mrope_position_selector(style: str, mrope_section: Sequence[int], freq_dim: int):
+    return _selector_for_style(style, mrope_section, freq_dim)
+
+
 @lru_cache(maxsize=None)
 def _mrope_apply_kernel(rotary_dim: int, position_ndim: int, pairing: str):
     if not _HAS_METAL:
@@ -447,6 +451,76 @@ def _apply_split_select_mrope(freqs, mrope_section):
     return mx.concatenate([chunk[i % 3] for i, chunk in enumerate(chunks)], axis=-1)
 
 
+def mrope_section_selectors(
+    mrope_section: Sequence[int],
+    position_axes: Sequence[int],
+    *,
+    interleave_sections: Sequence[int] = (),
+):
+    mrope_section = list(mrope_section)
+    position_axes = list(position_axes)
+    interleave_sections = list(interleave_sections)
+    if len(position_axes) != len(mrope_section):
+        raise ValueError("position_axes must match mrope_section length")
+
+    offsets = [0]
+    for length in mrope_section[:-1]:
+        offsets.append(offsets[-1] + length)
+
+    position_selector = []
+    frequency_selector = []
+
+    interleaved = set(interleave_sections)
+    if interleave_sections:
+        interleave_length = mrope_section[interleave_sections[0]]
+        if any(mrope_section[idx] != interleave_length for idx in interleave_sections):
+            raise ValueError("interleaved MRoPE sections must have equal length")
+        for local_idx in range(interleave_length):
+            for section_idx in interleave_sections:
+                position_selector.append(position_axes[section_idx])
+                frequency_selector.append(offsets[section_idx] + local_idx)
+
+    for section_idx, length in enumerate(mrope_section):
+        if section_idx in interleaved:
+            continue
+        offset = offsets[section_idx]
+        for local_idx in range(length):
+            position_selector.append(position_axes[section_idx])
+            frequency_selector.append(offset + local_idx)
+
+    return (
+        mx.array(position_selector, dtype=mx.int32),
+        mx.array(frequency_selector, dtype=mx.int32),
+    )
+
+
+@mx.compile
+def _selected_mrope_cos_sin(
+    position_ids,
+    inv_freq,
+    position_selector,
+    frequency_selector,
+):
+    positions = mx.take(position_ids, position_selector, axis=0).transpose(1, 2, 0)
+    freqs = positions.astype(mx.float32) * mx.take(inv_freq, frequency_selector)
+    emb = mx.repeat(freqs, repeats=2, axis=-1)
+    return mx.cos(emb), mx.sin(emb)
+
+
+def compute_selected_mrope_cos_sin(
+    position_ids,
+    inv_freq,
+    position_selector,
+    frequency_selector,
+):
+    return _selected_mrope_cos_sin(
+        position_ids,
+        inv_freq,
+        position_selector,
+        frequency_selector,
+    )
+
+
 def apply_mrope_frequency_layout(
     freqs,
     mrope_section: Sequence[int],
@@ -476,14 +550,13 @@ def compute_mrope_frequencies(
         return position_ids.astype(mx.float32)[..., None] * inv_freq
 
     # Fast path
-    if style in {"chunked", "interleaved"}:
+    if style in {"chunked", "interleaved", "split_select"}:
         if position_selector is None:
-            selector_fn = (
-                _chunked_position_selector
-                if style == "chunked"
-                else _interleaved_position_selector
+            position_selector = _selector_for_style(
+                style,
+                mrope_section,
+                inv_freq.shape[0],
             )
-            position_selector = selector_fn(mrope_section, inv_freq.shape[0])
         return _selected_mrope_freqs(position_ids, inv_freq, position_selector)
 
     # Slow path

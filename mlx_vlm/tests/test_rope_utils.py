@@ -5,7 +5,12 @@ import mlx_vlm.models.rope_utils as rope_utils
 from mlx_vlm.models.rope_utils import (
     MRoPERotaryEmbedding,
     apply_multimodal_rotary_pos_emb,
+    apply_mrope_frequency_layout,
     apply_rotary_pos_emb_even_odd,
+    compute_mrope_frequencies,
+    compute_selected_mrope_cos_sin,
+    mrope_section_selectors,
+    mrope_position_selector,
 )
 
 
@@ -99,3 +104,109 @@ def test_even_odd_precomputed_rotary_fast_path_matches_fallback(cos_layout):
 
     _assert_pair_close(fast, expected)
     _assert_pair_close((fast[0][..., 8:], fast[1][..., 8:]), (q[..., 8:], k[..., 8:]))
+
+
+def test_split_select_frequency_fast_path_matches_layout_fallback():
+    mx.random.seed(3)
+    position_ids = _position_ids(batch=2, seq_len=4)
+    inv_freq = mx.random.normal((4,)).astype(mx.float32)
+    mrope_section = [2, 1, 1]
+    position_selector = mrope_position_selector(
+        "split_select",
+        mrope_section,
+        inv_freq.shape[0],
+    )
+
+    fast = compute_mrope_frequencies(
+        position_ids,
+        inv_freq,
+        mrope_section,
+        style="split_select",
+        position_selector=position_selector,
+    )
+    freqs = position_ids.astype(mx.float32)[..., None] * inv_freq
+    expected = apply_mrope_frequency_layout(
+        freqs,
+        mrope_section,
+        style="split_select",
+    )
+
+    mx.eval(fast, expected)
+    assert _max_diff(fast, expected) < 1e-4
+
+
+def _reference_section_selected_mrope_cos_sin(
+    position_ids,
+    inv_freq,
+    mrope_section,
+    position_axes,
+    *,
+    interleave_sections=(),
+):
+    starts = [0]
+    for dim in mrope_section[:-1]:
+        starts.append(starts[-1] + dim)
+
+    section_freqs = []
+    for start, dim, position_axis in zip(starts, mrope_section, position_axes):
+        section_positions = position_ids[position_axis].astype(mx.float32)[..., None]
+        section_freqs.append(section_positions * inv_freq[start : start + dim])
+
+    parts = []
+    interleave_sections = tuple(interleave_sections)
+    for section_idx, section_freq in enumerate(section_freqs):
+        if section_idx not in interleave_sections:
+            parts.append(section_freq)
+            continue
+        if section_idx != interleave_sections[0]:
+            continue
+        interleaved = []
+        for offset in range(section_freq.shape[-1]):
+            for interleave_idx in interleave_sections:
+                interleaved.append(section_freqs[interleave_idx][..., offset])
+        parts.append(mx.stack(interleaved, axis=-1))
+
+    freqs = mx.concatenate(parts, axis=-1)
+    emb = mx.repeat(freqs, repeats=2, axis=-1)
+    return mx.cos(emb), mx.sin(emb)
+
+
+def test_mrope_section_selectors_interleave_selected_sections():
+    position_selector, frequency_selector = mrope_section_selectors(
+        [2, 2, 2],
+        position_axes=(1, 2, 0),
+        interleave_sections=(0, 1),
+    )
+
+    assert position_selector.tolist() == [1, 2, 1, 2, 0, 0]
+    assert frequency_selector.tolist() == [0, 2, 1, 3, 4, 5]
+
+
+def test_selected_mrope_cos_sin_matches_reference():
+    mx.random.seed(4)
+    mrope_section = [2, 2, 2]
+    position_axes = (1, 2, 0)
+    interleave_sections = (0, 1)
+    position_ids = _position_ids(batch=2, seq_len=4)
+    inv_freq = mx.random.normal((sum(mrope_section),)).astype(mx.float32)
+    position_selector, frequency_selector = mrope_section_selectors(
+        mrope_section,
+        position_axes=position_axes,
+        interleave_sections=interleave_sections,
+    )
+
+    fast = compute_selected_mrope_cos_sin(
+        position_ids,
+        inv_freq,
+        position_selector,
+        frequency_selector,
+    )
+    expected = _reference_section_selected_mrope_cos_sin(
+        position_ids,
+        inv_freq,
+        mrope_section,
+        position_axes,
+        interleave_sections=interleave_sections,
+    )
+
+    _assert_pair_close(fast, expected)
