@@ -387,24 +387,212 @@ finally:
     apc.close()
 ```
 
-To compare cold, warm-memory, and warm-disk behavior with a model:
+To compare cold, warm-memory, warm-disk, and disk-eviction behavior with a
+model, use the same direct API path:
 
-```sh
-python scripts/bench_apc_context_sweep.py \
-  --model Qwen/Qwen3-VL-4B-Instruct \
-  --contexts 8000 20000 50000 100000 \
-  --disk-cap-gb 0 \
-  --shard-max-blocks 256
-```
+```python
+import os
+import tempfile
+import time
+from pathlib import Path
 
-For a disk-eviction workload:
+from mlx_vlm import load, stream_generate
+from mlx_vlm.apc import APCManager, DiskBlockStore
+from mlx_vlm.prompt_utils import apply_chat_template
 
-```sh
-python scripts/bench_apc_disk_genstep.py \
-  --model Qwen/Qwen3-VL-4B-Instruct \
-  --test-prompt-tokens 8000 \
-  --fill-prompts 80 \
-  --disk-cap-gb 3.0
+model_id = "Qwen/Qwen3-VL-4B-Instruct"
+contexts = [8000, 20000, 50000, 100000]
+disk_cap_gb = 0  # 0 means uncapped
+shard_max_blocks = 256
+context_sweep_max_tokens = 1  # one token is enough to measure prefill reuse
+
+test_prompt_tokens = 8000
+fill_prompts = 80
+eviction_disk_cap_gb = 3.0
+
+os.environ["APC_DISK_SHARD_MAX_BLOCKS"] = str(shard_max_blocks)
+
+model, processor = load(model_id)
+tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
+
+def disk_cap_bytes(gb: float):
+    return None if gb <= 0 else int(gb * (1 << 30))
+
+
+def make_context(target_tokens: int, seed: int = 0) -> str:
+    line = (
+        f"Document {seed}: APC benchmark content with deterministic facts, "
+        "dates, identifiers, and repeated technical notes.\n"
+    )
+    line_tokens = max(1, len(tokenizer.encode(line, add_special_tokens=False)))
+    text = line * max(1, target_tokens // line_tokens)
+    while len(tokenizer.encode(text, add_special_tokens=False)) < target_tokens:
+        text += line
+    return text
+
+
+def make_prompt(context: str, question: str) -> str:
+    return apply_chat_template(
+        processor,
+        model.config,
+        prompt=f"{context}\n\n{question}",
+        num_images=0,
+    )
+
+
+def run_once(apc: APCManager, context: str, question: str, max_tokens: int = 32):
+    prompt = make_prompt(context, question)
+    apc.reset_stats()
+
+    last = None
+    output = []
+    start = time.perf_counter()
+    for chunk in stream_generate(
+        model,
+        processor,
+        prompt,
+        max_tokens=max_tokens,
+        temperature=0.0,
+        apc_manager=apc,
+    ):
+        output.append(chunk.text)
+        last = chunk
+
+    if last is None:
+        raise RuntimeError("generation returned no chunks")
+
+    return {
+        "wall_s": time.perf_counter() - start,
+        "prompt_tokens": last.prompt_tokens,
+        "prompt_tps": last.prompt_tps,
+        "generation_tps": last.generation_tps,
+        "apc": apc.stats_snapshot(),
+        "text": "".join(output).strip(),
+    }
+
+
+def print_result(label: str, result: dict) -> None:
+    stats = result["apc"]
+    print(
+        f"{label:<12} "
+        f"prompt_tokens={result['prompt_tokens']:>7} "
+        f"prompt_tps={result['prompt_tps']:>8.1f} "
+        f"gen_tps={result['generation_tps']:>7.1f} "
+        f"matched={stats.get('matched_tokens', 0):>7} "
+        f"disk_hits={stats.get('disk_hits', 0):>5} "
+        f"disk_evictions={stats.get('disk_evictions', 0):>5}"
+    )
+
+
+def open_apc(cache_root: Path, namespace: str, disk_gb: float) -> APCManager:
+    disk = DiskBlockStore(
+        cache_root,
+        namespace=namespace,
+        max_bytes=disk_cap_bytes(disk_gb),
+    )
+    return APCManager(num_blocks=4096, block_size=16, disk=disk)
+
+
+def run_context_sweep() -> None:
+    print("cold / warm-memory / warm-disk")
+    with tempfile.TemporaryDirectory() as tmp:
+        cache_root = Path(tmp)
+        for target_tokens in contexts:
+            context = make_context(target_tokens)
+            namespace = f"{model_id}-context-{target_tokens}"
+            apc = open_apc(cache_root, namespace, disk_cap_gb)
+            try:
+                print(f"\ncontext ~= {target_tokens} text tokens")
+                print_result(
+                    "cold",
+                    run_once(
+                        apc,
+                        context,
+                        "Summarize the key decisions.",
+                        max_tokens=context_sweep_max_tokens,
+                    ),
+                )
+                print_result(
+                    "warm-memory",
+                    run_once(
+                        apc,
+                        context,
+                        "List the open engineering risks.",
+                        max_tokens=context_sweep_max_tokens,
+                    ),
+                )
+            finally:
+                # Closing waits for queued disk writes before reopening the disk tier.
+                apc.close()
+
+            apc = open_apc(cache_root, namespace, disk_cap_gb)
+            try:
+                print_result(
+                    "warm-disk",
+                    run_once(
+                        apc,
+                        context,
+                        "Extract the implementation timeline.",
+                        max_tokens=context_sweep_max_tokens,
+                    ),
+                )
+            finally:
+                apc.close()
+
+
+def run_disk_eviction_workload() -> None:
+    print("\ndisk eviction workload")
+    with tempfile.TemporaryDirectory() as tmp:
+        cache_root = Path(tmp)
+        namespace = f"{model_id}-eviction"
+        test_context = make_context(test_prompt_tokens, seed=0)
+
+        apc = open_apc(cache_root, namespace, eviction_disk_cap_gb)
+        try:
+            print_result(
+                "seed",
+                run_once(apc, test_context, "Summarize the retained test prefix."),
+            )
+        finally:
+            apc.close()
+
+        apc = open_apc(cache_root, namespace, eviction_disk_cap_gb)
+        try:
+            for i in range(fill_prompts):
+                fill_context = make_context(test_prompt_tokens, seed=i + 1)
+                run_once(
+                    apc,
+                    fill_context,
+                    f"Summarize filler document {i + 1}.",
+                    max_tokens=1,
+                )
+                if (i + 1) % 10 == 0:
+                    stats = apc.stats_snapshot()
+                    print(
+                        f"filled={i + 1:>3} "
+                        f"disk_gb={stats.get('disk_bytes', 0) / (1 << 30):.2f} "
+                        f"disk_evictions={stats.get('disk_evictions', 0)}"
+                    )
+        finally:
+            apc.close()
+
+        apc = open_apc(cache_root, namespace, eviction_disk_cap_gb)
+        try:
+            print_result(
+                "post-fill",
+                run_once(
+                    apc,
+                    test_context,
+                    "Check whether the retained test prefix still restores.",
+                ),
+            )
+        finally:
+            apc.close()
+
+
+run_context_sweep()
+run_disk_eviction_workload()
 ```
 
 #### Server
