@@ -1324,7 +1324,7 @@ def generate_step(
 
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
 
-    mx.async_eval(y)
+    mx.async_eval(y, logprobs)
 
     # Speculative decoding
     if draft_model is not None:
@@ -1416,7 +1416,7 @@ def generate_step(
     while True:
         if n != max_tokens:
             next_y, next_logprobs = _step(y[None])
-            mx.async_eval(next_y)
+            mx.async_eval(next_y, next_logprobs)
         if n == 0:
             mx.eval(y)
         if n == max_tokens:
