@@ -109,6 +109,7 @@ class Qwen3_5Attention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         position_ids: Optional[mx.array] = None,
+        position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -138,7 +139,10 @@ class Qwen3_5Attention(nn.Module):
         else:
             kv_seq_len += cache.offset + 1 if cache is not None else 0
 
-        cos, sin = self.rotary_emb(values, position_ids)
+        if position_embeddings is None:
+            cos, sin = self.rotary_emb(values, position_ids)
+        else:
+            cos, sin = position_embeddings
 
         if mask is not None and isinstance(mask, mx.array):
             if isinstance(kv_seq_len, mx.array):
@@ -250,7 +254,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
         conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
         if cache is not None:
-            cache[0] = conv_input[:, -(self.conv_kernel_size - 1) :]
+            cache[0] = mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1) :])
         conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = [
@@ -330,6 +334,7 @@ class Qwen3_5DecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         position_ids: Optional[mx.array] = None,
+        position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
         gdn_sink: Optional[list] = None,
     ) -> mx.array:
         if self.is_linear:
@@ -337,7 +342,13 @@ class Qwen3_5DecoderLayer(nn.Module):
                 self.input_layernorm(x), mask, cache, gdn_sink=gdn_sink
             )
         else:
-            r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
+            r = self.self_attn(
+                self.input_layernorm(x),
+                mask=mask,
+                cache=cache,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+            )
         h = x + r
         return h + self.mlp(self.post_attention_layernorm(h))
 
@@ -376,11 +387,24 @@ class Qwen3_5Model(nn.Module):
 
         fa_mask = create_attention_mask(h, cache[self.fa_idx])
         ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
+        position_embeddings = None
+        if position_ids is not None:
+            for layer in self.layers:
+                if not layer.is_linear:
+                    position_embeddings = layer.self_attn.rotary_emb(h, position_ids)
+                    break
 
         capture_set = set(capture_layer_ids) if capture_layer_ids else set()
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
-            h = layer(h, mask, c, position_ids, gdn_sink=gdn_sink)
+            h = layer(
+                h,
+                mask=mask,
+                cache=c,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+                gdn_sink=gdn_sink,
+            )
             if hidden_sink is not None and i in capture_set:
                 hidden_sink.append(h)
 
