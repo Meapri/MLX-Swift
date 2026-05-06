@@ -140,6 +140,22 @@ def _fast_mrope_apply(
     return outputs[0], outputs[1]
 
 
+@lru_cache(maxsize=None)
+def _compiled_mrope_apply(rotary_dim: int):
+    @mx.compile
+    def apply(q, k, position_ids, inv_freq, position_selector):
+        return _fast_mrope_apply(
+            q,
+            k,
+            position_ids,
+            inv_freq,
+            position_selector,
+            rotary_dim,
+        )
+
+    return apply
+
+
 def get_mrope_section(
     *,
     rope_scaling: Optional[dict] = None,
@@ -275,6 +291,9 @@ class MRoPERotaryEmbedding:
         else:
             self.position_selector = None
         self.fused_apply = style in {"chunked", "interleaved"} and _HAS_METAL
+        self._compiled_apply = (
+            _compiled_mrope_apply(dim) if self.fused_apply else None
+        )
 
     def __call__(self, x, position_ids):
         freqs = compute_mrope_frequencies(
@@ -308,13 +327,12 @@ class MRoPERotaryEmbedding:
             and q.ndim == 4
             and k.ndim == 4
         ):
-            fast = _fast_mrope_apply(
+            fast = self._compiled_apply(
                 q,
                 k,
                 position_ids,
                 self.inv_freq,
                 self.position_selector,
-                self.dim,
             )
             if fast is not None:
                 return fast
