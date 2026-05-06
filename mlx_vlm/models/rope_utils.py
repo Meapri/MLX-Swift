@@ -1,7 +1,10 @@
 from typing import Optional, Sequence
 
 import mlx.core as mx
-import numpy as np
+
+
+def _cumulative_splits(lengths: Sequence[int]):
+    return mx.cumsum(mx.array(lengths, dtype=mx.int32))[:-1]
 
 
 def get_mrope_section(
@@ -43,7 +46,7 @@ def _apply_interleaved_mrope(freqs, mrope_section):
 
 
 def _apply_split_select_mrope(freqs, mrope_section):
-    split_indices = np.cumsum(mrope_section)[:-1].tolist()
+    split_indices = _cumulative_splits(mrope_section)
     chunks = mx.split(freqs, split_indices, axis=-1)
     return mx.concatenate([chunk[i % 3] for i, chunk in enumerate(chunks)], axis=-1)
 
@@ -154,7 +157,7 @@ def _apply_interleaved_rotary_pos_emb_axis1(q, k, cos, sin):
 
 
 def _section_cos_sin(cos, sin, mrope_section):
-    split_indices = np.cumsum(list(mrope_section) * 2)[:-1].tolist()
+    split_indices = _cumulative_splits(list(mrope_section) * 2)
     cos = mx.concatenate(
         [m[i % 3] for i, m in enumerate(mx.split(cos, split_indices, axis=-1))],
         axis=-1,
