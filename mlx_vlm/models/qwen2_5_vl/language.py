@@ -96,15 +96,20 @@ class Attention(nn.Module):
             kv_seq_len += cache.offset + 1 if cache is not None else 0
 
         if position_embeddings is None:
-            cos, sin = self.rotary_emb(values, position_ids)
+            queries, keys = self.rotary_emb.apply_rotary(
+                queries,
+                keys,
+                position_ids,
+                unsqueeze_dim=1,
+            )
         else:
             cos, sin = position_embeddings
+            queries, keys = apply_multimodal_rotary_pos_emb(
+                queries, keys, cos, sin, unqueeze_dim=1
+            )
 
         if mask is not None and isinstance(mask, mx.array):
             mask = mask[..., : keys.shape[-2]]
-        queries, keys = apply_multimodal_rotary_pos_emb(
-            queries, keys, cos, sin, unqueeze_dim=1
-        )
 
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
@@ -194,7 +199,11 @@ class Qwen2Model(nn.Module):
             mask = create_attention_mask(h, cache)
 
         position_embeddings = None
-        if position_ids is not None and self.layers:
+        if (
+            position_ids is not None
+            and self.layers
+            and not self.layers[0].self_attn.rotary_emb.fused_apply
+        ):
             position_embeddings = self.layers[0].self_attn.rotary_emb(h, position_ids)
 
         for layer, c in zip(self.layers, cache):

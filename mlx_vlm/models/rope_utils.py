@@ -18,14 +18,24 @@ def _interleaved_position_selector(mrope_section: Sequence[int], freq_dim: int):
     return mx.array(selector, dtype=mx.int32)
 
 
+def _chunked_position_selector(mrope_section: Sequence[int], freq_dim: int):
+    selector = [0] * freq_dim
+    offset = mrope_section[0]
+    for dim, length in enumerate(mrope_section[1:], start=1):
+        for idx in range(offset, min(offset + length, freq_dim)):
+            selector[idx] = dim
+        offset += length
+    return mx.array(selector, dtype=mx.int32)
+
+
 @mx.compile
-def _interleaved_mrope_freqs(position_ids, inv_freq, position_selector):
+def _selected_mrope_freqs(position_ids, inv_freq, position_selector):
     positions = mx.take(position_ids, position_selector, axis=0).transpose(1, 2, 0)
     return positions.astype(mx.float32) * inv_freq
 
 
 @lru_cache(maxsize=None)
-def _interleaved_mrope_apply_kernel(rotary_dim: int, position_ndim: int):
+def _mrope_apply_kernel(rotary_dim: int, position_ndim: int):
     if not _HAS_METAL:
         return None
 
@@ -98,14 +108,14 @@ def _interleaved_mrope_apply_kernel(rotary_dim: int, position_ndim: int):
     """
 
     return mx.fast.metal_kernel(
-        name=f"interleaved_mrope_apply_{rotary_dim}_{position_ndim}d",
+        name=f"mrope_apply_{rotary_dim}_{position_ndim}d",
         input_names=["q", "k", "position_ids", "inv_freq", "position_selector"],
         output_names=["q_out", "k_out"],
         source=source,
     )
 
 
-def _fast_interleaved_mrope_apply(
+def _fast_mrope_apply(
     q,
     k,
     position_ids,
@@ -113,7 +123,7 @@ def _fast_interleaved_mrope_apply(
     position_selector,
     rotary_dim: int,
 ):
-    kernel = _interleaved_mrope_apply_kernel(rotary_dim, position_ids.ndim)
+    kernel = _mrope_apply_kernel(rotary_dim, position_ids.ndim)
     if kernel is None:
         return None
 
@@ -202,13 +212,18 @@ def compute_mrope_frequencies(
     if position_ids.ndim == 2:
         return position_ids.astype(mx.float32)[..., None] * inv_freq
 
-    if style == "interleaved":
+    # Fast path
+    if style in {"chunked", "interleaved"}:
         if position_selector is None:
-            position_selector = _interleaved_position_selector(
-                mrope_section, inv_freq.shape[0]
+            selector_fn = (
+                _chunked_position_selector
+                if style == "chunked"
+                else _interleaved_position_selector
             )
-        return _interleaved_mrope_freqs(position_ids, inv_freq, position_selector)
+            position_selector = selector_fn(mrope_section, inv_freq.shape[0])
+        return _selected_mrope_freqs(position_ids, inv_freq, position_selector)
 
+    # Slow path
     freqs = position_ids.astype(mx.float32)[..., None] * inv_freq
     return apply_mrope_frequency_layout(freqs, mrope_section, style=style)
 
@@ -249,12 +264,17 @@ class MRoPERotaryEmbedding:
                 rope_parameters=rope_parameters,
             )
         )
-        self.position_selector = (
-            _interleaved_position_selector(self.mrope_section, self.inv_freq.shape[0])
-            if style == "interleaved"
-            else None
-        )
-        self.fused_apply = style == "interleaved" and _HAS_METAL
+        if style == "chunked":
+            self.position_selector = _chunked_position_selector(
+                self.mrope_section, self.inv_freq.shape[0]
+            )
+        elif style == "interleaved":
+            self.position_selector = _interleaved_position_selector(
+                self.mrope_section, self.inv_freq.shape[0]
+            )
+        else:
+            self.position_selector = None
+        self.fused_apply = style in {"chunked", "interleaved"} and _HAS_METAL
 
     def __call__(self, x, position_ids):
         freqs = compute_mrope_frequencies(
@@ -288,7 +308,7 @@ class MRoPERotaryEmbedding:
             and q.ndim == 4
             and k.ndim == 4
         ):
-            fast = _fast_interleaved_mrope_apply(
+            fast = _fast_mrope_apply(
                 q,
                 k,
                 position_ids,
