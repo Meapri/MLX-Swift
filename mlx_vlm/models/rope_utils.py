@@ -191,6 +191,28 @@ def apply_mrope_frequency_layout(
     return freqs
 
 
+def compute_mrope_frequencies(
+    position_ids,
+    inv_freq,
+    mrope_section: Sequence[int],
+    *,
+    style: str = "interleaved",
+    position_selector=None,
+):
+    if position_ids.ndim == 2:
+        return position_ids.astype(mx.float32)[..., None] * inv_freq
+
+    if style == "interleaved":
+        if position_selector is None:
+            position_selector = _interleaved_position_selector(
+                mrope_section, inv_freq.shape[0]
+            )
+        return _interleaved_mrope_freqs(position_ids, inv_freq, position_selector)
+
+    freqs = position_ids.astype(mx.float32)[..., None] * inv_freq
+    return apply_mrope_frequency_layout(freqs, mrope_section, style=style)
+
+
 class MRoPERotaryEmbedding:
     """Shared language-side rotary embedding for MRoPE models.
 
@@ -235,21 +257,13 @@ class MRoPERotaryEmbedding:
         self.fused_apply = style == "interleaved" and _HAS_METAL
 
     def __call__(self, x, position_ids):
-        if position_ids.ndim == 2:
-            freqs = position_ids.astype(mx.float32)[..., None] * self.inv_freq
-        elif self.style == "interleaved":
-            freqs = _interleaved_mrope_freqs(
-                position_ids,
-                self.inv_freq,
-                self.position_selector,
-            )
-        else:
-            freqs = position_ids.astype(mx.float32)[..., None] * self.inv_freq
-            freqs = apply_mrope_frequency_layout(
-                freqs,
-                self.mrope_section,
-                style=self.style,
-            )
+        freqs = compute_mrope_frequencies(
+            position_ids,
+            self.inv_freq,
+            self.mrope_section,
+            style=self.style,
+            position_selector=self.position_selector,
+        )
         emb = mx.concatenate([freqs, freqs], axis=-1)
         cos = mx.cos(emb) * self.attention_scaling
         sin = mx.sin(emb) * self.attention_scaling
