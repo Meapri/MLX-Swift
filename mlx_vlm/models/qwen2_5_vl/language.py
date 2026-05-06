@@ -387,14 +387,11 @@ class LanguageModel(nn.Module):
                     attention_mask == 0, mx.ones_like(position_ids), position_ids
                 )
                 max_position_ids = position_ids.max(axis=-1, keepdims=True)
-                position_ids = mx.broadcast_to(
-                    position_ids[None, :, :], (3, *position_ids.shape)
-                )
                 mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
             else:
                 position_ids = mx.arange(input_ids.shape[1]).reshape(1, -1)
                 position_ids = mx.broadcast_to(
-                    position_ids, (3, input_ids.shape[0], input_ids.shape[1])
+                    position_ids, (input_ids.shape[0], input_ids.shape[1])
                 )
                 mrope_position_deltas = mx.zeros(
                     [input_ids.shape[0], 1],
@@ -453,9 +450,14 @@ class LanguageModel(nn.Module):
             ):
                 if self._position_ids is not None:
                     seq_length = inputs.shape[1]
-                    position_ids = self._position_ids[
-                        :, :, cache_offset : cache_offset + seq_length
-                    ]
+                    if self._position_ids.ndim == 3:
+                        position_ids = self._position_ids[
+                            :, :, cache_offset : cache_offset + seq_length
+                        ]
+                    else:
+                        position_ids = self._position_ids[
+                            :, cache_offset : cache_offset + seq_length
+                        ]
                 else:
                     position_ids, rope_deltas = self.get_rope_index(
                         inputs, image_grid_thw, video_grid_thw, rope_mask
@@ -487,10 +489,7 @@ class LanguageModel(nn.Module):
 
                 position_ids = mx.arange(seq_length).reshape(1, -1)
                 position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
-                position_ids = mx.add(position_ids, delta)[None, ...]
-                position_ids = mx.broadcast_to(
-                    position_ids, (3, batch_size, seq_length)
-                )
+                position_ids = mx.add(position_ids, delta)
 
         out = self.model(
             inputs, cache=cache, inputs_embeds=inputs_embeds, position_ids=position_ids

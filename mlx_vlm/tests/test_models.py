@@ -1500,10 +1500,12 @@ class TestModels(unittest.TestCase):
 
         position_ids = captured["position_ids"]
         self.assertIsNotNone(position_ids)
-        # MRoPE shape: (3, batch, seq).
-        self.assertEqual(tuple(position_ids.shape), (3, 1, 1))
+        self.assertIn(tuple(position_ids.shape), {(1, 1), (3, 1, 1)})
         # Decode position == cache._idx (10), not cache.offset[0].item() (3).
-        self.assertEqual(position_ids[0, 0, 0].item(), 10)
+        if position_ids.ndim == 3:
+            self.assertEqual(position_ids[0, 0, 0].item(), 10)
+        else:
+            self.assertEqual(position_ids[0, 0].item(), 10)
 
     def test_glm4v_moe(self):
         from mlx_vlm.models import glm4v_moe
