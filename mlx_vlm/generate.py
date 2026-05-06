@@ -2015,6 +2015,29 @@ def _prompt_kwarg_row(v: mx.array, row_idx: int, batch_size: int) -> mx.array:
     return v[:1]
 
 
+def _split_prompt_kwargs_per_row(prompt_kwargs: dict, batch_size: int) -> List[dict]:
+    """Normalize batched prompt kwargs into one dict per batch row.
+
+    ``model.get_input_embeddings()`` commonly returns batch-sized tensors
+    (notably ``inputs_embeds``). ``BatchGenerator.insert()`` stores prompt
+    kwargs per sequence, so passing the same batched dict for every row causes
+    the prompt builder to concatenate those batched tensors ``batch_size``
+    times, effectively squaring the batch dimension.
+    """
+    if batch_size <= 1:
+        return [prompt_kwargs or {}]
+
+    rows = [{} for _ in range(batch_size)]
+    for k, v in (prompt_kwargs or {}).items():
+        if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
+            for i in range(batch_size):
+                rows[i][k] = _prompt_kwarg_row(v, i, batch_size)
+        else:
+            for row in rows:
+                row[k] = v
+    return rows
+
+
 def _is_sequence_aligned_prompt_kwarg(
     key: str, v: mx.array, sequence_length: int
 ) -> bool:
@@ -3853,7 +3876,7 @@ def _generate_batch(
     uids = gen.insert(
         input_ids.tolist(),
         max_tokens,
-        prompt_kwargs=[gen_kwargs] * len(input_ids),
+        prompt_kwargs=_split_prompt_kwargs_per_row(gen_kwargs, batch_size),
         logits_processors=logits_processors,
     )
     results = {uid: [] for uid in uids}
