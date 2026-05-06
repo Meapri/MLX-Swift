@@ -103,25 +103,13 @@ class MRoPERotaryEmbedding:
         )
 
     def __call__(self, x, position_ids):
-        if position_ids.ndim == 2:
-            position_ids = mx.broadcast_to(
-                position_ids[None, ...],
-                (3, position_ids.shape[0], position_ids.shape[1]),
+        freqs = position_ids.astype(mx.float32)[..., None] * self.inv_freq
+        if position_ids.ndim != 2:
+            freqs = apply_mrope_frequency_layout(
+                freqs,
+                self.mrope_section,
+                style=self.style,
             )
-
-        inv_freq_expanded = mx.broadcast_to(
-            self.inv_freq[None, None, :, None].astype(mx.float32),
-            (3, position_ids.shape[1], self.inv_freq.shape[0], 1),
-        )
-        position_ids_expanded = position_ids[:, :, None, :].astype(mx.float32)
-
-        freqs = inv_freq_expanded @ position_ids_expanded
-        freqs = mx.swapaxes(freqs, 2, 3)
-        freqs = apply_mrope_frequency_layout(
-            freqs,
-            self.mrope_section,
-            style=self.style,
-        )
         emb = mx.concatenate([freqs, freqs], axis=-1)
         cos = mx.cos(emb) * self.attention_scaling
         sin = mx.sin(emb) * self.attention_scaling
