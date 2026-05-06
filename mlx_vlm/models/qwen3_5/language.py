@@ -140,16 +140,20 @@ class Qwen3_5Attention(nn.Module):
             kv_seq_len += cache.offset + 1 if cache is not None else 0
 
         if position_embeddings is None:
-            cos, sin = self.rotary_emb(values, position_ids)
+            queries, keys = self.rotary_emb.apply_rotary(
+                queries,
+                keys,
+                position_ids,
+                unsqueeze_dim=1,
+            )
         else:
             cos, sin = position_embeddings
+            queries, keys = apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
 
         if mask is not None and isinstance(mask, mx.array):
             if isinstance(kv_seq_len, mx.array):
                 kv_seq_len = kv_seq_len.max().item()
             mask = mask[..., : int(kv_seq_len)]
-
-        queries, keys = apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
 
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
@@ -383,7 +387,10 @@ class Qwen3_5Model(nn.Module):
         if position_ids is not None:
             for layer in self.layers:
                 if not layer.is_linear:
-                    position_embeddings = layer.self_attn.rotary_emb(h, position_ids)
+                    if not layer.self_attn.rotary_emb.fused_apply:
+                        position_embeddings = layer.self_attn.rotary_emb(
+                            h, position_ids
+                        )
                     break
 
         capture_set = set(capture_layer_ids) if capture_layer_ids else set()
@@ -776,10 +783,7 @@ class LanguageModel(nn.Module):
 
                 position_ids = mx.arange(seq_length).reshape(1, -1)
                 position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
-                position_ids = mx.add(position_ids, delta)[None, ...]
-                position_ids = mx.broadcast_to(
-                    position_ids, (3, batch_size, seq_length)
-                )
+                position_ids = mx.add(position_ids, delta)
 
         hidden_sink: Optional[List[mx.array]] = (
             [] if capture_layer_ids is not None else None
