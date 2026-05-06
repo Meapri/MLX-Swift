@@ -75,6 +75,7 @@ class Attention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
         position_ids: Optional[mx.array] = None,
+        position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -110,7 +111,10 @@ class Attention(nn.Module):
         else:
             kv_seq_len += cache_size
 
-        cos, sin = self.rotary_emb(values, position_ids)
+        if position_embeddings is None:
+            cos, sin = self.rotary_emb(values, position_ids)
+        else:
+            cos, sin = position_embeddings
 
         if mask is not None and isinstance(mask, mx.array):
             if isinstance(kv_seq_len, mx.array):
@@ -159,8 +163,15 @@ class Qwen3VLDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
         position_ids: Optional[mx.array] = None,
+        position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
     ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
+        r = self.self_attn(
+            self.input_layernorm(x),
+            mask=mask,
+            cache=cache,
+            position_ids=position_ids,
+            position_embeddings=position_embeddings,
+        )
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
         out = h + r
@@ -204,8 +215,12 @@ class Qwen3VLModel(nn.Module):
             mask = create_attention_mask(
                 h, cache[0] if cache and cache[0] is not None else cache
             )
+        position_embeddings = None
+        if position_ids is not None and self.layers:
+            position_embeddings = self.layers[0].self_attn.rotary_emb(h, position_ids)
+
         for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
-            h = layer(h, mask, c, position_ids)
+            h = layer(h, mask, c, position_ids, position_embeddings)
             # Add deepstack visual embeds
             # add visual features to the hidden states of first several layers
             if deepstack_visual_embeds is not None and layer_idx in range(

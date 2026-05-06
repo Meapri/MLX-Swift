@@ -207,6 +207,7 @@ class Attention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
         position_ids: Optional[mx.array] = None,
+        position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -229,7 +230,10 @@ class Attention(nn.Module):
             position_ids = mx.arange(offset, offset + L)
             position_ids = mx.expand_dims(position_ids, axis=0)
 
-        cos, sin = self.rotary_emb(values, position_ids)
+        if position_embeddings is None:
+            cos, sin = self.rotary_emb(values, position_ids)
+        else:
+            cos, sin = position_embeddings
         queries, keys = apply_rotary_pos_emb(queries, keys, cos, sin)
 
         if cache is not None:
@@ -410,9 +414,16 @@ class Ernie4_5VLDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
         position_ids: Optional[mx.array] = None,
+        position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
         token_type_ids: Optional[mx.array] = None,
     ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
+        r = self.self_attn(
+            self.input_layernorm(x),
+            mask=mask,
+            cache=cache,
+            position_ids=position_ids,
+            position_embeddings=position_embeddings,
+        )
         h = x + r
         if isinstance(self.mlp, Ernie4_5_MoeMLP):
             r = self.mlp(
@@ -458,9 +469,19 @@ class Ernie4_5Model(nn.Module):
             mask = create_attention_mask(
                 h, cache[0] if cache and cache[0] is not None else cache
             )
+        position_embeddings = None
+        if position_ids is not None and self.layers:
+            position_embeddings = self.layers[0].self_attn.rotary_emb(h, position_ids)
 
         for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, c, position_ids, token_type_ids=token_type_ids)
+            h = layer(
+                h,
+                mask=mask,
+                cache=c,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+                token_type_ids=token_type_ids,
+            )
 
         return self.norm(h)
 

@@ -77,6 +77,7 @@ class Attention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
         position_ids: Optional[mx.array] = None,
+        position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -102,7 +103,10 @@ class Attention(nn.Module):
         else:
             kv_seq_len += cache.offset + 1 if cache is not None else 0
 
-        cos, sin = self.rotary_emb(values, position_ids)
+        if position_embeddings is None:
+            cos, sin = self.rotary_emb(values, position_ids)
+        else:
+            cos, sin = position_embeddings
 
         if mask is not None and isinstance(mask, mx.array):
             if isinstance(kv_seq_len, mx.array):
@@ -188,8 +192,15 @@ class Qwen3OmniMoEThinkerTextDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
         position_ids: Optional[mx.array] = None,
+        position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
     ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
+        r = self.self_attn(
+            self.input_layernorm(x),
+            mask=mask,
+            cache=cache,
+            position_ids=position_ids,
+            position_embeddings=position_embeddings,
+        )
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
         out = h + r
@@ -235,11 +246,14 @@ class Qwen3VLMoEModel(nn.Module):
             )
 
         all_hidden_states = [] if output_hidden_states else None
+        position_embeddings = None
+        if position_ids is not None and self.layers:
+            position_embeddings = self.layers[0].self_attn.rotary_emb(h, position_ids)
 
         for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
             if output_hidden_states:
                 all_hidden_states.append(h)
-            h = layer(h, mask, c, position_ids)
+            h = layer(h, mask, c, position_ids, position_embeddings)
 
             if deepstack_visual_embeds is not None and layer_idx in range(
                 len(deepstack_visual_embeds)
