@@ -116,17 +116,13 @@ def _mrope_apply_kernel(rotary_dim: int, position_ndim: int):
 
 
 def _fast_mrope_apply(
+    kernel,
     q,
     k,
     position_ids,
     inv_freq,
     position_selector,
-    rotary_dim: int,
 ):
-    kernel = _mrope_apply_kernel(rotary_dim, position_ids.ndim)
-    if kernel is None:
-        return None
-
     q_size = q.size
     k_size = k.size
     outputs = kernel(
@@ -141,16 +137,20 @@ def _fast_mrope_apply(
 
 
 @lru_cache(maxsize=None)
-def _compiled_mrope_apply(rotary_dim: int):
+def _compiled_mrope_apply(rotary_dim: int, position_ndim: int):
+    kernel = _mrope_apply_kernel(rotary_dim, position_ndim)
+    if kernel is None:
+        return None
+
     @mx.compile
     def apply(q, k, position_ids, inv_freq, position_selector):
         return _fast_mrope_apply(
+            kernel,
             q,
             k,
             position_ids,
             inv_freq,
             position_selector,
-            rotary_dim,
         )
 
     return apply
@@ -291,9 +291,7 @@ class MRoPERotaryEmbedding:
         else:
             self.position_selector = None
         self.fused_apply = style in {"chunked", "interleaved"} and _HAS_METAL
-        self._compiled_apply = (
-            _compiled_mrope_apply(dim) if self.fused_apply else None
-        )
+        self._compiled_apply = {} if self.fused_apply else None
 
     def __call__(self, x, position_ids):
         freqs = compute_mrope_frequencies(
@@ -327,13 +325,21 @@ class MRoPERotaryEmbedding:
             and q.ndim == 4
             and k.ndim == 4
         ):
-            fast = self._compiled_apply(
-                q,
-                k,
-                position_ids,
-                self.inv_freq,
-                self.position_selector,
-            )
+            compiled_apply = self._compiled_apply.get(position_ids.ndim)
+            if compiled_apply is None:
+                compiled_apply = _compiled_mrope_apply(self.dim, position_ids.ndim)
+                if compiled_apply is not None:
+                    self._compiled_apply[position_ids.ndim] = compiled_apply
+
+            fast = None
+            if compiled_apply is not None:
+                fast = compiled_apply(
+                    q,
+                    k,
+                    position_ids,
+                    self.inv_freq,
+                    self.position_selector,
+                )
             if fast is not None:
                 return fast
 
