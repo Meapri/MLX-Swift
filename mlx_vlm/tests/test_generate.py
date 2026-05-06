@@ -547,6 +547,53 @@ class TestBatchGenerator:
         second = batch.next()
         assert [r.token for r in second] == [2, 2]
 
+    def test_generation_batch_extend_keeps_processor_context_aligned(self):
+        class FixedLogitModel:
+            def __call__(self, input_ids, cache=None, **kwargs):
+                token_scores = mx.array([0.0, 10.0, 0.0, 0.0])
+                logits = mx.broadcast_to(
+                    token_scores, (input_ids.shape[0], input_ids.shape[1], 4)
+                )
+                return MagicMock(logits=logits)
+
+        seen_contexts = []
+
+        def force_token_2(tokens, logits):
+            seen_contexts.append(tokens.tolist())
+            token_scores = mx.array([-1e9, -1e9, 0.0, -1e9])
+            return mx.broadcast_to(token_scores, logits.shape)
+
+        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+        stop_criteria = lambda token: False
+        plain = GenerationBatch(
+            model=FixedLogitModel(),
+            uids=[0, 1],
+            inputs=mx.array([5, 6], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2, 2],
+            logits_processors=[None, None],
+        )
+        structured = GenerationBatch(
+            model=FixedLogitModel(),
+            uids=[2],
+            inputs=mx.array([7], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2],
+            token_context=[[30]],
+            logits_processors=[[force_token_2]],
+        )
+
+        plain.extend(structured)
+        assert plain.token_context == [[], [], [30]]
+
+        first = plain.next()
+        assert [r.token for r in first] == [5, 6, 7]
+        assert seen_contexts == [[30, 7]]
+
     def test_remove_from_unprocessed(self, mock_model, mock_processor):
         gen = BatchGenerator(
             model=mock_model.language_model,

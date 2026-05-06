@@ -2171,6 +2171,7 @@ class GenerationBatch:
         self.top_logprobs_k = top_logprobs_k
         self.logits_processors = logits_processors or []
         self.token_context = [list(ctx) for ctx in (token_context or [])]
+        self._ensure_token_context()
 
         self._current_tokens = None
         self._current_lps = None
@@ -2184,6 +2185,17 @@ class GenerationBatch:
 
     def __len__(self):
         return len(self.uids)
+
+    def _ensure_token_context(self, *, force: bool = False):
+        if not (force or (self.logits_processors and any(self.logits_processors))):
+            if not self.logits_processors:
+                self.token_context = []
+            return
+        if len(self.token_context) < len(self.uids):
+            missing = len(self.uids) - len(self.token_context)
+            self.token_context.extend([[] for _ in range(missing)])
+        elif len(self.token_context) > len(self.uids):
+            self.token_context = self.token_context[: len(self.uids)]
 
     def _step(self):
         """Perform one generation step with double buffering."""
@@ -2203,8 +2215,7 @@ class GenerationBatch:
 
         if self.logits_processors and any(self.logits_processors):
             last_tokens = inputs.tolist()
-            if not self.token_context:
-                self.token_context = [[] for _ in self.uids]
+            self._ensure_token_context()
             for i, token in enumerate(last_tokens):
                 self.token_context[i].append(token)
 
@@ -2273,12 +2284,19 @@ class GenerationBatch:
     def extend(self, other: "GenerationBatch"):
         """Extend this batch with another generation batch."""
         self_was_empty = len(self.uids) == 0
+        self_has_processors = self.logits_processors and any(self.logits_processors)
+        other_has_processors = other.logits_processors and any(other.logits_processors)
+        if self_has_processors or other_has_processors:
+            self._ensure_token_context(force=bool(other_has_processors))
+            other._ensure_token_context(force=bool(self_has_processors))
+
         self.uids.extend(other.uids)
         self.prompt_cache = _extend_cache(self.prompt_cache, other.prompt_cache)
         self.max_tokens.extend(other.max_tokens)
         self._num_tokens.extend(other._num_tokens)
         self.token_context.extend(other.token_context)
         self.logits_processors.extend(other.logits_processors)
+        self._ensure_token_context()
 
         if self._current_tokens is None:
             self._current_tokens = other._current_tokens
