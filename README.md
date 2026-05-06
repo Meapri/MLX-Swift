@@ -101,7 +101,7 @@ When the budget is exceeded, the model is forced to emit `\n</think>` and transi
 On the server, thinking mode is disabled by default. Start the server with `--enable-thinking` to make thinking mode the default for requests that do not specify it:
 
 ```sh
-mlx_vlm.server --model MODEL_NAME --enable-thinking
+mlx_vlm.server --model Qwen/Qwen3.5-4B --enable-thinking
 ```
 
 Requests can override the server default with `enable_thinking: true` or `enable_thinking: false`.
