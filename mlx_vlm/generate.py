@@ -1243,7 +1243,7 @@ def generate_step(
 
             quantize_cache_fn(prompt_cache)
 
-            logprobs = logits - mx.logsumexp(logits)
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
             y = sampler(logprobs)
 
             if outputs.cross_attention_states is not None:

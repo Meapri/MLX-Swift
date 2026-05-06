@@ -2,6 +2,7 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_lm.models.activations import swiglu
 
 from ..base import (
     LanguageModelOutput,
@@ -129,7 +130,7 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
 
     def __call__(self, x) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class Qwen2VLDecoderLayer(nn.Module):
