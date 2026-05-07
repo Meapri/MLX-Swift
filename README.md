@@ -57,17 +57,27 @@ With a local Gemma4 MLX model:
 SWIFT_BUILD_JOBS=18 scripts/verify_real_gemma4_smoke.sh
 ```
 
-With a local Qwen2.5-VL MLX model for tokenizer, image, video, and streaming input:
+With a local Qwen VL MLX model for tokenizer, image, video, and streaming input:
 
 ```bash
-MLXVLM_REAL_QWEN25VL_MODEL=/path/to/qwen2.5-vl \
+MLXVLM_REAL_QWEN_VL_MODEL=/path/to/qwen-vl-model \
 SWIFT_BUILD_JOBS=18 scripts/verify_real_qwen25vl_video_smoke.sh
 ```
 
 Or let the smoke download the default MLX model first:
 
 ```bash
-MLXVLM_REAL_QWEN25VL_ALLOW_REMOTE=1 \
+MLXVLM_REAL_QWEN_VL_ALLOW_REMOTE=1 \
+SWIFT_BUILD_JOBS=18 scripts/verify_real_qwen25vl_video_smoke.sh
+```
+
+The same gate can target Qwen3-VL, for example:
+
+```bash
+MLXVLM_REAL_QWEN_VL_MODEL=mlx-community/Qwen3-VL-4B-Instruct-3bit \
+MLXVLM_REAL_QWEN_VL_ALLOW_REMOTE=1 \
+MLXVLM_REAL_QWEN_VL_DOWNLOAD_DIR="$HOME/Models/mlx-community-Qwen3-VL-4B-Instruct-3bit" \
+MLXVLM_REAL_QWEN_VL_LABEL=Qwen3-VL \
 SWIFT_BUILD_JOBS=18 scripts/verify_real_qwen25vl_video_smoke.sh
 ```
 

@@ -1363,6 +1363,14 @@ public enum MLXVLMUserInputBridge {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .replacingOccurrences(of: "\n", with: "")
                 .replacingOccurrences(of: "\r", with: "")
+            if URL(string: normalized)?.scheme != nil ||
+                normalized.hasPrefix("/") ||
+                normalized.hasPrefix("~") ||
+                normalized.hasPrefix(".") ||
+                normalized.contains(":")
+            {
+                return nil
+            }
             if let data = Data(base64Encoded: normalized, options: [.ignoreUnknownCharacters]) {
                 media = (data, nil)
             } else {
