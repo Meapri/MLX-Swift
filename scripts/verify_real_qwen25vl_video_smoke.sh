@@ -8,6 +8,53 @@ SWIFT_BUILD_JOBS="${SWIFT_BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || getconf
 MODEL="${MLXVLM_REAL_QWEN25VL_MODEL:-mlx-community/Qwen2.5-VL-3B-Instruct-3bit}"
 ALLOW_REMOTE="${MLXVLM_REAL_QWEN25VL_ALLOW_REMOTE:-0}"
 
+download_hf_model() {
+  local model_id="$1"
+  local target_root="${MLXVLM_REAL_QWEN25VL_DOWNLOAD_DIR:-$HOME/Models/${model_id//\//-}}"
+
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "real Qwen2.5-VL video smoke skipped: curl is required to download $model_id" >&2
+    exit 0
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "real Qwen2.5-VL video smoke skipped: python3 is required to read the Hugging Face file list for $model_id" >&2
+    exit 0
+  fi
+
+  mkdir -p "$target_root"
+  echo "downloading $model_id into $target_root" >&2
+  curl -fsS "https://huggingface.co/api/models/$model_id" |
+    python3 -c 'import json, sys
+data = json.load(sys.stdin)
+for sibling in data.get("siblings", []):
+    name = sibling.get("rfilename")
+    if name and not name.endswith("/"):
+        print(name)
+' |
+    while IFS= read -r file; do
+      local destination="$target_root/$file"
+      local url="https://huggingface.co/$model_id/resolve/main/$file"
+      mkdir -p "$(dirname "$destination")"
+      local expected_size
+      expected_size="$(
+        curl -fsSI -L "$url" |
+          awk 'BEGIN { IGNORECASE = 1 } /^Content-Length:/ { gsub("\r", "", $2); size = $2 } END { print size }'
+      )"
+      local local_size=""
+      if [[ -f "$destination" ]]; then
+        local_size="$(stat -f%z "$destination" 2>/dev/null || stat -c%s "$destination" 2>/dev/null || true)"
+      fi
+      if [[ -n "$expected_size" && -n "$local_size" && "$local_size" == "$expected_size" ]]; then
+        continue
+      fi
+      if [[ -z "$expected_size" && -s "$destination" ]]; then
+        continue
+      fi
+      curl -fL -C - --retry 5 --retry-delay 5 -o "$destination" "$url"
+    done
+  echo "$target_root"
+}
+
 if ! command -v rsync >/dev/null 2>&1; then
   echo "real Qwen2.5-VL video smoke skipped: rsync is required for the identity-safe build copy"
   exit 0
@@ -21,6 +68,10 @@ fi
 if [[ "$MODEL" == */* && ! -d "$MODEL" && "$ALLOW_REMOTE" != "1" ]]; then
   echo "real Qwen2.5-VL video smoke skipped: set MLXVLM_REAL_QWEN25VL_MODEL to a local model directory, or set MLXVLM_REAL_QWEN25VL_ALLOW_REMOTE=1 to download $MODEL"
   exit 0
+fi
+
+if [[ "$MODEL" == */* && ! -d "$MODEL" && "$ALLOW_REMOTE" == "1" ]]; then
+  MODEL="$(download_hf_model "$MODEL")"
 fi
 
 TMP_ROOT="${TMPDIR:-/tmp}/mlx-vlm-swift-real-qwen25vl-video-smoke-$$"

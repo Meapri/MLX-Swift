@@ -64,6 +64,13 @@ MLXVLM_REAL_QWEN25VL_MODEL=/path/to/qwen2.5-vl \
 SWIFT_BUILD_JOBS=18 scripts/verify_real_qwen25vl_video_smoke.sh
 ```
 
+Or let the smoke download the default MLX model first:
+
+```bash
+MLXVLM_REAL_QWEN25VL_ALLOW_REMOTE=1 \
+SWIFT_BUILD_JOBS=18 scripts/verify_real_qwen25vl_video_smoke.sh
+```
+
 ## Port Notes
 
 See [docs/swift_port.md](docs/swift_port.md) for the running compatibility map, implemented parity areas, and known remaining gaps.
