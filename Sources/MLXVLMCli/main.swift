@@ -3328,6 +3328,46 @@ enum SelfTest {
         precondition(wordTokens.tokenIDs == [1, 0, 3, 2])
         precondition(wordTokens.unknownTokens == ["missing"])
 
+        let wordPieceModel = root.appendingPathComponent("wordpiece")
+        try FileManager.default.createDirectory(at: wordPieceModel, withIntermediateDirectories: true)
+        try Data("""
+        {"model_type":"wordpiece_test","vocab_size":11}
+        """.utf8).write(to: wordPieceModel.appendingPathComponent("config.json"))
+        try Data("""
+        [PAD]
+        [UNK]
+        [CLS]
+        [SEP]
+        hello
+        world
+        swift
+        ##ly
+        !
+        <image>
+        mlx
+        """.utf8).write(to: wordPieceModel.appendingPathComponent("vocab.txt"))
+        try Data("""
+        {"unk_token":"[UNK]","cls_token":"[CLS]","sep_token":"[SEP]","pad_token":"[PAD]","added_tokens_decoder":{"9":{"content":"<image>","special":true}}}
+        """.utf8).write(to: wordPieceModel.appendingPathComponent("tokenizer_config.json"))
+        let wordPieceDescriptor = try ModelStore().loadDescriptor(pathOrIdentifier: wordPieceModel.path)
+        guard let wordPieceCatalog = TokenizerCatalogBuilder().catalog(for: wordPieceDescriptor) else {
+            fatalError("Expected WordPiece tokenizer catalog")
+        }
+        let wordPiecePlan = TokenizerImplementationPlanner().plan(descriptor: wordPieceDescriptor, catalog: wordPieceCatalog)
+        precondition(wordPiecePlan.requiredBackend == "wordpiece-vocab-txt")
+        precondition(wordPiecePlan.swiftExecutionMode == "wordpiece-greedy")
+        precondition(!wordPiecePlan.requiresFullTokenizerImplementation)
+        precondition(wordPieceCatalog.unknownTokenID == 1)
+        let wordPieceTokenizer = SimpleTokenizer(catalog: wordPieceCatalog, plan: wordPiecePlan)
+        let wordPieceTokens = wordPieceTokenizer.tokenize("Hello swiftly <image> mlx!")
+        precondition(wordPieceTokens.supported)
+        precondition(wordPieceTokens.tokens == ["hello", "swift", "##ly", "<image>", "mlx", "!"])
+        precondition(wordPieceTokens.tokenIDs == [4, 6, 7, 9, 10, 8])
+        precondition(wordPieceTokens.unknownTokens.isEmpty)
+        let wordPieceDecoded = wordPieceTokenizer.detokenize([4, 6, 7, 9, 10, 8], skipSpecialTokens: false)
+        precondition(wordPieceDecoded.supported)
+        precondition(wordPieceDecoded.text == "hello swiftly<image> mlx!")
+
         let byteBPEModel = root.appendingPathComponent("bytelevel-bpe")
         try FileManager.default.createDirectory(at: byteBPEModel, withIntermediateDirectories: true)
         try Data("""
@@ -3508,10 +3548,21 @@ enum SelfTest {
         precondition(sidecarDescriptor.tokenizerMetadata.hasVocabJSON)
         precondition(sidecarDescriptor.tokenizerMetadata.hasMergesTXT)
         precondition(sidecarDescriptor.tokenizerMetadata.hasVocabTXT)
-        let sidecarPlan = TokenizerImplementationPlanner().plan(descriptor: sidecarDescriptor, catalog: nil)
+        guard let sidecarCatalog = TokenizerCatalogBuilder().catalog(for: sidecarDescriptor) else {
+            fatalError("Expected sidecar tiktoken catalog")
+        }
+        precondition(sidecarCatalog.modelType == "Tiktoken")
+        precondition(sidecarCatalog.id(for: "token") == 0)
+        let sidecarPlan = TokenizerImplementationPlanner().plan(descriptor: sidecarDescriptor, catalog: sidecarCatalog)
         precondition(sidecarPlan.requiredBackend == "tiktoken-file")
         precondition(sidecarPlan.hasTiktoken)
-        precondition(sidecarPlan.requiresFullTokenizerImplementation)
+        precondition(sidecarPlan.swiftExecutionMode == "tiktoken-greedy")
+        precondition(!sidecarPlan.requiresFullTokenizerImplementation)
+        let sidecarTokens = SimpleTokenizer(catalog: sidecarCatalog, plan: sidecarPlan).tokenize("token")
+        precondition(sidecarTokens.supported)
+        precondition(sidecarTokens.tokenIDs == [0])
+        let sidecarText = SimpleTokenizer(catalog: sidecarCatalog, plan: sidecarPlan).detokenize([0])
+        precondition(sidecarText.text == "token")
         let sidecarCompatibility = ModelCompatibilityValidator.validate(descriptor: sidecarDescriptor)
         precondition(sidecarCompatibility.checks.contains { $0.id == "tokenizer-present" && $0.passed })
 

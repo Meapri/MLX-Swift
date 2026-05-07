@@ -110,7 +110,13 @@ public struct TokenizerCatalogBuilder {
         if fileManager.fileExists(atPath: tokenizerURL.path) {
             return tokenizerJSONCatalog(tokenizerURL: tokenizerURL)
         }
-        return sidecarBPECatalog(modelDirectory: modelDirectory)
+        if let catalog = sidecarTiktokenCatalog(modelDirectory: modelDirectory) {
+            return catalog
+        }
+        if let catalog = sidecarBPECatalog(modelDirectory: modelDirectory) {
+            return catalog
+        }
+        return sidecarWordPieceCatalog(modelDirectory: modelDirectory)
     }
 
     private func tokenizerJSONCatalog(tokenizerURL: URL) -> TokenizerCatalog {
@@ -254,6 +260,123 @@ public struct TokenizerCatalogBuilder {
         }
     }
 
+    private func sidecarWordPieceCatalog(modelDirectory: URL) -> TokenizerCatalog? {
+        let vocabURL = modelDirectory.appendingPathComponent("vocab.txt")
+        guard fileManager.fileExists(atPath: vocabURL.path) else {
+            return nil
+        }
+
+        do {
+            let text = try String(contentsOf: vocabURL, encoding: .utf8)
+            var tokens: [TokenizerCatalogToken] = []
+            var vocab: [String: JSONValue] = [:]
+            for (id, rawLine) in text.split(whereSeparator: \.isNewline).enumerated() {
+                let content = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !content.isEmpty else {
+                    continue
+                }
+                tokens.append(
+                    TokenizerCatalogToken(
+                        content: content,
+                        id: id,
+                        source: "vocab.txt",
+                        special: Self.looksLikeSpecialToken(content)
+                    )
+                )
+                vocab[content] = .number(Double(id))
+            }
+
+            let tokenizerConfig = try loadJSONObjectIfPresent(modelDirectory.appendingPathComponent("tokenizer_config.json"))
+            markSpecialTokens(&tokens, fromTokenizerConfig: tokenizerConfig, vocab: vocab)
+            let unknownToken = tokenizerConfig?["unk_token"]?.stringValue
+                ?? (vocab["[UNK]"] == nil ? nil : "[UNK]")
+
+            return TokenizerCatalog(
+                modelType: "WordPiece",
+                unknownToken: unknownToken,
+                unknownTokenID: unknownToken.flatMap { token in tokens.first { $0.content == token }?.id },
+                tokens: tokens,
+                merges: [],
+                duplicateContents: duplicates(tokens.map(\.content)),
+                duplicateIDs: duplicates(tokens.map(\.id)),
+                error: nil
+            )
+        } catch {
+            return TokenizerCatalog(
+                modelType: "WordPiece",
+                unknownToken: nil,
+                unknownTokenID: nil,
+                tokens: [],
+                merges: [],
+                duplicateContents: [],
+                duplicateIDs: [],
+                error: String(describing: error)
+            )
+        }
+    }
+
+    private func sidecarTiktokenCatalog(modelDirectory: URL) -> TokenizerCatalog? {
+        let tiktokenURL = modelDirectory.appendingPathComponent("tokenizer.tiktoken")
+        guard fileManager.fileExists(atPath: tiktokenURL.path) else {
+            return nil
+        }
+
+        do {
+            let text = try String(contentsOf: tiktokenURL, encoding: .utf8)
+            var tokens: [TokenizerCatalogToken] = []
+            var vocab: [String: JSONValue] = [:]
+            for line in text.split(whereSeparator: \.isNewline) {
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else {
+                    continue
+                }
+                let parts = trimmed.split(whereSeparator: \.isWhitespace).map(String.init)
+                guard parts.count >= 2,
+                      let id = Int(parts[1]),
+                      let content = Self.tiktokenContent(parts[0])
+                else {
+                    continue
+                }
+                tokens.append(
+                    TokenizerCatalogToken(
+                        content: content,
+                        id: id,
+                        source: "tokenizer.tiktoken",
+                        special: Self.looksLikeSpecialToken(content)
+                    )
+                )
+                vocab[content] = .number(Double(id))
+            }
+
+            let tokenizerConfig = try loadJSONObjectIfPresent(modelDirectory.appendingPathComponent("tokenizer_config.json"))
+            markSpecialTokens(&tokens, fromTokenizerConfig: tokenizerConfig, vocab: vocab)
+            let unknownToken = tokenizerConfig?["unk_token"]?.stringValue
+                ?? tokenizerConfig?["oov_token"]?.stringValue
+
+            return TokenizerCatalog(
+                modelType: "Tiktoken",
+                unknownToken: unknownToken,
+                unknownTokenID: unknownToken.flatMap { token in tokens.first { $0.content == token }?.id },
+                tokens: tokens,
+                merges: [],
+                duplicateContents: duplicates(tokens.map(\.content)),
+                duplicateIDs: duplicates(tokens.map(\.id)),
+                error: nil
+            )
+        } catch {
+            return TokenizerCatalog(
+                modelType: "Tiktoken",
+                unknownToken: nil,
+                unknownTokenID: nil,
+                tokens: [],
+                merges: [],
+                duplicateContents: [],
+                duplicateIDs: [],
+                error: String(describing: error)
+            )
+        }
+    }
+
     private func loadMergesTXT(_ url: URL) throws -> [TokenizerCatalogMerge] {
         let text = try String(contentsOf: url, encoding: .utf8)
         var merges: [TokenizerCatalogMerge] = []
@@ -366,5 +489,20 @@ public struct TokenizerCatalogBuilder {
             }
         }
         return Array(duplicated)
+    }
+
+    private static func looksLikeSpecialToken(_ token: String) -> Bool {
+        token.count >= 3 &&
+            ((token.hasPrefix("[") && token.hasSuffix("]")) ||
+                (token.hasPrefix("<") && token.hasSuffix(">")))
+    }
+
+    private static func tiktokenContent(_ raw: String) -> String? {
+        if let data = Data(base64Encoded: raw),
+           let decoded = String(data: data, encoding: .utf8)
+        {
+            return decoded
+        }
+        return raw
     }
 }

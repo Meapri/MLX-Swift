@@ -438,7 +438,11 @@ printf '#version: 0.2\nh e\n' > "$SIDECAR_TOKENIZER_MODEL_DIR/merges.txt"
 printf '[UNK]\nhello\n' > "$SIDECAR_TOKENIZER_MODEL_DIR/vocab.txt"
 "$BIN" inspect --model "$SIDECAR_TOKENIZER_MODEL_DIR" | grep -q '"hasTiktoken" : true'
 "$BIN" inspect --model "$SIDECAR_TOKENIZER_MODEL_DIR" | grep -q '"hasMergesTXT" : true'
+"$BIN" inspect-tokenizer-catalog --model "$SIDECAR_TOKENIZER_MODEL_DIR" | grep -q '"modelType" : "Tiktoken"'
 "$BIN" inspect-tokenizer-plan --model "$SIDECAR_TOKENIZER_MODEL_DIR" | grep -q '"requiredBackend" : "tiktoken-file"'
+"$BIN" inspect-tokenizer-plan --model "$SIDECAR_TOKENIZER_MODEL_DIR" | grep -q '"swiftExecutionMode" : "tiktoken-greedy"'
+"$BIN" tokenize-simple --model "$SIDECAR_TOKENIZER_MODEL_DIR" --text 'token' | grep -Fq '"tokenIDs" : ['
+"$BIN" detokenize-simple --model "$SIDECAR_TOKENIZER_MODEL_DIR" --ids 0 | grep -q '"text" : "token"'
 "$BIN" validate-model --model "$SIDECAR_TOKENIZER_MODEL_DIR" | grep -q '"id" : "tokenizer-present"'
 
 SIDECAR_BPE_MODEL_DIR="${TMPDIR:-/tmp}/mlx-vlm-swift-verify-sidecar-bpe"
@@ -487,6 +491,34 @@ JSON
 "$BIN" inspect-tokenizer-plan --model "$WORD_MODEL_DIR" | grep -q '"requiresFullTokenizerImplementation" : false'
 "$BIN" tokenize-simple --model "$WORD_MODEL_DIR" --text 'hello missing <image> world' | grep -q '"tokenIDs"'
 "$BIN" tokenize-simple --model "$WORD_MODEL_DIR" --text 'hello missing <image> world' | grep -q '"unknownTokens"'
+
+WORDPIECE_MODEL_DIR="${TMPDIR:-/tmp}/mlx-vlm-swift-verify-wordpiece"
+rm -rf "$WORDPIECE_MODEL_DIR"
+mkdir -p "$WORDPIECE_MODEL_DIR"
+cat > "$WORDPIECE_MODEL_DIR/config.json" <<'JSON'
+{"model_type":"wordpiece_test","vocab_size":11}
+JSON
+cat > "$WORDPIECE_MODEL_DIR/vocab.txt" <<'TXT'
+[PAD]
+[UNK]
+[CLS]
+[SEP]
+hello
+world
+swift
+##ly
+!
+<image>
+mlx
+TXT
+cat > "$WORDPIECE_MODEL_DIR/tokenizer_config.json" <<'JSON'
+{"unk_token":"[UNK]","cls_token":"[CLS]","sep_token":"[SEP]","pad_token":"[PAD]","added_tokens_decoder":{"9":{"content":"<image>","special":true}}}
+JSON
+"$BIN" inspect-tokenizer-catalog --model "$WORDPIECE_MODEL_DIR" | grep -q '"modelType" : "WordPiece"'
+"$BIN" inspect-tokenizer-plan --model "$WORDPIECE_MODEL_DIR" | grep -q '"requiredBackend" : "wordpiece-vocab-txt"'
+"$BIN" inspect-tokenizer-plan --model "$WORDPIECE_MODEL_DIR" | grep -q '"swiftExecutionMode" : "wordpiece-greedy"'
+"$BIN" tokenize-simple --model "$WORDPIECE_MODEL_DIR" --text 'Hello swiftly <image> mlx!' | grep -q '##ly'
+"$BIN" detokenize-simple --model "$WORDPIECE_MODEL_DIR" --ids 4,6,7,9,10,8 | grep -q '"text" : "hello swiftly<image> mlx!"'
 
 BYTE_BPE_MODEL_DIR="${TMPDIR:-/tmp}/mlx-vlm-swift-verify-byte-bpe"
 rm -rf "$BYTE_BPE_MODEL_DIR"

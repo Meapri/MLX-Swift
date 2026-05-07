@@ -192,11 +192,6 @@ public struct TokenizerImplementationPlanner {
                   jsonMetadata?.preTokenizerType == "ByteLevel"
         {
             reasons.append("ByteLevel BPE tokenizer.json is present, but the vocab does not expose ByteLevel token strings needed by the dependency-free Swift tokenizer.")
-        } else if requiredBackend == "tiktoken-file" ||
-            requiredBackend == "bpe-vocab-json-merges-txt" ||
-            requiredBackend == "wordpiece-vocab-txt"
-        {
-            reasons.append("Tokenizer sidecar files are present, but Swift execution for \(requiredBackend) is not implemented yet.")
         } else {
             reasons.append("Full Swift tokenizer execution is not implemented yet; catalog preflight only recognizes exact known token strings.")
         }
@@ -213,6 +208,14 @@ public struct TokenizerImplementationPlanner {
         }
         if requiredBackend == "tokenizers-json-wordlevel" {
             return "wordlevel-whitespace"
+        }
+        if requiredBackend == "tokenizers-json-wordpiece" ||
+            requiredBackend == "wordpiece-vocab-txt"
+        {
+            return "wordpiece-greedy"
+        }
+        if requiredBackend == "tiktoken-file" {
+            return "tiktoken-greedy"
         }
         if requiredBackend == "tokenizers-json-bpe",
            jsonMetadata?.preTokenizerType == "ByteLevel",
