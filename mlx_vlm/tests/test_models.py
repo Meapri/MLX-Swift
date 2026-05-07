@@ -5400,6 +5400,23 @@ class TestMiniCPMO(unittest.TestCase):
         self.assertEqual(sanitized["audio_tower.conv1.weight"].shape, (8, 3, 80))
         self.assertEqual(sanitized["audio_tower.conv2.weight"].shape, (8, 3, 8))
 
+    def test_minicpmo_vision_embedding_uses_floating_pixel_dtype(self):
+        from mlx_vlm.models import minicpmo
+
+        model = minicpmo.Model(self._tiny_config())
+        model.language_model.model.embed_tokens.weight = mx.zeros(
+            model.language_model.model.embed_tokens.weight.shape,
+            dtype=mx.uint32,
+        )
+        pixel_values = [[mx.ones((3, 28, 28), dtype=mx.uint32)]]
+        tgt_sizes = [mx.array([[2, 2]], dtype=mx.int32)]
+
+        vision_hidden_states = model.get_vision_embedding(pixel_values, tgt_sizes)
+
+        self.assertEqual(len(vision_hidden_states), 1)
+        self.assertIsInstance(vision_hidden_states[0], mx.array)
+        self.assertEqual(vision_hidden_states[0].shape, (1, 4, 64))
+
 
 class TestPhi4MM(unittest.TestCase):
     @staticmethod
