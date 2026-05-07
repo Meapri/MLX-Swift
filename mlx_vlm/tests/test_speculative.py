@@ -13,6 +13,7 @@ import mlx.core as mx
 import pytest
 
 import mlx_vlm.models.qwen3_5.language as qwen_language
+from mlx_vlm.generate import _effective_mtp_block_size
 from mlx_vlm.models.cache import ArraysCache
 from mlx_vlm.speculative.drafters import (
     DEFAULT_DRAFTER_KIND,
@@ -223,6 +224,22 @@ def test_normalize_batched_shared_kv_states_drops_tail_zero_slack():
             131.0,
         ],
     ]
+
+
+def test_effective_mtp_block_size_keeps_small_requested_override():
+    assert _effective_mtp_block_size(4, 4, [], 10) == 4
+    assert _effective_mtp_block_size(3, 4, [1, 1], 10) == 3
+
+
+def test_effective_mtp_block_size_warm_starts_from_config_when_override_is_large():
+    assert _effective_mtp_block_size(8, 4, [], 10) == 4
+    assert _effective_mtp_block_size(6, 4, [], 10) == 4
+
+
+def test_effective_mtp_block_size_shrinks_large_override_to_recent_acceptance():
+    assert _effective_mtp_block_size(8, 4, [2, 2, 2, 2], 10) == 4
+    assert _effective_mtp_block_size(8, 4, [1, 1, 0, 1], 10) == 3
+    assert _effective_mtp_block_size(8, 4, [0, 0, 0, 0], 10) == 2
 
 
 def test_gemma4_assistant_overrides_dflash_to_mtp(tmp_path, caplog):

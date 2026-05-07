@@ -503,6 +503,28 @@ def _speculative_walk_batch(
     return accepted_list, new_tokens_list
 
 
+def _effective_mtp_block_size(
+    requested_block_total: int,
+    configured_block_total: int,
+    accept_lens: List[int],
+    remaining_budget: int,
+) -> int:
+    """Choose an effective MTP block size for the next speculative round."""
+    bs = min(requested_block_total, remaining_budget)
+    if bs <= 2 or requested_block_total <= configured_block_total:
+        return bs
+
+    if not accept_lens:
+        return min(bs, max(2, configured_block_total))
+
+    recent = accept_lens[-4:]
+    mean_accept = sum(recent) / len(recent)
+    # ``accepted`` counts drafted tokens only; add one target "bonus" token and
+    # one token of slack before expanding the next draft block.
+    adaptive_total = max(2, int(mean_accept + 0.5) + 2)
+    return min(bs, adaptive_total)
+
+
 def _mtp_rounds(
     model: nn.Module,
     draft_model: nn.Module,
@@ -537,6 +559,7 @@ def _mtp_rounds(
         if draft_block_size is not None
         else int(draft_model.config.block_size)
     )
+    configured_block_total = int(getattr(draft_model.config, "block_size", block_total))
     draft_model.reset(model)
 
     # Hidden from prefill is full prompt-length; reduce to a single slot.
@@ -557,7 +580,12 @@ def _mtp_rounds(
     emitted = 1  # caller already yielded the first bonus
 
     while emitted < max_tokens:
-        bs = min(block_total, max_tokens - emitted + 1)
+        bs = _effective_mtp_block_size(
+            block_total,
+            configured_block_total,
+            draft_model.accept_lens,
+            max_tokens - emitted + 1,
+        )
         if bs <= 1:
             break
 
@@ -662,6 +690,7 @@ def _mtp_rounds_batch(
         if draft_block_size is not None
         else int(draft_model.config.block_size)
     )
+    configured_block_total = int(getattr(draft_model.config, "block_size", block_total))
     draft_model.reset(model)
 
     # First-round hidden: prefill output may have shape [B, L, H]; reduce
@@ -697,7 +726,12 @@ def _mtp_rounds_batch(
             max(1, max_tokens - emitted[active_idx[j]] + 1)
             for j in range(len(active_idx))
         ]
-        bs = min(block_total, min(remaining))
+        bs = _effective_mtp_block_size(
+            block_total,
+            configured_block_total,
+            draft_model.accept_lens,
+            min(remaining),
+        )
         if bs <= 1:
             break
 
