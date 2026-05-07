@@ -8,14 +8,11 @@ _HALF_SPLIT = "half_split"
 _EVEN_ODD = "even_odd"
 _HALF_COS = "half"
 _FULL_COS = "full"
-_POSITION_SELECTOR_STYLES = {
-    "chunked",
-    "interleaved",
-    "sectioned_half_split",
-    "sectioned_even_odd",
-    "split_select",
-}
 _SELECTED_FREQUENCY_STYLES = {"chunked", "interleaved", "split_select"}
+_SECTIONED_STYLES = {"sectioned_half_split", "sectioned_even_odd"}
+_EVEN_ODD_PAIRING_STYLES = {"sectioned_even_odd", "split_select", "ernie_3d"}
+_EVEN_ODD_LAYOUT_STYLES = {"sectioned_even_odd", "split_select"}
+_POSITION_SELECTOR_STYLES = _SELECTED_FREQUENCY_STYLES | _SECTIONED_STYLES
 
 
 def _cumulative_splits(lengths: Sequence[int]):
@@ -47,7 +44,7 @@ def _selected_mrope_freqs(position_ids, inv_freq, position_selector):
 
 
 def _pairing_for_style(style: str):
-    if style in {"sectioned_even_odd", "split_select", "ernie_3d"}:
+    if style in _EVEN_ODD_PAIRING_STYLES:
         return _EVEN_ODD
     return _HALF_SPLIT
 
@@ -627,17 +624,14 @@ class MRoPERotaryEmbedding:
                 if compiled_apply is not None:
                     self._compiled_apply[position_ids.ndim] = compiled_apply
 
-            fast = None
             if compiled_apply is not None:
-                fast = compiled_apply(
+                return compiled_apply(
                     q,
                     k,
                     position_ids,
                     self.inv_freq,
                     self.position_selector,
                 )
-            if fast is not None:
-                return fast
 
         cos, sin = self(k, position_ids)
         return apply_multimodal_rotary_pos_emb(
@@ -664,6 +658,42 @@ def rotate_half_even_odd(x):
     return mx.flatten(mx.stack([-x2, x1], axis=-1), start_axis=-2, end_axis=-1)
 
 
+def _apply_rotary_embedding(
+    q,
+    k,
+    cos,
+    sin,
+    rotate_fn,
+    *,
+    cast_output: bool = True,
+    compute_dtype=None,
+):
+    rotary_dim = cos.shape[-1]
+    q_rot = q[..., :rotary_dim]
+    q_pass = q[..., rotary_dim:]
+    k_rot = k[..., :rotary_dim]
+    k_pass = k[..., rotary_dim:]
+
+    if compute_dtype is not None:
+        q_rot = q_rot.astype(compute_dtype)
+        k_rot = k_rot.astype(compute_dtype)
+
+    q_embed = (q_rot * cos) + (rotate_fn(q_rot) * sin)
+    k_embed = (k_rot * cos) + (rotate_fn(k_rot) * sin)
+
+    if cast_output:
+        q_embed = q_embed.astype(q.dtype)
+        k_embed = k_embed.astype(k.dtype)
+
+    if q_pass.shape[-1] == 0 and k_pass.shape[-1] == 0:
+        return q_embed, k_embed
+
+    return (
+        mx.concatenate([q_embed, q_pass], axis=-1),
+        mx.concatenate([k_embed, k_pass], axis=-1),
+    )
+
+
 @mx.compile
 def _apply_interleaved_rotary_pos_emb_axis1(q, k, cos, sin):
     cos = mx.expand_dims(cos, axis=1)
@@ -686,16 +716,17 @@ def _apply_interleaved_rotary_pos_emb_axis1(q, k, cos, sin):
     )
 
 
-def _section_cos_sin(cos, sin, mrope_section):
+def _section_frequency_layout(values, mrope_section):
     split_indices = _cumulative_splits(list(mrope_section) * 2)
-    cos = mx.concatenate(
-        [m[i % 3] for i, m in enumerate(mx.split(cos, split_indices, axis=-1))],
+    return mx.concatenate(
+        [m[i % 3] for i, m in enumerate(mx.split(values, split_indices, axis=-1))],
         axis=-1,
     )[:, None, :, :]
-    sin = mx.concatenate(
-        [m[i % 3] for i, m in enumerate(mx.split(sin, split_indices, axis=-1))],
-        axis=-1,
-    )[:, None, :, :]
+
+
+def _section_cos_sin(cos, sin, mrope_section):
+    cos = _section_frequency_layout(cos, mrope_section)
+    sin = _section_frequency_layout(sin, mrope_section)
     return cos, sin
 
 
@@ -769,27 +800,13 @@ def apply_rotary_pos_emb_even_odd(q, k, cos, sin, *, cos_layout: str = _HALF_COS
         cos = mx.repeat(cos[..., : cos.shape[-1] // 2], repeats=2, axis=-1)
         sin = mx.repeat(sin[..., : sin.shape[-1] // 2], repeats=2, axis=-1)
 
-    rotary_dim = cos.shape[-1]
-    q_rot = q[..., :rotary_dim]
-    q_pass = q[..., rotary_dim:]
-    k_rot = k[..., :rotary_dim]
-    k_pass = k[..., rotary_dim:]
-
-    q_embed = (q_rot.astype(mx.float32) * cos) + (
-        rotate_half_even_odd(q_rot).astype(mx.float32) * sin
-    )
-    k_embed = (k_rot.astype(mx.float32) * cos) + (
-        rotate_half_even_odd(k_rot).astype(mx.float32) * sin
-    )
-    q_embed = q_embed.astype(q.dtype)
-    k_embed = k_embed.astype(k.dtype)
-
-    if q_pass.shape[-1] == 0 and k_pass.shape[-1] == 0:
-        return q_embed, k_embed
-
-    return (
-        mx.concatenate([q_embed, q_pass], axis=-1),
-        mx.concatenate([k_embed, k_pass], axis=-1),
+    return _apply_rotary_embedding(
+        q,
+        k,
+        cos,
+        sin,
+        rotate_half_even_odd,
+        compute_dtype=mx.float32,
     )
 
 
@@ -807,7 +824,7 @@ def apply_multimodal_rotary_pos_emb(
     if style == "interleaved" and unsqueeze_dim == 1 and cast_output:
         return _apply_interleaved_rotary_pos_emb_axis1(q, k, cos, sin)
 
-    if style in {"sectioned_half_split", "sectioned_even_odd"}:
+    if style in _SECTIONED_STYLES:
         if mrope_section is None:
             raise ValueError("mrope_section is required for sectioned MRoPE")
         fast = _maybe_fast_precomputed_rotary(
@@ -827,30 +844,18 @@ def apply_multimodal_rotary_pos_emb(
         cos = mx.expand_dims(cos, axis=unsqueeze_dim)
         sin = mx.expand_dims(sin, axis=unsqueeze_dim)
 
-    if style in {"sectioned_even_odd", "split_select"}:
+    if style in _EVEN_ODD_LAYOUT_STYLES:
         cos = mx.repeat(cos[..., : cos.shape[-1] // 2], repeats=2, axis=-1)
         sin = mx.repeat(sin[..., : sin.shape[-1] // 2], repeats=2, axis=-1)
         rotate_fn = rotate_half_even_odd
     else:
         rotate_fn = rotate_half
 
-    rotary_dim = cos.shape[-1]
-    q_rot = q[..., :rotary_dim]
-    q_pass = q[..., rotary_dim:]
-    k_rot = k[..., :rotary_dim]
-    k_pass = k[..., rotary_dim:]
-
-    q_embed = (q_rot * cos) + (rotate_fn(q_rot) * sin)
-    k_embed = (k_rot * cos) + (rotate_fn(k_rot) * sin)
-
-    if cast_output:
-        q_embed = q_embed.astype(q.dtype)
-        k_embed = k_embed.astype(k.dtype)
-
-    if q_pass.shape[-1] == 0 and k_pass.shape[-1] == 0:
-        return q_embed, k_embed
-
-    q_embed = mx.concatenate([q_embed, q_pass], axis=-1)
-    k_embed = mx.concatenate([k_embed, k_pass], axis=-1)
-
-    return q_embed, k_embed
+    return _apply_rotary_embedding(
+        q,
+        k,
+        cos,
+        sin,
+        rotate_fn,
+        cast_output=cast_output,
+    )
