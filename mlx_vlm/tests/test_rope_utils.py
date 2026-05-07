@@ -24,61 +24,6 @@ def _assert_pair_close(actual, expected, *, atol=1e-4):
     assert _max_diff(actual[1], expected[1]) < atol
 
 
-def _reference_rotate_half(x):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return mx.concatenate([-x2, x1], axis=-1)
-
-
-def _reference_rotate_half_even_odd(x):
-    x1 = x[..., 0::2]
-    x2 = x[..., 1::2]
-    return mx.flatten(mx.stack([-x2, x1], axis=-1), start_axis=-2, end_axis=-1)
-
-
-def _reference_section_cos_sin(cos, sin, mrope_section):
-    if len(mrope_section) != 3:
-        raise ValueError("sectioned MRoPE expects exactly 3 sections")
-    split_indices = mx.cumsum(mx.array(list(mrope_section) * 2, dtype=mx.int32))[:-1]
-
-    def layout(values):
-        chunks = mx.split(values, split_indices, axis=-1)
-        return mx.concatenate(
-            [chunk[axis % 3] for axis, chunk in enumerate(chunks)],
-            axis=-1,
-        )[:, None, :, :]
-
-    return layout(cos), layout(sin)
-
-
-def _reference_apply_rotary(q, k, cos, sin, style, mrope_section):
-    if style in {"sectioned_half_split", "sectioned_even_odd"}:
-        cos, sin = _reference_section_cos_sin(cos, sin, mrope_section)
-    else:
-        cos = mx.expand_dims(cos, axis=1)
-        sin = mx.expand_dims(sin, axis=1)
-
-    if style in {"sectioned_even_odd", "split_select"}:
-        cos = mx.repeat(cos[..., : cos.shape[-1] // 2], repeats=2, axis=-1)
-        sin = mx.repeat(sin[..., : sin.shape[-1] // 2], repeats=2, axis=-1)
-        rotate_fn = _reference_rotate_half_even_odd
-    else:
-        rotate_fn = _reference_rotate_half
-
-    rotary_dim = cos.shape[-1]
-    q_rot = q[..., :rotary_dim]
-    k_rot = k[..., :rotary_dim]
-    q_embed = (q_rot * cos) + (rotate_fn(q_rot) * sin)
-    k_embed = (k_rot * cos) + (rotate_fn(k_rot) * sin)
-
-    if rotary_dim == q.shape[-1] and rotary_dim == k.shape[-1]:
-        return q_embed.astype(q.dtype), k_embed.astype(k.dtype)
-    return (
-        mx.concatenate([q_embed.astype(q.dtype), q[..., rotary_dim:]], axis=-1),
-        mx.concatenate([k_embed.astype(k.dtype), k[..., rotary_dim:]], axis=-1),
-    )
-
-
 def _disable_metal_fast_path(fn):
     has_metal = rope_utils._HAS_METAL
     rope_utils._HAS_METAL = False
@@ -136,10 +81,30 @@ def test_mrope_apply_rotary_fast_path_matches_fallback(style):
         "split_select",
     ],
 )
-def test_mrope_apply_rotary_matches_reference_layout(style):
+def test_mrope_apply_rotary_fallback_routes_style_to_shared_apply(monkeypatch, style):
     q = (mx.arange(2 * 3 * 4 * 10).reshape(2, 3, 4, 10) / 100).astype(mx.float32)
     k = (mx.arange(2 * 2 * 4 * 10).reshape(2, 2, 4, 10) / 80).astype(mx.float32)
     position_ids = _position_ids()
+    calls = []
+    sentinel = (q + 1, k + 1)
+
+    def fake_apply(q_arg, k_arg, cos, sin, **kwargs):
+        calls.append(
+            {
+                "q": q_arg,
+                "k": k_arg,
+                "cos_shape": cos.shape,
+                "sin_shape": sin.shape,
+                **kwargs,
+            }
+        )
+        return sentinel
+
+    monkeypatch.setattr(
+        rope_utils,
+        "apply_multimodal_rotary_pos_emb",
+        fake_apply,
+    )
     kwargs = {
         "dim": 8,
         "base": 10000,
@@ -148,11 +113,25 @@ def test_mrope_apply_rotary_matches_reference_layout(style):
     }
 
     rotary = MRoPERotaryEmbedding(**kwargs)
-    actual = rotary.apply_rotary(q, k, position_ids)
-    cos, sin = rotary(k, position_ids)
-    expected = _reference_apply_rotary(q, k, cos, sin, style, kwargs["mrope_section"])
+    rotary.fused_apply = False
+    actual = rotary.apply_rotary(
+        q,
+        k,
+        position_ids,
+        unsqueeze_dim=2,
+        cast_output=False,
+    )
 
-    _assert_pair_close(actual, expected)
+    assert actual is sentinel
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["q"] is q
+    assert call["k"] is k
+    assert call["mrope_section"] == kwargs["mrope_section"]
+    assert call["style"] == style
+    assert call["unsqueeze_dim"] == 2
+    assert call["cast_output"] is False
+    assert call["cos_shape"] == call["sin_shape"]
 
 
 @pytest.mark.parametrize("style", ["sectioned_half_split", "sectioned_even_odd"])
@@ -209,44 +188,18 @@ def test_even_odd_precomputed_rotary_fast_path_matches_fallback(cos_layout):
     _assert_pair_close((fast[0][..., 8:], fast[1][..., 8:]), (q[..., 8:], k[..., 8:]))
 
 
-def _reference_mrope_frequency_layout(freqs, mrope_section, style):
-    if style == "chunked":
-        split_indices = mx.cumsum(mx.array(mrope_section, dtype=mx.int32))[:-1]
-        return mx.concatenate(
-            [
-                chunk[axis]
-                for axis, chunk in enumerate(
-                    mx.split(freqs, split_indices, axis=-1)
-                )
-            ],
-            axis=-1,
-        )
-    if style == "interleaved":
-        selected = []
-        for idx in range(sum(mrope_section)):
-            axis = 0
-            if idx % 3 == 1 and idx < mrope_section[1] * 3:
-                axis = 1
-            elif idx % 3 == 2 and idx < mrope_section[2] * 3:
-                axis = 2
-            selected.append(freqs[axis, ..., idx : idx + 1])
-        return mx.concatenate(selected, axis=-1)
-    if style == "split_select":
-        split_indices = mx.cumsum(mx.array(mrope_section, dtype=mx.int32))[:-1]
-        return mx.concatenate(
-            [
-                chunk[axis % 3]
-                for axis, chunk in enumerate(
-                    mx.split(freqs, split_indices, axis=-1)
-                )
-            ],
-            axis=-1,
-        )
-    return freqs
-
-
-@pytest.mark.parametrize("style", ["chunked", "interleaved", "split_select"])
-def test_selected_frequency_fast_path_matches_layout_reference(style):
+@pytest.mark.parametrize(
+    ("style", "expected_selector"),
+    [
+        ("chunked", [0, 0, 1, 1, 2, 2]),
+        ("interleaved", [0, 1, 2, 0, 1, 2]),
+        ("split_select", [0, 0, 1, 1, 2, 2]),
+    ],
+)
+def test_selected_frequency_fast_path_matches_layout_helper(
+    style,
+    expected_selector,
+):
     mx.random.seed(3)
     position_ids = _position_ids(batch=2, seq_len=4)
     mrope_section = [2, 2, 2]
@@ -256,6 +209,7 @@ def test_selected_frequency_fast_path_matches_layout_reference(style):
         mrope_section,
         inv_freq.shape[0],
     )
+    assert position_selector.tolist() == expected_selector
 
     fast = compute_mrope_frequencies(
         position_ids,
@@ -270,47 +224,9 @@ def test_selected_frequency_fast_path_matches_layout_reference(style):
         mrope_section,
         style=style,
     )
-    expected = _reference_mrope_frequency_layout(freqs, mrope_section, style)
 
-    mx.eval(fast, layout, expected)
-    assert _max_diff(fast, expected) < 1e-4
-    assert _max_diff(layout, expected) < 1e-4
-
-
-def _reference_section_selected_mrope_cos_sin(
-    position_ids,
-    inv_freq,
-    mrope_section,
-    position_axes,
-    *,
-    interleave_sections=(),
-):
-    starts = [0]
-    for dim in mrope_section[:-1]:
-        starts.append(starts[-1] + dim)
-
-    section_freqs = []
-    for start, dim, position_axis in zip(starts, mrope_section, position_axes):
-        section_positions = position_ids[position_axis].astype(mx.float32)[..., None]
-        section_freqs.append(section_positions * inv_freq[start : start + dim])
-
-    parts = []
-    interleave_sections = tuple(interleave_sections)
-    for section_idx, section_freq in enumerate(section_freqs):
-        if section_idx not in interleave_sections:
-            parts.append(section_freq)
-            continue
-        if section_idx != interleave_sections[0]:
-            continue
-        interleaved = []
-        for offset in range(section_freq.shape[-1]):
-            for interleave_idx in interleave_sections:
-                interleaved.append(section_freqs[interleave_idx][..., offset])
-        parts.append(mx.stack(interleaved, axis=-1))
-
-    freqs = mx.concatenate(parts, axis=-1)
-    emb = mx.repeat(freqs, repeats=2, axis=-1)
-    return mx.cos(emb), mx.sin(emb)
+    mx.eval(fast, layout)
+    assert _max_diff(fast, layout) < 1e-4
 
 
 def test_mrope_section_selectors_interleave_selected_sections():
@@ -324,7 +240,7 @@ def test_mrope_section_selectors_interleave_selected_sections():
     assert frequency_selector.tolist() == [0, 2, 1, 3, 4, 5]
 
 
-def test_selected_mrope_cos_sin_matches_reference():
+def test_selected_mrope_cos_sin_applies_section_selectors():
     mx.random.seed(4)
     mrope_section = [2, 2, 2]
     position_axes = (1, 2, 0)
@@ -343,12 +259,14 @@ def test_selected_mrope_cos_sin_matches_reference():
         position_selector,
         frequency_selector,
     )
-    expected = _reference_section_selected_mrope_cos_sin(
-        position_ids,
-        inv_freq,
-        mrope_section,
-        position_axes,
-        interleave_sections=interleave_sections,
+    selected_positions = mx.take(position_ids, position_selector, axis=0).transpose(
+        1, 2, 0
     )
+    freqs = selected_positions.astype(mx.float32) * mx.take(
+        inv_freq,
+        frequency_selector,
+    )
+    emb = mx.repeat(freqs, repeats=2, axis=-1)
+    expected = mx.cos(emb), mx.sin(emb)
 
     _assert_pair_close(fast, expected)
