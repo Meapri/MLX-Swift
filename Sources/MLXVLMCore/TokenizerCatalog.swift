@@ -110,6 +110,9 @@ public struct TokenizerCatalogBuilder {
         if fileManager.fileExists(atPath: tokenizerURL.path) {
             return tokenizerJSONCatalog(tokenizerURL: tokenizerURL)
         }
+        if let catalog = sentencePieceModelCatalog(modelDirectory: modelDirectory) {
+            return catalog
+        }
         if let catalog = sidecarTiktokenCatalog(modelDirectory: modelDirectory) {
             return catalog
         }
@@ -218,6 +221,51 @@ public struct TokenizerCatalogBuilder {
         } catch {
             return TokenizerCatalog(
                 modelType: nil,
+                unknownToken: nil,
+                unknownTokenID: nil,
+                tokens: [],
+                merges: [],
+                duplicateContents: [],
+                duplicateIDs: [],
+                error: String(describing: error)
+            )
+        }
+    }
+
+    private func sentencePieceModelCatalog(modelDirectory: URL) -> TokenizerCatalog? {
+        let modelURL = modelDirectory.appendingPathComponent("tokenizer.model")
+        guard fileManager.fileExists(atPath: modelURL.path) else {
+            return nil
+        }
+
+        do {
+            let parsed = try SentencePieceModelProtoParser(data: Data(contentsOf: modelURL)).parse()
+            guard !parsed.tokens.isEmpty else {
+                throw ModelStoreError.invalidConfig("tokenizer.model did not contain SentencePiece pieces")
+            }
+
+            let tokenizerConfig = try loadJSONObjectIfPresent(modelDirectory.appendingPathComponent("tokenizer_config.json"))
+            var tokens = parsed.tokens
+            var vocab: [String: JSONValue] = [:]
+            for token in tokens {
+                vocab[token.content] = .number(Double(token.id))
+            }
+            markSpecialTokens(&tokens, fromTokenizerConfig: tokenizerConfig, vocab: vocab)
+            let unknownToken = tokenizerConfig?["unk_token"]?.stringValue ?? parsed.unknownToken
+
+            return TokenizerCatalog(
+                modelType: "Unigram",
+                unknownToken: unknownToken,
+                unknownTokenID: unknownToken.flatMap { token in tokens.first { $0.content == token }?.id },
+                tokens: tokens,
+                merges: [],
+                duplicateContents: duplicates(tokens.map(\.content)),
+                duplicateIDs: duplicates(tokens.map(\.id)),
+                error: nil
+            )
+        } catch {
+            return TokenizerCatalog(
+                modelType: "SentencePiece",
                 unknownToken: nil,
                 unknownTokenID: nil,
                 tokens: [],
@@ -532,5 +580,141 @@ public struct TokenizerCatalogBuilder {
             return decoded
         }
         return raw
+    }
+}
+
+private struct SentencePieceModelProtoParser {
+    private let data: Data
+
+    init(data: Data) {
+        self.data = data
+    }
+
+    func parse() throws -> (tokens: [TokenizerCatalogToken], unknownToken: String?) {
+        var reader = ProtoReader(data: data)
+        var tokens: [TokenizerCatalogToken] = []
+        var unknownToken: String?
+        while !reader.isAtEnd {
+            let key = try reader.readVarint()
+            let field = Int(key >> 3)
+            let wireType = Int(key & 0x07)
+            if field == 1, wireType == 2 {
+                let pieceData = try reader.readLengthDelimitedData()
+                if let piece = try Self.parsePiece(pieceData, id: tokens.count) {
+                    tokens.append(piece.token)
+                    if piece.isUnknown {
+                        unknownToken = piece.token.content
+                    }
+                }
+            } else {
+                try reader.skip(wireType: wireType)
+            }
+        }
+        return (tokens, unknownToken)
+    }
+
+    private static func parsePiece(
+        _ data: Data,
+        id: Int
+    ) throws -> (token: TokenizerCatalogToken, isUnknown: Bool)? {
+        var reader = ProtoReader(data: data)
+        var content: String?
+        var pieceType = 1
+        while !reader.isAtEnd {
+            let key = try reader.readVarint()
+            let field = Int(key >> 3)
+            let wireType = Int(key & 0x07)
+            switch (field, wireType) {
+            case (1, 2):
+                content = try reader.readLengthDelimitedString()
+            case (3, 0):
+                pieceType = Int(try reader.readVarint())
+            default:
+                try reader.skip(wireType: wireType)
+            }
+        }
+        guard let content else {
+            return nil
+        }
+        return (
+            TokenizerCatalogToken(
+                content: content,
+                id: id,
+                source: "tokenizer.model",
+                special: pieceType == 2 || pieceType == 3 || pieceType == 4 || pieceType == 5
+            ),
+            pieceType == 2
+        )
+    }
+}
+
+private struct ProtoReader {
+    private let bytes: [UInt8]
+    private var offset = 0
+
+    init(data: Data) {
+        self.bytes = Array(data)
+    }
+
+    var isAtEnd: Bool {
+        offset >= bytes.count
+    }
+
+    mutating func readVarint() throws -> UInt64 {
+        var result: UInt64 = 0
+        var shift: UInt64 = 0
+        while shift < 64 {
+            guard offset < bytes.count else {
+                throw ModelStoreError.invalidConfig("Unexpected end of tokenizer.model varint")
+            }
+            let byte = bytes[offset]
+            offset += 1
+            result |= UInt64(byte & 0x7F) << shift
+            if byte & 0x80 == 0 {
+                return result
+            }
+            shift += 7
+        }
+        throw ModelStoreError.invalidConfig("Invalid tokenizer.model varint")
+    }
+
+    mutating func readLengthDelimitedData() throws -> Data {
+        let length = Int(try readVarint())
+        guard length >= 0, offset + length <= bytes.count else {
+            throw ModelStoreError.invalidConfig("Invalid tokenizer.model length-delimited field")
+        }
+        let start = offset
+        offset += length
+        return Data(bytes[start..<offset])
+    }
+
+    mutating func readLengthDelimitedString() throws -> String {
+        let data = try readLengthDelimitedData()
+        guard let string = String(data: data, encoding: .utf8) else {
+            throw ModelStoreError.invalidConfig("Invalid UTF-8 string in tokenizer.model")
+        }
+        return string
+    }
+
+    mutating func skip(wireType: Int) throws {
+        switch wireType {
+        case 0:
+            _ = try readVarint()
+        case 1:
+            try skipBytes(8)
+        case 2:
+            _ = try readLengthDelimitedData()
+        case 5:
+            try skipBytes(4)
+        default:
+            throw ModelStoreError.invalidConfig("Unsupported tokenizer.model protobuf wire type: \(wireType)")
+        }
+    }
+
+    private mutating func skipBytes(_ count: Int) throws {
+        guard count >= 0, offset + count <= bytes.count else {
+            throw ModelStoreError.invalidConfig("Unexpected end of tokenizer.model fixed-width field")
+        }
+        offset += count
     }
 }

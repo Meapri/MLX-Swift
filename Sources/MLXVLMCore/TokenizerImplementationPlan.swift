@@ -78,7 +78,8 @@ public struct TokenizerImplementationPlanner {
             hasTiktoken: metadata.hasTiktoken,
             hasVocabJSON: metadata.hasVocabJSON,
             hasMergesTXT: metadata.hasMergesTXT,
-            hasVocabTXT: metadata.hasVocabTXT
+            hasVocabTXT: metadata.hasVocabTXT,
+            catalog: catalog
         )
         let canUseCatalogPreflight = catalog?.error == nil && (catalog?.tokenCount ?? 0) > 0
         let swiftExecutionMode = swiftExecutionMode(
@@ -125,7 +126,8 @@ public struct TokenizerImplementationPlanner {
         hasTiktoken: Bool,
         hasVocabJSON: Bool,
         hasMergesTXT: Bool,
-        hasVocabTXT: Bool
+        hasVocabTXT: Bool,
+        catalog: TokenizerCatalog?
     ) -> String {
         switch modelType?.lowercased() {
         case "bpe":
@@ -140,7 +142,7 @@ public struct TokenizerImplementationPlanner {
             return "tokenizers-json-\(value)"
         case nil:
             if hasTokenizerModel {
-                return "sentencepiece-model"
+                return catalog?.modelType == "Unigram" ? "sentencepiece-unigram-model" : "sentencepiece-model"
             }
             if hasTiktoken {
                 return "tiktoken-file"
@@ -215,7 +217,8 @@ public struct TokenizerImplementationPlanner {
             return "wordpiece-greedy"
         }
         if requiredBackend == "tokenizers-json-unigram" ||
-            requiredBackend == "sentencepiece-unigram-or-tokenizers-json"
+            requiredBackend == "sentencepiece-unigram-or-tokenizers-json" ||
+            requiredBackend == "sentencepiece-unigram-model"
         {
             return "unigram-greedy"
         }

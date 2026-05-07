@@ -67,6 +67,7 @@ public struct SimpleTokenizer: Sendable {
             plan.requiredBackend == "tokenizers-json-wordpiece" ||
             plan.requiredBackend == "tokenizers-json-unigram" ||
             plan.requiredBackend == "sentencepiece-unigram-or-tokenizers-json" ||
+            plan.requiredBackend == "sentencepiece-unigram-model" ||
             plan.requiredBackend == "tokenizers-json-bpe" ||
             plan.requiredBackend == "bpe-vocab-json-merges-txt" ||
             plan.requiredBackend == "wordpiece-vocab-txt" ||
@@ -112,6 +113,7 @@ public struct SimpleTokenizer: Sendable {
             plan.requiredBackend == "tokenizers-json-wordpiece" ||
             plan.requiredBackend == "tokenizers-json-unigram" ||
             plan.requiredBackend == "sentencepiece-unigram-or-tokenizers-json" ||
+            plan.requiredBackend == "sentencepiece-unigram-model" ||
             plan.requiredBackend == "tokenizers-json-bpe" ||
             plan.requiredBackend == "bpe-vocab-json-merges-txt" ||
             plan.requiredBackend == "wordpiece-vocab-txt" ||
@@ -174,7 +176,8 @@ public struct SimpleTokenizer: Sendable {
 
     private var isUnigramBackend: Bool {
         plan.requiredBackend == "tokenizers-json-unigram" ||
-            plan.requiredBackend == "sentencepiece-unigram-or-tokenizers-json"
+            plan.requiredBackend == "sentencepiece-unigram-or-tokenizers-json" ||
+            plan.requiredBackend == "sentencepiece-unigram-model"
     }
 
     private var isTiktokenBackend: Bool {

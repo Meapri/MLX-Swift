@@ -557,6 +557,22 @@ JSON
 "$BIN" tokenize-simple --model "$UNIGRAM_MODEL_DIR" --text 'hello swiftly <image> mlx!' | grep -q '3'
 "$BIN" detokenize-simple --model "$UNIGRAM_MODEL_DIR" --ids 1,2,3,6,4,5 | grep -q '"text" : "hello swiftly<image> mlx!"'
 
+SP_MODEL_DIR="${TMPDIR:-/tmp}/mlx-vlm-swift-verify-sentencepiece"
+rm -rf "$SP_MODEL_DIR"
+mkdir -p "$SP_MODEL_DIR"
+cat > "$SP_MODEL_DIR/config.json" <<'JSON'
+{"model_type":"sentencepiece_test","vocab_size":8}
+JSON
+printf '\x0A\x0E\x0A\x05<unk>\x15\x00\x00\x00\x00\x18\x02\x0A\x11\x0A\x08\xE2\x96\x81hello\x15\x00\x00\x80\xBF\x18\x01\x0A\x11\x0A\x08\xE2\x96\x81swift\x15\x00\x00\x00\xC0\x18\x01\x0A\x0B\x0A\x02ly\x15\x00\x00\x40\xC0\x18\x01\x0A\x0F\x0A\x06\xE2\x96\x81mlx\x15\x00\x00\x80\xC0\x18\x01\x0A\x0A\x0A\x01!\x15\x00\x00\xA0\xC0\x18\x01\x0A\x10\x0A\x07<image>\x15\x00\x00\xC0\xC0\x18\x04' > "$SP_MODEL_DIR/tokenizer.model"
+"$BIN" inspect-tokenizer-catalog --model "$SP_MODEL_DIR" | grep -q '"modelType" : "Unigram"'
+"$BIN" inspect-tokenizer-catalog --model "$SP_MODEL_DIR" | grep -q '"source" : "tokenizer.model"'
+"$BIN" inspect-tokenizer-plan --model "$SP_MODEL_DIR" | grep -q '"requiredBackend" : "sentencepiece-unigram-model"'
+"$BIN" inspect-tokenizer-plan --model "$SP_MODEL_DIR" | grep -q '"swiftExecutionMode" : "unigram-greedy"'
+"$BIN" inspect-tokenizer-plan --model "$SP_MODEL_DIR" | grep -q '"requiresFullTokenizerImplementation" : false'
+"$BIN" tokenize-simple --model "$SP_MODEL_DIR" --text 'hello swiftly <image> mlx!' | grep -q '"tokenIDs"'
+"$BIN" tokenize-simple --model "$SP_MODEL_DIR" --text 'hello swiftly <image> mlx!' | grep -q '3'
+"$BIN" detokenize-simple --model "$SP_MODEL_DIR" --ids 1,2,3,6,4,5 | grep -q '"text" : "hello swiftly<image> mlx!"'
+
 BYTE_BPE_MODEL_DIR="${TMPDIR:-/tmp}/mlx-vlm-swift-verify-byte-bpe"
 rm -rf "$BYTE_BPE_MODEL_DIR"
 mkdir -p "$BYTE_BPE_MODEL_DIR"
