@@ -8,11 +8,6 @@ _HALF_SPLIT = "half_split"
 _EVEN_ODD = "even_odd"
 _HALF_COS = "half"
 _FULL_COS = "full"
-_SELECTED_FREQUENCY_STYLES = {"chunked", "interleaved", "split_select"}
-_SECTIONED_STYLES = {"sectioned_half_split", "sectioned_even_odd"}
-_EVEN_ODD_PAIRING_STYLES = {"sectioned_even_odd", "split_select", "ernie_3d"}
-_EVEN_ODD_LAYOUT_STYLES = {"sectioned_even_odd", "split_select"}
-_POSITION_SELECTOR_STYLES = _SELECTED_FREQUENCY_STYLES | _SECTIONED_STYLES
 
 
 def _cumulative_splits(lengths: Sequence[int]):
@@ -43,16 +38,36 @@ def _selected_mrope_freqs(position_ids, inv_freq, position_selector):
     return positions.astype(mx.float32) * inv_freq
 
 
-def _pairing_for_style(style: str):
-    if style in _EVEN_ODD_PAIRING_STYLES:
-        return _EVEN_ODD
-    return _HALF_SPLIT
-
-
 def mrope_position_selector(style: str, mrope_section: Sequence[int], freq_dim: int):
     if style == "interleaved":
         return _interleaved_position_selector(mrope_section, freq_dim)
     return _chunked_position_selector(mrope_section, freq_dim)
+
+
+def _selects_frequency_by_position(style: str):
+    return style in {"chunked", "interleaved", "split_select"}
+
+
+def _is_sectioned_style(style: str):
+    return style in {"sectioned_half_split", "sectioned_even_odd"}
+
+
+def _has_mrope_apply_selector(style: str):
+    return _selects_frequency_by_position(style) or _is_sectioned_style(style)
+
+
+def _uses_even_odd_pairing(style: str):
+    return style in {"sectioned_even_odd", "split_select", "ernie_3d"}
+
+
+def _needs_even_odd_layout(style: str):
+    return style in {"sectioned_even_odd", "split_select"}
+
+
+def _pairing_for_style(style: str):
+    if _uses_even_odd_pairing(style):
+        return _EVEN_ODD
+    return _HALF_SPLIT
 
 
 @lru_cache(maxsize=None)
@@ -500,7 +515,7 @@ def apply_mrope_frequency_layout(
 ):
     mrope_section = list(mrope_section)
 
-    if style in _SELECTED_FREQUENCY_STYLES:
+    if _selects_frequency_by_position(style):
         position_selector = mrope_position_selector(
             style,
             mrope_section,
@@ -522,7 +537,7 @@ def compute_mrope_frequencies(
         return position_ids.astype(mx.float32)[..., None] * inv_freq
 
     # Fast path
-    if style in _SELECTED_FREQUENCY_STYLES:
+    if _selects_frequency_by_position(style):
         if position_selector is None:
             position_selector = mrope_position_selector(
                 style,
@@ -572,7 +587,7 @@ class MRoPERotaryEmbedding:
                 rope_parameters=rope_parameters,
             )
         )
-        if style in _POSITION_SELECTOR_STYLES:
+        if _has_mrope_apply_selector(style):
             self.position_selector = mrope_position_selector(
                 style,
                 self.mrope_section,
@@ -824,7 +839,7 @@ def apply_multimodal_rotary_pos_emb(
     if style == "interleaved" and unsqueeze_dim == 1 and cast_output:
         return _apply_interleaved_rotary_pos_emb_axis1(q, k, cos, sin)
 
-    if style in _SECTIONED_STYLES:
+    if _is_sectioned_style(style):
         if mrope_section is None:
             raise ValueError("mrope_section is required for sectioned MRoPE")
         fast = _maybe_fast_precomputed_rotary(
@@ -844,7 +859,7 @@ def apply_multimodal_rotary_pos_emb(
         cos = mx.expand_dims(cos, axis=unsqueeze_dim)
         sin = mx.expand_dims(sin, axis=unsqueeze_dim)
 
-    if style in _EVEN_ODD_LAYOUT_STYLES:
+    if _needs_even_odd_layout(style):
         cos = mx.repeat(cos[..., : cos.shape[-1] // 2], repeats=2, axis=-1)
         sin = mx.repeat(sin[..., : sin.shape[-1] // 2], repeats=2, axis=-1)
         rotate_fn = rotate_half_even_odd
