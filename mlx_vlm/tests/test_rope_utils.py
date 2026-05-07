@@ -24,6 +24,61 @@ def _assert_pair_close(actual, expected, *, atol=1e-4):
     assert _max_diff(actual[1], expected[1]) < atol
 
 
+def _reference_rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return mx.concatenate([-x2, x1], axis=-1)
+
+
+def _reference_rotate_half_even_odd(x):
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    return mx.flatten(mx.stack([-x2, x1], axis=-1), start_axis=-2, end_axis=-1)
+
+
+def _reference_section_cos_sin(cos, sin, mrope_section):
+    if len(mrope_section) != 3:
+        raise ValueError("sectioned MRoPE expects exactly 3 sections")
+    split_indices = mx.cumsum(mx.array(list(mrope_section) * 2, dtype=mx.int32))[:-1]
+
+    def layout(values):
+        chunks = mx.split(values, split_indices, axis=-1)
+        return mx.concatenate(
+            [chunk[axis % 3] for axis, chunk in enumerate(chunks)],
+            axis=-1,
+        )[:, None, :, :]
+
+    return layout(cos), layout(sin)
+
+
+def _reference_apply_rotary(q, k, cos, sin, style, mrope_section):
+    if style in {"sectioned_half_split", "sectioned_even_odd"}:
+        cos, sin = _reference_section_cos_sin(cos, sin, mrope_section)
+    else:
+        cos = mx.expand_dims(cos, axis=1)
+        sin = mx.expand_dims(sin, axis=1)
+
+    if style in {"sectioned_even_odd", "split_select"}:
+        cos = mx.repeat(cos[..., : cos.shape[-1] // 2], repeats=2, axis=-1)
+        sin = mx.repeat(sin[..., : sin.shape[-1] // 2], repeats=2, axis=-1)
+        rotate_fn = _reference_rotate_half_even_odd
+    else:
+        rotate_fn = _reference_rotate_half
+
+    rotary_dim = cos.shape[-1]
+    q_rot = q[..., :rotary_dim]
+    k_rot = k[..., :rotary_dim]
+    q_embed = (q_rot * cos) + (rotate_fn(q_rot) * sin)
+    k_embed = (k_rot * cos) + (rotate_fn(k_rot) * sin)
+
+    if rotary_dim == q.shape[-1] and rotary_dim == k.shape[-1]:
+        return q_embed.astype(q.dtype), k_embed.astype(k.dtype)
+    return (
+        mx.concatenate([q_embed.astype(q.dtype), q[..., rotary_dim:]], axis=-1),
+        mx.concatenate([k_embed.astype(k.dtype), k[..., rotary_dim:]], axis=-1),
+    )
+
+
 def _disable_metal_fast_path(fn):
     has_metal = rope_utils._HAS_METAL
     rope_utils._HAS_METAL = False
@@ -71,6 +126,35 @@ def test_mrope_apply_rotary_fast_path_matches_fallback(style):
     _assert_pair_close((fast[0][..., 8:], fast[1][..., 8:]), (q[..., 8:], k[..., 8:]))
 
 
+@pytest.mark.parametrize(
+    "style",
+    [
+        "chunked",
+        "interleaved",
+        "sectioned_half_split",
+        "sectioned_even_odd",
+        "split_select",
+    ],
+)
+def test_mrope_apply_rotary_matches_reference_layout(style):
+    q = (mx.arange(2 * 3 * 4 * 10).reshape(2, 3, 4, 10) / 100).astype(mx.float32)
+    k = (mx.arange(2 * 2 * 4 * 10).reshape(2, 2, 4, 10) / 80).astype(mx.float32)
+    position_ids = _position_ids()
+    kwargs = {
+        "dim": 8,
+        "base": 10000,
+        "mrope_section": [2, 1, 1],
+        "style": style,
+    }
+
+    rotary = MRoPERotaryEmbedding(**kwargs)
+    actual = rotary.apply_rotary(q, k, position_ids)
+    cos, sin = rotary(k, position_ids)
+    expected = _reference_apply_rotary(q, k, cos, sin, style, kwargs["mrope_section"])
+
+    _assert_pair_close(actual, expected)
+
+
 @pytest.mark.parametrize("style", ["sectioned_half_split", "sectioned_even_odd"])
 def test_sectioned_precomputed_rotary_fast_path_matches_fallback(style):
     mx.random.seed(1)
@@ -87,6 +171,25 @@ def test_sectioned_precomputed_rotary_fast_path_matches_fallback(style):
 
     _assert_pair_close(fast, expected)
     _assert_pair_close((fast[0][..., 8:], fast[1][..., 8:]), (q[..., 8:], k[..., 8:]))
+
+
+def test_sectioned_mrope_requires_three_sections():
+    q = mx.zeros((1, 1, 2, 8))
+    k = mx.zeros((1, 1, 2, 8))
+    cos = mx.zeros((3, 1, 2, 8))
+    sin = mx.zeros((3, 1, 2, 8))
+
+    with pytest.raises(ValueError, match="exactly 3 sections"):
+        _disable_metal_fast_path(
+            lambda: apply_multimodal_rotary_pos_emb(
+                q,
+                k,
+                cos,
+                sin,
+                mrope_section=[2, 2],
+                style="sectioned_half_split",
+            )
+        )
 
 
 @pytest.mark.parametrize("cos_layout", ["half", "full"])

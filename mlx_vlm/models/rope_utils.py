@@ -534,6 +534,8 @@ def compute_mrope_frequencies(
     position_selector=None,
 ):
     if position_ids.ndim == 2:
+        # Text-only positions use the same scalar position for every MRoPE axis,
+        # so chunked/interleaved layout selection collapses to the same angles.
         return position_ids.astype(mx.float32)[..., None] * inv_freq
 
     # Fast path
@@ -732,6 +734,8 @@ def _apply_interleaved_rotary_pos_emb_axis1(q, k, cos, sin):
 
 
 def _section_frequency_layout(values, mrope_section):
+    if len(mrope_section) != 3:
+        raise ValueError("sectioned MRoPE expects exactly 3 sections")
     split_indices = _cumulative_splits(list(mrope_section) * 2)
     return mx.concatenate(
         [m[i % 3] for i, m in enumerate(mx.split(values, split_indices, axis=-1))],
