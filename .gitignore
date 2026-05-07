@@ -8,6 +8,7 @@ __pycache__/
 # Distribution / packaging
 bin/
 build/
+.build/
 develop-eggs/
 dist/
 eggs/
@@ -27,3 +28,5 @@ var/
 .venv
 .codex_tmp/
 .vscode
+default.metallib
+mlx-swift_Cmlx.bundle/
