@@ -1284,6 +1284,8 @@ final class CompatibilityServer: @unchecked Sendable {
     private let deepDiagnostics: Bool
     private let queue = DispatchQueue(label: "mlx-vlm-swift.compatibility-server")
     private var residency = OllamaModelResidency()
+    private var modelAliases: [String: ModelDescriptor] = [:]
+    private var pushedBlobDigests: Set<String> = []
     private var generationBackend: (any VLMBackend)?
     private var embeddingBackend: (any EmbeddingBackend)?
     private var embeddingBackendUnavailableReason: String?
@@ -1840,7 +1842,7 @@ final class CompatibilityServer: @unchecked Sendable {
         case "/api/version":
             return encodedResponse(OllamaVersionResponse(version: "mlx-vlm-swift-compat"))
         case "/api/tags":
-            return encodedResponse(OllamaTagsResponse(models: [OllamaModelTag(descriptor: descriptor)]))
+            return encodedResponse(OllamaTagsResponse(models: ollamaModelTags()))
         case "/api/ps":
             return encodedResponse(residency.runningModelsResponse(descriptor: descriptor))
         case "/v1/cache/stats", "/cache/stats":
@@ -1877,7 +1879,7 @@ final class CompatibilityServer: @unchecked Sendable {
         case "/api/delete":
             return parseModelOperationRequest(from: request, operation: "delete")
         case let blobPath where blobPath.hasPrefix("/api/blobs/"):
-            return parseBlobOperationRequest(path: blobPath, method: method)
+            return parseBlobOperationRequest(path: blobPath, method: method, request: request)
         case "/api/generate":
             return parseOllamaGenerateRequest(from: request)
         case "/api/chat":
@@ -1929,10 +1931,24 @@ final class CompatibilityServer: @unchecked Sendable {
         var models = HuggingFaceCacheResolver().cachedMLXModels().map {
             OpenAIModelResponse(id: $0.id, created: $0.created, ownedBy: "huggingface-cache")
         }
+        for alias in modelAliases.keys.sorted() where !models.contains(where: { $0.id == alias }) {
+            models.append(OpenAIModelResponse(id: alias, ownedBy: "mlx-vlm-swift-alias"))
+        }
         if !models.contains(where: { $0.id == descriptor.id }) {
             models.insert(OpenAIModelResponse(id: descriptor.id), at: 0)
         }
         return models
+    }
+
+    private func ollamaModelTags() -> [OllamaModelTag] {
+        var tags = [OllamaModelTag(descriptor: descriptor)]
+        for alias in modelAliases.keys.sorted() {
+            guard let aliasDescriptor = modelAliases[alias] else {
+                continue
+            }
+            tags.append(OllamaModelTag(name: alias, descriptor: aliasDescriptor))
+        }
+        return tags
     }
 
     private func parseOllamaShowRequest(from request: String) -> Data {
@@ -1944,17 +1960,20 @@ final class CompatibilityServer: @unchecked Sendable {
         do {
             let decoded = try JSONDecoder().decode(OllamaShowRequest.self, from: Data(body.utf8))
             if let requestedModel = decoded.modelName, requestedModel != descriptor.id {
-                return jsonResponse(
-                    [
-                        "error": [
-                            "message": "Model '\(requestedModel)' was not found.",
-                            "type": "invalid_request_error",
-                            "param": "model",
-                            "code": "model_not_found",
-                        ]
-                    ],
-                    status: "404 Not Found"
-                )
+                guard let aliasDescriptor = modelAliases[requestedModel] else {
+                    return jsonResponse(
+                        [
+                            "error": [
+                                "message": "Model '\(requestedModel)' was not found.",
+                                "type": "invalid_request_error",
+                                "param": "model",
+                                "code": "model_not_found",
+                            ]
+                        ],
+                        status: "404 Not Found"
+                    )
+                }
+                return encodedResponse(OllamaShowResponse(descriptor: aliasDescriptor))
             }
             return encodedResponse(OllamaShowResponse(descriptor: descriptor))
         } catch {
@@ -2255,16 +2274,209 @@ final class CompatibilityServer: @unchecked Sendable {
         let data = body.isEmpty ? Data("{}".utf8) : Data(body.utf8)
         do {
             let decoded = try JSONDecoder().decode(OllamaModelOperationRequest.self, from: data)
-            return encodedResponse(
-                OllamaModelOperationReport(operation: operation, request: decoded),
-                status: "501 Not Implemented"
-            )
+            switch operation {
+            case "create":
+                return createModelResponse(request: decoded)
+            case "pull":
+                return pullModelResponse(request: decoded)
+            case "push":
+                return pushModelResponse(request: decoded)
+            case "copy":
+                return copyModelResponse(request: decoded)
+            case "delete":
+                return deleteModelResponse(request: decoded)
+            default:
+                return encodedResponse(
+                    OllamaModelOperationReport(operation: operation, request: decoded, backend: currentBackendStatus),
+                    status: "501 Not Implemented"
+                )
+            }
         } catch {
             return jsonResponse(["parse_error": String(describing: error)], status: "400 Bad Request")
         }
     }
 
-    private func parseBlobOperationRequest(path: String, method: String) -> Data {
+    private func createModelResponse(request: OllamaModelOperationRequest) -> Data {
+        guard let destination = request.requestedModelName, !destination.isEmpty else {
+            return missingModelOperationFieldResponse(operation: "create", field: "model")
+        }
+        let source = request.sourceName ?? request.modelfileSourceName ?? descriptor.path
+        do {
+            let resolved = try resolveOperationDescriptor(named: source, useLatest: request.useLatest)
+            modelAliases[destination] = resolved
+            return encodedResponse(
+                OllamaModelOperationReport(
+                    operation: "create",
+                    request: request,
+                    backend: currentBackendStatus,
+                    accepted: true,
+                    status: "success",
+                    path: resolved.path,
+                    error: nil
+                )
+            )
+        } catch {
+            return modelOperationErrorResponse(operation: "create", request: request, error: error)
+        }
+    }
+
+    private func pullModelResponse(request: OllamaModelOperationRequest) -> Data {
+        guard let model = request.modelName, !model.isEmpty else {
+            return missingModelOperationFieldResponse(operation: "pull", field: "model")
+        }
+
+        do {
+            let descriptor = try resolveOperationDescriptor(named: model, useLatest: request.useLatest)
+            return encodedResponse(
+                OllamaModelOperationReport(
+                    operation: "pull",
+                    request: request,
+                    backend: currentBackendStatus,
+                    accepted: true,
+                    status: "success",
+                    path: descriptor.path,
+                    error: nil
+                )
+            )
+        } catch {
+            return modelOperationErrorResponse(operation: "pull", request: request, error: error)
+        }
+    }
+
+    private func pushModelResponse(request: OllamaModelOperationRequest) -> Data {
+        guard let model = request.requestedModelName ?? request.modelName, !model.isEmpty else {
+            return missingModelOperationFieldResponse(operation: "push", field: "model")
+        }
+        do {
+            let descriptor = try resolveOperationDescriptor(named: model, useLatest: request.useLatest)
+            return encodedResponse(
+                OllamaModelOperationReport(
+                    operation: "push",
+                    request: request,
+                    backend: currentBackendStatus,
+                    accepted: true,
+                    status: "validated",
+                    path: descriptor.path,
+                    error: nil
+                )
+            )
+        } catch {
+            return modelOperationErrorResponse(operation: "push", request: request, error: error)
+        }
+    }
+
+    private func copyModelResponse(request: OllamaModelOperationRequest) -> Data {
+        guard let source = request.sourceName, !source.isEmpty else {
+            return missingModelOperationFieldResponse(operation: "copy", field: "source")
+        }
+        guard let destination = request.destinationName, !destination.isEmpty else {
+            return missingModelOperationFieldResponse(operation: "copy", field: "destination")
+        }
+        do {
+            let resolved = try resolveOperationDescriptor(named: source, useLatest: request.useLatest)
+            modelAliases[destination] = resolved
+            return encodedResponse(
+                OllamaModelOperationReport(
+                    operation: "copy",
+                    request: request,
+                    backend: currentBackendStatus,
+                    accepted: true,
+                    status: "success",
+                    path: resolved.path,
+                    error: nil
+                )
+            )
+        } catch {
+            return modelOperationErrorResponse(operation: "copy", request: request, error: error)
+        }
+    }
+
+    private func deleteModelResponse(request: OllamaModelOperationRequest) -> Data {
+        guard let model = request.requestedModelName ?? request.modelName, !model.isEmpty else {
+            return missingModelOperationFieldResponse(operation: "delete", field: "model")
+        }
+        let removed = modelAliases.removeValue(forKey: model)
+        if let removed {
+            return encodedResponse(
+                OllamaModelOperationReport(
+                    operation: "delete",
+                    request: request,
+                    backend: currentBackendStatus,
+                    accepted: true,
+                    status: "deleted",
+                    path: removed.path,
+                    error: nil
+                )
+            )
+        }
+        do {
+            let resolved = try resolveOperationDescriptor(named: model, useLatest: request.useLatest)
+            return encodedResponse(
+                OllamaModelOperationReport(
+                    operation: "delete",
+                    request: request,
+                    backend: currentBackendStatus,
+                    accepted: true,
+                    status: "external_model_retained",
+                    path: resolved.path,
+                    error: nil
+                )
+            )
+        } catch {
+            return modelOperationErrorResponse(operation: "delete", request: request, error: error, status: "404 Not Found")
+        }
+    }
+
+    private func resolveOperationDescriptor(named name: String, useLatest: Bool) throws -> ModelDescriptor {
+        if name == descriptor.id || name == descriptor.path {
+            return descriptor
+        }
+        if let alias = modelAliases[name] {
+            return alias
+        }
+        return try waitForAsync {
+            try await MLXRemoteModelResolver().resolveDescriptor(
+                pathOrIdentifier: name,
+                useLatest: useLatest
+            )
+        }
+    }
+
+    private func missingModelOperationFieldResponse(operation: String, field: String) -> Data {
+        jsonResponse(
+            [
+                "error": [
+                    "message": "Ollama \(operation) request is missing \(field).",
+                    "type": "invalid_request_error",
+                    "param": field,
+                    "code": "missing_\(field)",
+                ]
+            ],
+            status: "400 Bad Request"
+        )
+    }
+
+    private func modelOperationErrorResponse(
+        operation: String,
+        request: OllamaModelOperationRequest,
+        error: Error,
+        status: String = "502 Bad Gateway"
+    ) -> Data {
+        encodedResponse(
+            OllamaModelOperationReport(
+                operation: operation,
+                request: request,
+                backend: currentBackendStatus,
+                accepted: false,
+                status: "error",
+                path: nil,
+                error: String(describing: error)
+            ),
+            status: status
+        )
+    }
+
+    private func parseBlobOperationRequest(path: String, method: String, request: String) -> Data {
         let digest = String(path.dropFirst("/api/blobs/".count))
         guard digest.hasPrefix("sha256:"), digest.count > "sha256:".count else {
             return jsonResponse(
@@ -2282,11 +2494,24 @@ final class CompatibilityServer: @unchecked Sendable {
 
         switch method.uppercased() {
         case "HEAD":
-            return httpResponse(status: "404 Not Found", body: Data())
+            return httpResponse(
+                status: pushedBlobDigests.contains(digest) ? "200 OK" : "404 Not Found",
+                body: Data()
+            )
         case "POST":
+            let byteCount = httpBody(from: request).map { Data($0.utf8).count } ?? 0
+            pushedBlobDigests.insert(digest)
             return encodedResponse(
-                OllamaBlobOperationReport(operation: "push-blob", digest: digest),
-                status: "501 Not Implemented"
+                OllamaBlobOperationReport(
+                    operation: "push-blob",
+                    digest: digest,
+                    exists: true,
+                    backend: currentBackendStatus,
+                    accepted: true,
+                    status: "success",
+                    bytes: byteCount,
+                    error: nil
+                )
             )
         default:
             return encodedResponse(
@@ -3615,13 +3840,45 @@ enum SelfTest {
             request: OllamaModelOperationRequest(fields: ["model": .string("qwen")])
         )
         precondition(modelOperation.model == "qwen")
+        precondition(modelOperation.destination == "qwen")
         precondition(modelOperation.accepted == false)
+        precondition(modelOperation.status == "unavailable")
+        precondition(modelOperation.error?.contains("not available") == true)
         precondition(modelOperation.backend.activeBackend == "compatibility-shell")
+        let createOperation = OllamaModelOperationReport(
+            operation: "create",
+            request: OllamaModelOperationRequest(fields: [
+                "model": .string("alias"),
+                "modelfile": .string("FROM /tmp/model\nPARAMETER temperature 0.2"),
+            ]),
+            accepted: true,
+            status: "success",
+            path: "/tmp/model",
+            error: nil
+        )
+        precondition(createOperation.model == "alias")
+        precondition(createOperation.source == "/tmp/model")
+        precondition(createOperation.destination == "alias")
+        precondition(createOperation.error == nil)
         let blobOperation = OllamaBlobOperationReport(operation: "push-blob", digest: "sha256:abc123")
         precondition(blobOperation.digest == "sha256:abc123")
         precondition(blobOperation.accepted == false)
         precondition(blobOperation.exists == false)
+        precondition(blobOperation.status == "unavailable")
         precondition(blobOperation.backend.activeBackend == "compatibility-shell")
+        let acceptedBlobOperation = OllamaBlobOperationReport(
+            operation: "push-blob",
+            digest: "sha256:def456",
+            exists: true,
+            accepted: true,
+            status: "success",
+            bytes: 4,
+            error: nil
+        )
+        precondition(acceptedBlobOperation.accepted == true)
+        precondition(acceptedBlobOperation.exists == true)
+        precondition(acceptedBlobOperation.error == nil)
+        precondition(acceptedBlobOperation.bytes == 4)
         let apcStats = APCCacheStatusResponse()
         precondition(apcStats.enabled == false)
         precondition(apcStats.status == nil)
@@ -4303,6 +4560,12 @@ enum SelfTest {
         )
         precondition(completionResponseJSON.contains("\"object\":\"text_completion\""))
         precondition(completionResponseJSON.contains("\"text\":\"ok\""))
+        let echoedCompletionJSON = GenerationAPIResponseRenderer.renderCompleted(
+            result,
+            api: .openAICompletions,
+            request: normalizedCompletion
+        ).body
+        precondition(echoedCompletionJSON.contains("\"text\":\"legacy promptok\""))
         let completionStreamJSON = ResponseStreamFramer.serverSentEvent(
             OpenAICompletionStreamResponse(model: "qwen", chunk: finalChunk, created: 0, usage: result.usage)
         )

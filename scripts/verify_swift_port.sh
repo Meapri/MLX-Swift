@@ -654,9 +654,31 @@ curl -fsS "http://127.0.0.1:$PORT/api/tags" | grep -q '"models"'
 MODEL_ID="$(basename "$MODEL_DIR")"
 curl -fsS "http://127.0.0.1:$PORT/v1/models?limit=20" | grep -q '"object":"list"'
 curl -fsS "http://127.0.0.1:$PORT/v1/models/$MODEL_ID" | grep -q '"owned_by":"mlx-vlm-swift"'
+curl -fsS -X POST "http://127.0.0.1:$PORT/api/pull" \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$MODEL_DIR\"}" | grep -q '"accepted":true'
+curl -fsS -X POST "http://127.0.0.1:$PORT/api/create" \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"swift-created\",\"from\":\"$MODEL_DIR\"}" | grep -q '"status":"success"'
+curl -fsS "http://127.0.0.1:$PORT/api/tags" | grep -q '"model":"swift-created"'
+curl -fsS -X POST "http://127.0.0.1:$PORT/api/show" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"swift-created"}' | grep -q '"mlx_vlm.backend_ready"'
+curl -fsS "http://127.0.0.1:$PORT/v1/models/swift-created" | grep -q '"owned_by":"mlx-vlm-swift-alias"'
+curl -fsS -X POST "http://127.0.0.1:$PORT/api/copy" \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"swift-created","destination":"swift-copied"}' | grep -q '"status":"success"'
+curl -fsS -X POST "http://127.0.0.1:$PORT/api/push" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"swift-copied"}' | grep -q '"status":"validated"'
+curl -fsS -X DELETE "http://127.0.0.1:$PORT/api/delete" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"swift-copied"}' | grep -q '"status":"deleted"'
 BLOB_HEAD_STATUS="$(curl -sS -o /dev/null -w '%{http_code}' -I "http://127.0.0.1:$PORT/api/blobs/sha256:abc123")"
 test "$BLOB_HEAD_STATUS" = "404"
-curl -sS -X POST "http://127.0.0.1:$PORT/api/blobs/sha256:abc123" | grep -q '"operation":"push-blob"'
+curl -sS -X POST "http://127.0.0.1:$PORT/api/blobs/sha256:abc123" --data-binary 'blob' | grep -q '"accepted":true'
+BLOB_HEAD_STATUS="$(curl -sS -o /dev/null -w '%{http_code}' -I "http://127.0.0.1:$PORT/api/blobs/sha256:abc123")"
+test "$BLOB_HEAD_STATUS" = "200"
 SERVER_SHOW_JSON="$(mktemp)"
 curl -fsS "http://127.0.0.1:$PORT/api/show" > "$SERVER_SHOW_JSON"
 grep -q '"mlx_vlm.backend_ready"' "$SERVER_SHOW_JSON"

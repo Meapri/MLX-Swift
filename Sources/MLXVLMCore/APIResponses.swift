@@ -237,15 +237,17 @@ public struct OpenAICompletionResponse: Codable, Equatable, Sendable {
     public init(
         result: CompletedGeneration,
         id: String = "cmpl-swift",
-        created: Int = Int(Date().timeIntervalSince1970)
+        created: Int = Int(Date().timeIntervalSince1970),
+        request: GenerationRequest? = nil
     ) {
         self.id = id
         self.object = "text_completion"
         self.created = created
         self.model = result.model
+        let text = Self.responseText(result: result, request: request)
         self.choices = [
             OpenAICompletionChoice(
-                text: result.text,
+                text: text,
                 index: 0,
                 finishReason: result.finishReason
             )
@@ -255,6 +257,22 @@ public struct OpenAICompletionResponse: Codable, Equatable, Sendable {
             completionTokens: result.usage.completionTokens,
             totalTokens: result.usage.totalTokens
         )
+    }
+
+    private static func responseText(result: CompletedGeneration, request: GenerationRequest?) -> String {
+        guard request?.metadata.responseMetadata?["echo"]?.boolValue == true else {
+            return result.text
+        }
+        let prompt = request?.messages
+            .flatMap(\.content)
+            .compactMap { part -> String? in
+                guard case .text(let text) = part else {
+                    return nil
+                }
+                return text
+            }
+            .joined(separator: " ") ?? ""
+        return prompt + result.text
     }
 }
 
@@ -1122,7 +1140,7 @@ public enum GenerationAPIResponseRenderer {
         case .ollamaChat:
             body = encode(OllamaChatResponse(result: result))
         case .openAICompletions:
-            body = encode(OpenAICompletionResponse(result: result))
+            body = encode(OpenAICompletionResponse(result: result, request: request))
         case .openAIChat:
             body = encode(OpenAIChatCompletionResponse(result: result))
         case .openAIResponses:

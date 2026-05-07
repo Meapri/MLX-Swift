@@ -308,25 +308,74 @@ public struct OllamaModelOperationRequest: Codable, Equatable, Sendable {
             ?? fields["destination"]?.stringValue
             ?? fields["from"]?.stringValue
     }
+
+    public var requestedModelName: String? {
+        fields["model"]?.stringValue ?? fields["name"]?.stringValue
+    }
+
+    public var sourceName: String? {
+        fields["source"]?.stringValue ?? fields["from"]?.stringValue
+    }
+
+    public var destinationName: String? {
+        fields["destination"]?.stringValue ?? fields["name"]?.stringValue
+    }
+
+    public var modelfile: String? {
+        fields["modelfile"]?.stringValue
+    }
+
+    public var modelfileSourceName: String? {
+        guard let modelfile else {
+            return nil
+        }
+        for line in modelfile.split(whereSeparator: \.isNewline) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.uppercased().hasPrefix("FROM ") else {
+                continue
+            }
+            let source = trimmed.dropFirst("FROM ".count).trimmingCharacters(in: .whitespacesAndNewlines)
+            return source.isEmpty ? nil : source
+        }
+        return nil
+    }
+
+    public var useLatest: Bool {
+        fields["use_latest"]?.boolValue ??
+            fields["useLatest"]?.boolValue ??
+            false
+    }
 }
 
 public struct OllamaModelOperationReport: Codable, Equatable, Sendable {
     public let operation: String
     public let model: String?
+    public let source: String?
+    public let destination: String?
     public let accepted: Bool
-    public let error: String
+    public let status: String
+    public let path: String?
+    public let error: String?
     public let backend: BackendStatus
     public let request: OllamaModelOperationRequest
 
     public init(
         operation: String,
         request: OllamaModelOperationRequest,
-        backend: BackendStatus = .compatibilityShell
+        backend: BackendStatus = .compatibilityShell,
+        accepted: Bool = false,
+        status: String = "unavailable",
+        path: String? = nil,
+        error: String? = nil
     ) {
         self.operation = operation
         self.model = request.modelName
-        self.accepted = false
-        self.error = "Ollama model operation '\(operation)' is not available in the dependency-free Swift compatibility shell."
+        self.source = request.sourceName ?? request.modelfileSourceName
+        self.destination = request.destinationName ?? request.requestedModelName
+        self.accepted = accepted
+        self.status = status
+        self.path = path
+        self.error = error ?? (accepted ? nil : "Ollama model operation '\(operation)' is not available in the dependency-free Swift compatibility shell.")
         self.backend = backend
         self.request = request
     }
@@ -337,20 +386,28 @@ public struct OllamaBlobOperationReport: Codable, Equatable, Sendable {
     public let digest: String
     public let accepted: Bool
     public let exists: Bool
-    public let error: String
+    public let status: String
+    public let bytes: Int?
+    public let error: String?
     public let backend: BackendStatus
 
     public init(
         operation: String,
         digest: String,
         exists: Bool = false,
-        backend: BackendStatus = .compatibilityShell
+        backend: BackendStatus = .compatibilityShell,
+        accepted: Bool = false,
+        status: String = "unavailable",
+        bytes: Int? = nil,
+        error: String? = nil
     ) {
         self.operation = operation
         self.digest = digest
-        self.accepted = false
+        self.accepted = accepted
         self.exists = exists
-        self.error = "Ollama blob operation '\(operation)' is not available in the dependency-free Swift compatibility shell."
+        self.status = status
+        self.bytes = bytes
+        self.error = error ?? (accepted ? nil : "Ollama blob operation '\(operation)' is not available in the dependency-free Swift compatibility shell.")
         self.backend = backend
     }
 }
@@ -376,8 +433,12 @@ public struct APCCacheStatusResponse: Codable, Equatable, Sendable {
 
 public extension OllamaModelTag {
     init(descriptor: ModelDescriptor, modifiedAt: String = "1970-01-01T00:00:00Z") {
-        self.name = descriptor.id
-        self.model = descriptor.id
+        self.init(name: descriptor.id, descriptor: descriptor, modifiedAt: modifiedAt)
+    }
+
+    init(name: String, descriptor: ModelDescriptor, modifiedAt: String = "1970-01-01T00:00:00Z") {
+        self.name = name
+        self.model = name
         self.modifiedAt = modifiedAt
         self.size = descriptor.totalWeightBytes
         self.digest = descriptor.weightFiles.map(\.name).joined(separator: ":")
