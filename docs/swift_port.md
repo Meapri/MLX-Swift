@@ -181,6 +181,7 @@ Implemented now:
 - `scripts/check_mlx_backend_dependencies.sh` checks for local `mlx-swift`, `mlx-swift-lm`, and `swift-tokenizers-mlx` checkouts, prints the backend plan when they are missing, and builds the `MLXVLMMLXBackend` target with local dependency environment variables when they are available.
 - `scripts/verify_local_mlx_manifest.sh` creates temporary mock `MLX`, `MLXLMCommon`, `MLXLLM`, `MLXVLM`, and `MLXLMTokenizers` packages to verify the local dependency manifest path and compile-time `canImport` probe without requiring network access or real MLX packages.
 - `scripts/verify_mock_real_mlx_api.sh` creates stricter mock `MLX`, `MLXLMCommon`, `MLXVLM`, and `MLXLMTokenizers` packages that expose `DType`, `MLXArray(data, shape, dtype:)`, `GenerateParameters`, `UserInput`, `ToolSpec`, `ToolCall`, `Generation`, `GenerateCompletionInfo`, `ModelContainer.prepare/generate`, `VLMModelFactory.loadContainer`, and `TokenizersLoader`, then builds with `MLXVLM_ENABLE_REAL_MLX_API=1` to exercise guarded upstream API bridges without downloading dependencies.
+- `scripts/verify_real_gemma4_smoke.sh` is the local real-backend regression gate. When the Gemma4 E4B MLX model directory is present, it builds an identity-safe temporary copy with real upstream `mlx-swift`, `mlx-swift-lm`, and `swift-tokenizers-mlx`, starts the server, and verifies health, OpenAI chat, tool-schema passthrough, Ollama raw-base64 image input, OpenAI data-URI image input, OpenAI SSE streaming without `Content-Length`, Ollama NDJSON streaming without `Content-Length`, and the expected VLM embedding `501` diagnostic.
 
 Generation endpoints now have two honest modes: dependency-free builds return typed `501 Not Implemented` compatibility reports, while real MLX builds route generation through upstream `mlx-swift-lm` instead of returning fake text.
 
@@ -224,6 +225,7 @@ Inline multimodal smoke tests against the same local Gemma4 E4B model also pass 
 - OpenAI `/v1/chat/completions` with `image_url.url:"data:image/png;base64,..."` returned `Black`.
 - OpenAI `stream:true` returned `Content-Type: text/event-stream` with per-chunk `data:` frames, final usage, and `data: [DONE]`, without a `Content-Length` header.
 - Ollama `stream:true` returned `Content-Type: application/x-ndjson` with per-chunk JSON lines and final `prompt_eval_count:16`, `eval_count:2`, without a `Content-Length` header.
+- The same checks are now codified in `scripts/verify_real_gemma4_smoke.sh`; set `MLXVLM_REAL_SMOKE_MODEL=/path/to/model` to run it against a different local Gemma4-compatible model directory.
 
 Recommended backend dependency sketch:
 

@@ -24,8 +24,8 @@ if enableMLXBackendDependencies {
         dependencies.append(.package(name: "MLXSwift", path: path))
         mlxSwiftPackageRef = "MLXSwift"
     } else {
-        dependencies.append(.package(name: "MLXSwift", url: "https://github.com/ml-explore/mlx-swift", "0.31.3"..<"0.32.0"))
-        mlxSwiftPackageRef = "MLXSwift"
+        dependencies.append(.package(url: "https://github.com/ml-explore/mlx-swift", "0.31.3"..<"0.32.0"))
+        mlxSwiftPackageRef = "mlx-swift"
     }
 
     let mlxSwiftLMPackageRef: String
