@@ -39,8 +39,9 @@ public enum MLXVLMUserInputBridgePolicy {
     }
 }
 
-#if MLXVLM_REAL_MLX_API && canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXVLM) && canImport(MLXLMTokenizers)
+#if MLXVLM_REAL_MLX_API && canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXLLM) && canImport(MLXVLM) && canImport(MLXLMTokenizers)
 import MLX
+import MLXLLM
 import MLXLMCommon
 import MLXLMTokenizers
 import MLXVLM
@@ -48,11 +49,11 @@ import MLXVLM
 public enum MLXVLMUpstreamBackendError: Error, CustomStringConvertible, Sendable {
     case unsupportedMessageRole(MessageRole)
     case unsupportedMediaReference(String)
-    case unsupportedToolPayload
     case unsupportedToolSpec(MLXVLMCore.JSONValue)
     case unsupportedAdapterPath(String)
     case invalidAdapterConfig(String)
     case invalidAdapterWeights(String)
+    case invalidDraftModel(String)
 
     public var description: String {
         switch self {
@@ -60,8 +61,6 @@ public enum MLXVLMUpstreamBackendError: Error, CustomStringConvertible, Sendable
             return "Unsupported chat message role for mlx-swift-lm Chat.Message: \(role.rawValue)"
         case .unsupportedMediaReference(let reference):
             return "Unsupported media reference for mlx-swift-lm UserInput: \(reference)"
-        case .unsupportedToolPayload:
-            return "Tool payload bridging to mlx-swift-lm ToolSpec is not implemented yet."
         case .unsupportedToolSpec(let value):
             return "Unsupported tool schema for mlx-swift-lm ToolSpec: \(value)"
         case .unsupportedAdapterPath(let path):
@@ -70,6 +69,8 @@ public enum MLXVLMUpstreamBackendError: Error, CustomStringConvertible, Sendable
             return "Invalid adapter_config.json for mlx-swift-lm LoRA bridge: \(reason)"
         case .invalidAdapterWeights(let reason):
             return "Invalid adapters.safetensors for mlx-swift-lm LoRA bridge: \(reason)"
+        case .invalidDraftModel(let reason):
+            return "Invalid draft model for mlx-swift-lm speculative decoding: \(reason)"
         }
     }
 }
@@ -153,6 +154,23 @@ public struct MLXVLMUpstreamGenerator: VLMGenerator {
                         iterator: iterator
                     )
                     return stream
+                }
+            } else if let draft = try await MLXVLMResolvedDraftModel.loadIfRequested(metadata: input.request.metadata) {
+                let draftContainer = draft.container
+                let numDraftTokens = draft.numDraftTokens
+                upstreamStream = try await draftContainer.perform(nonSendable: lmInput) { draftContext, lmInput in
+                    try await container.upstream.perform(
+                        nonSendable: (lmInput, draftContext.model)
+                    ) { context, values in
+                        let (lmInput, draftModel) = values
+                        return try MLXLMCommon.generate(
+                            input: lmInput,
+                            parameters: parameters,
+                            context: context,
+                            draftModel: draftModel,
+                            numDraftTokens: numDraftTokens
+                        )
+                    }
                 }
             } else {
                 upstreamStream = try await container.upstream.generate(input: lmInput, parameters: parameters)
@@ -428,7 +446,7 @@ public enum MLXVLMAdapterBridge {
     }
 }
 
-public struct MLXVLMUpstreamBackend: VLMBackend {
+public struct MLXVLMUpstreamBackend: VLMBackend, TokenizationBackend {
     public let descriptor: ModelDescriptor
     public let status: BackendStatus = .mlxSwiftVLM
     public let container: MLXVLMUpstreamModelContainer
@@ -469,6 +487,61 @@ public struct MLXVLMUpstreamBackend: VLMBackend {
     public func generate(_ request: GenerationRequest) async throws -> AsyncThrowingStream<GenerationChunk, Error> {
         try await generator.generate(input: process(request))
     }
+
+    public func tokenize(text: String, addSpecialTokens: Bool = true) async throws -> BackendTokenizationResult {
+        let tokenizer = await container.upstream.tokenizer
+        let tokenIDs = tokenizer.encode(text: text, addSpecialTokens: addSpecialTokens)
+        let tokens = tokenIDs.map { tokenizer.convertIdToToken($0) ?? "" }
+        return BackendTokenizationResult(
+            backend: status.activeBackend,
+            tokens: tokens,
+            tokenIDs: tokenIDs,
+            text: text
+        )
+    }
+
+    public func detokenize(tokenIDs: [Int], skipSpecialTokens: Bool = true) async throws -> BackendDetokenizationResult {
+        let tokenizer = await container.upstream.tokenizer
+        let text = tokenizer.decode(tokenIds: tokenIDs, skipSpecialTokens: skipSpecialTokens)
+        let tokenPairs = tokenIDs.map { id in (id, tokenizer.convertIdToToken(id)) }
+        return BackendDetokenizationResult(
+            backend: status.activeBackend,
+            text: text,
+            tokenIDs: tokenIDs,
+            tokens: tokenPairs.map { $0.1 ?? "" },
+            unknownTokenIDs: tokenPairs.compactMap { $0.1 == nil ? $0.0 : nil }
+        )
+    }
+}
+
+struct MLXVLMResolvedDraftModel {
+    let container: MLXLMCommon.ModelContainer
+    let numDraftTokens: Int
+
+    static func loadIfRequested(metadata: GenerationRequestMetadata) async throws -> MLXVLMResolvedDraftModel? {
+        guard let model = metadata.draftModel?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !model.isEmpty
+        else {
+            return nil
+        }
+        let descriptor = try await MLXRemoteModelResolver().resolveDescriptor(pathOrIdentifier: model)
+        let directory = URL(fileURLWithPath: descriptor.path)
+        let tokenizers = MLXLMTokenizers.TokenizersLoader()
+        let container: MLXLMCommon.ModelContainer
+        do {
+            container = try await MLXVLM.VLMModelFactory.shared.loadContainer(from: directory, using: tokenizers)
+        } catch {
+            do {
+                container = try await MLXLLM.LLMModelFactory.shared.loadContainer(from: directory, using: tokenizers)
+            } catch {
+                throw MLXVLMUpstreamBackendError.invalidDraftModel("\(model) could not be loaded as VLM or LLM")
+            }
+        }
+        return MLXVLMResolvedDraftModel(
+            container: container,
+            numDraftTokens: max(1, metadata.draftBlockSize ?? 2)
+        )
+    }
 }
 
 struct MLXVLMStructuredLogitProcessorFactory {
@@ -482,7 +555,14 @@ struct MLXVLMStructuredLogitProcessorFactory {
             return nil
         }
         let tokenizer = await container.tokenizer
-        let startTokenIDs = JSONStartTokenProcessor.startTokenIDs(tokenizer: tokenizer)
+        let guidance = JSONSchemaGuidance(responseFormat: request.metadata.responseFormat)
+        if let prefixTokenIDs = guidance.prefixTokenIDs(tokenizer: tokenizer), !prefixTokenIDs.isEmpty {
+            return CompositeLogitProcessor(
+                first: parameters.processor(),
+                second: JSONPrefixTokenProcessor(expectedTokenIDs: prefixTokenIDs)
+            )
+        }
+        let startTokenIDs = JSONStartTokenProcessor.startTokenIDs(tokenizer: tokenizer, rootStart: guidance.rootStart)
         guard !startTokenIDs.isEmpty else {
             return parameters.processor()
         }
@@ -517,6 +597,87 @@ struct CompositeLogitProcessor: LogitProcessor {
     }
 }
 
+struct JSONSchemaGuidance {
+    let rootStart: JSONRootStart
+    let requiredProperties: [String]
+
+    init(responseFormat: MLXVLMCore.JSONValue?) {
+        guard let schema = Self.schema(from: responseFormat) else {
+            self.rootStart = .either
+            self.requiredProperties = []
+            return
+        }
+        let type = schema["type"]?.stringValue?.lowercased()
+        self.rootStart = type == "array" ? .array : .object
+        self.requiredProperties = schema["required"]?.arrayValue?.compactMap(\.stringValue) ?? []
+    }
+
+    func prefixTokenIDs(tokenizer: Tokenizer) -> [Int]? {
+        guard rootStart == .object,
+              let firstRequired = requiredProperties.first,
+              !firstRequired.isEmpty
+        else {
+            return nil
+        }
+        let escapedKey = Self.escapedJSONString(firstRequired)
+        let candidates = [
+            "{\"\(escapedKey)\":",
+            "{ \"\(escapedKey)\":",
+        ]
+        return candidates.lazy
+            .map { tokenizer.encode(text: $0, addSpecialTokens: false) }
+            .first { !$0.isEmpty }
+    }
+
+    private static func schema(from responseFormat: MLXVLMCore.JSONValue?) -> [String: MLXVLMCore.JSONValue]? {
+        guard let object = responseFormat?.objectValue else {
+            return nil
+        }
+        if let schema = object["schema"]?.objectValue {
+            return schema
+        }
+        if let schema = object["json_schema"]?["schema"]?.objectValue {
+            return schema
+        }
+        return nil
+    }
+
+    private static func escapedJSONString(_ string: String) -> String {
+        var result = ""
+        for scalar in string.unicodeScalars {
+            switch scalar {
+            case "\"":
+                result += "\\\""
+            case "\\":
+                result += "\\\\"
+            case "\u{08}":
+                result += "\\b"
+            case "\u{0C}":
+                result += "\\f"
+            case "\n":
+                result += "\\n"
+            case "\r":
+                result += "\\r"
+            case "\t":
+                result += "\\t"
+            default:
+                if scalar.value < 0x20 {
+                    result += String(format: "\\u%04X", scalar.value)
+                } else {
+                    result.unicodeScalars.append(scalar)
+                }
+            }
+        }
+        return result
+    }
+}
+
+enum JSONRootStart: Equatable {
+    case object
+    case array
+    case either
+}
+
 struct JSONStartTokenProcessor: LogitProcessor {
     private let allowedTokenIDs: [Int]
     private var generatedTokenCount = 0
@@ -525,15 +686,24 @@ struct JSONStartTokenProcessor: LogitProcessor {
         self.allowedTokenIDs = allowedTokenIDs
     }
 
-    static func startTokenIDs(tokenizer: Tokenizer) -> [Int] {
+    static func startTokenIDs(tokenizer: Tokenizer, rootStart: JSONRootStart = .either) -> [Int] {
         var result: [Int] = []
-        for candidate in ["{", "[", " {", " ["] {
+        let candidates: [String]
+        switch rootStart {
+        case .object:
+            candidates = ["{", " {"]
+        case .array:
+            candidates = ["[", " ["]
+        case .either:
+            candidates = ["{", "[", " {", " ["]
+        }
+        for candidate in candidates {
             let ids = tokenizer.encode(text: candidate, addSpecialTokens: false)
             if ids.count == 1 {
                 result.append(ids[0])
             }
         }
-        for candidate in ["{", "["] {
+        for candidate in candidates.map({ $0.trimmingCharacters(in: .whitespaces) }) {
             if let id = tokenizer.convertTokenToId(candidate) {
                 result.append(id)
             }
@@ -548,8 +718,34 @@ struct JSONStartTokenProcessor: LogitProcessor {
         guard generatedTokenCount == 0, !allowedTokenIDs.isEmpty else {
             return logits
         }
-        var masked = MLXArray.zeros(logits.shape, dtype: logits.dtype) + MLXArray(-Float.infinity)
+        let masked = MLXArray.zeros(logits.shape, dtype: logits.dtype) + MLXArray(-Float.infinity)
         let indices = MLXArray(allowedTokenIDs).asType(.uint32)
+        masked[0..., indices] = logits[0..., indices]
+        return masked
+    }
+
+    mutating func didSample(token: MLXArray) {
+        generatedTokenCount += token.size
+    }
+}
+
+struct JSONPrefixTokenProcessor: LogitProcessor {
+    private let expectedTokenIDs: [Int]
+    private var generatedTokenCount = 0
+
+    init(expectedTokenIDs: [Int]) {
+        self.expectedTokenIDs = expectedTokenIDs
+    }
+
+    mutating func prompt(_ prompt: MLXArray) {}
+
+    func process(logits: MLXArray) -> MLXArray {
+        guard generatedTokenCount < expectedTokenIDs.count else {
+            return logits
+        }
+        let expectedTokenID = expectedTokenIDs[generatedTokenCount]
+        let masked = MLXArray.zeros(logits.shape, dtype: logits.dtype) + MLXArray(-Float.infinity)
+        let indices = MLXArray([expectedTokenID]).asType(.uint32)
         masked[0..., indices] = logits[0..., indices]
         return masked
     }
@@ -654,6 +850,21 @@ public enum MLXVLMUserInputBridge {
         if let responseMetadata = request.metadata.responseMetadata {
             context["metadata"] = try sendableValue(from: responseMetadata)
         }
+        if let n = request.metadata.n {
+            context["n"] = n
+        }
+        if let streamOptions = request.metadata.streamOptions {
+            context["stream_options"] = try sendableValue(from: streamOptions)
+        }
+        if let modalities = request.metadata.modalities {
+            context["modalities"] = try modalities.map { try sendableValue(from: $0) }
+        }
+        if let audio = request.metadata.audio {
+            context["audio"] = try sendableValue(from: audio)
+        }
+        if let prediction = request.metadata.prediction {
+            context["prediction"] = try sendableValue(from: prediction)
+        }
         if let previousResponseID = request.metadata.previousResponseID {
             context["previous_response_id"] = previousResponseID
         }
@@ -674,6 +885,15 @@ public enum MLXVLMUserInputBridge {
         }
         if let adapterPath = request.metadata.adapterPath {
             context["adapter_path"] = adapterPath
+        }
+        if let draftModel = request.metadata.draftModel {
+            context["draft_model"] = draftModel
+        }
+        if let draftKind = request.metadata.draftKind {
+            context["draft_kind"] = draftKind
+        }
+        if let draftBlockSize = request.metadata.draftBlockSize {
+            context["draft_block_size"] = draftBlockSize
         }
         if let resizeShape = request.metadata.resizeShape {
             context["resize_shape"] = resizeShape

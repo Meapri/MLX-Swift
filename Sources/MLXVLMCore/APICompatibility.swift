@@ -104,7 +104,10 @@ public struct OllamaGenerateRequest: Codable, Equatable, Sendable {
                 template: template,
                 suffix: suffix,
                 legacyContext: context,
-                rawOptions: options
+                rawOptions: options,
+                draftModel: options?.compatibleDraftModel,
+                draftKind: options?.compatibleDraftKind,
+                draftBlockSize: options?.compatibleDraftBlockSize
             ),
             stream: stream ?? false
         )
@@ -165,7 +168,10 @@ public struct OllamaChatRequest: Codable, Equatable, Sendable {
             metadata: GenerationRequestMetadata(
                 responseFormat: format,
                 tools: tools,
-                rawOptions: options
+                rawOptions: options,
+                draftModel: options?.compatibleDraftModel,
+                draftKind: options?.compatibleDraftKind,
+                draftBlockSize: options?.compatibleDraftBlockSize
             ),
             stream: stream ?? false
         )
@@ -194,10 +200,23 @@ public struct OpenAIChatCompletionRequest: Codable, Equatable, Sendable {
     public let topLogprobs: Int?
     public let resizeShape: CompatibleResizeShape?
     public let responseFormat: JSONValue?
+    public let n: Int?
     public let tools: [JSONValue]?
     public let toolChoice: JSONValue?
     public let adapterPath: String?
+    public let draftModel: String?
+    public let draftKind: String?
+    public let draftBlockSize: Int?
     public let user: String?
+    public let metadata: JSONValue?
+    public let parallelToolCalls: Bool?
+    public let store: Bool?
+    public let reasoning: JSONValue?
+    public let serviceTier: String?
+    public let streamOptions: JSONValue?
+    public let modalities: [JSONValue]?
+    public let audio: JSONValue?
+    public let prediction: JSONValue?
     public let stream: Bool?
 
     enum CodingKeys: String, CodingKey {
@@ -222,10 +241,23 @@ public struct OpenAIChatCompletionRequest: Codable, Equatable, Sendable {
         case topLogprobs = "top_logprobs"
         case resizeShape = "resize_shape"
         case responseFormat = "response_format"
+        case n
         case tools
         case toolChoice = "tool_choice"
         case adapterPath = "adapter_path"
+        case draftModel = "draft_model"
+        case draftKind = "draft_kind"
+        case draftBlockSize = "draft_block_size"
         case user
+        case metadata
+        case parallelToolCalls = "parallel_tool_calls"
+        case store
+        case reasoning
+        case serviceTier = "service_tier"
+        case streamOptions = "stream_options"
+        case modalities
+        case audio
+        case prediction
         case stream
     }
 
@@ -276,15 +308,200 @@ public struct OpenAIChatCompletionRequest: Codable, Equatable, Sendable {
                 tools: tools,
                 toolChoice: toolChoice,
                 adapterPath: adapterPath,
+                draftModel: draftModel,
+                draftKind: draftKind,
+                draftBlockSize: draftBlockSize,
                 logitBias: logitBias,
                 logprobs: logprobs,
                 topLogprobs: topLogprobs,
                 resizeShape: resizeShape?.values,
                 thinkingStartToken: thinkingStartToken,
-                user: user
+                user: user,
+                responseMetadata: metadata,
+                n: n,
+                streamOptions: streamOptions,
+                modalities: modalities,
+                audio: audio,
+                prediction: prediction,
+                parallelToolCalls: parallelToolCalls,
+                store: store,
+                serviceTier: serviceTier,
+                responseReasoning: reasoning
             ),
             stream: stream ?? false
         )
+    }
+}
+
+public struct OpenAICompletionRequest: Codable, Equatable, Sendable {
+    public let model: String
+    public let prompt: CompatibleCompletionPrompt?
+    public let suffix: String?
+    public let maxTokens: Int?
+    public let temperature: Double?
+    public let topP: Double?
+    public let topK: Int?
+    public let minP: Double?
+    public let stop: CompatibleStop?
+    public let seed: Int?
+    public let presencePenalty: Double?
+    public let frequencyPenalty: Double?
+    public let logitBias: JSONValue?
+    public let logprobs: Int?
+    public let echo: Bool?
+    public let n: Int?
+    public let bestOf: Int?
+    public let streamOptions: JSONValue?
+    public let user: String?
+    public let stream: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case model
+        case prompt
+        case suffix
+        case maxTokens = "max_tokens"
+        case temperature
+        case topP = "top_p"
+        case topK = "top_k"
+        case minP = "min_p"
+        case stop
+        case seed
+        case presencePenalty = "presence_penalty"
+        case frequencyPenalty = "frequency_penalty"
+        case logitBias = "logit_bias"
+        case logprobs
+        case echo
+        case n
+        case bestOf = "best_of"
+        case streamOptions = "stream_options"
+        case user
+        case stream
+    }
+
+    public func generationRequest(
+        defaultModel: String,
+        defaultParameters: GenerationParameters = GenerationParameters()
+    ) throws -> GenerationRequest {
+        guard let prompt else {
+            throw APICompatibilityError.missingPrompt
+        }
+        let promptText = prompt.textValue ?? ""
+        return GenerationRequest(
+            model: model.isEmpty ? defaultModel : model,
+            messages: [ChatMessage(role: .user, content: [.text(promptText)])],
+            parameters: GenerationParameters(
+                maxTokens: maxTokens ?? defaultParameters.maxTokens,
+                temperature: temperature ?? defaultParameters.temperature,
+                topP: topP ?? defaultParameters.topP,
+                topK: topK ?? defaultParameters.topK,
+                minP: minP ?? defaultParameters.minP,
+                typicalP: defaultParameters.typicalP,
+                tfsZ: defaultParameters.tfsZ,
+                seed: seed ?? defaultParameters.seed,
+                contextLength: defaultParameters.contextLength,
+                numKeep: defaultParameters.numKeep,
+                kvBits: defaultParameters.kvBits,
+                kvQuantizationScheme: defaultParameters.kvQuantizationScheme,
+                kvGroupSize: defaultParameters.kvGroupSize,
+                quantizedKVStart: defaultParameters.quantizedKVStart,
+                maxKVSize: defaultParameters.maxKVSize,
+                prefillStepSize: defaultParameters.prefillStepSize,
+                visionCacheSize: defaultParameters.visionCacheSize,
+                quantizeActivations: defaultParameters.quantizeActivations,
+                repetitionPenalty: defaultParameters.repetitionPenalty,
+                repeatLastN: defaultParameters.repeatLastN,
+                presencePenalty: presencePenalty ?? defaultParameters.presencePenalty,
+                frequencyPenalty: frequencyPenalty ?? defaultParameters.frequencyPenalty,
+                penalizeNewline: defaultParameters.penalizeNewline,
+                mirostat: defaultParameters.mirostat,
+                mirostatTau: defaultParameters.mirostatTau,
+                mirostatEta: defaultParameters.mirostatEta,
+                stopSequences: stop?.values ?? defaultParameters.stopSequences,
+                keepAlive: defaultParameters.keepAlive,
+                enableThinking: defaultParameters.enableThinking,
+                thinkingBudget: defaultParameters.thinkingBudget
+            ),
+            metadata: GenerationRequestMetadata(
+                rawPrompt: true,
+                suffix: suffix,
+                legacyContext: prompt.tokenIDs,
+                logitBias: logitBias,
+                logprobs: logprobs != nil,
+                topLogprobs: logprobs,
+                user: user,
+                responseMetadata: completionMetadata,
+                n: n,
+                streamOptions: streamOptions
+            ),
+            stream: stream ?? false
+        )
+    }
+
+    private var completionMetadata: JSONValue? {
+        var object: [String: JSONValue] = [:]
+        if let echo {
+            object["echo"] = .bool(echo)
+        }
+        if let bestOf {
+            object["best_of"] = .number(Double(bestOf))
+        }
+        return object.isEmpty ? nil : .object(object)
+    }
+}
+
+public enum CompatibleCompletionPrompt: Codable, Equatable, Sendable {
+    case string(String)
+    case strings([String])
+    case tokenIDs([Int])
+    case tokenIDBatches([[Int]])
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let value = try? container.decode(String.self) {
+            self = .string(value)
+        } else if let value = try? container.decode([String].self) {
+            self = .strings(value)
+        } else if let value = try? container.decode([Int].self) {
+            self = .tokenIDs(value)
+        } else {
+            self = .tokenIDBatches(try container.decode([[Int]].self))
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .string(let value):
+            try container.encode(value)
+        case .strings(let value):
+            try container.encode(value)
+        case .tokenIDs(let value):
+            try container.encode(value)
+        case .tokenIDBatches(let value):
+            try container.encode(value)
+        }
+    }
+
+    var textValue: String? {
+        switch self {
+        case .string(let value):
+            return value
+        case .strings(let value):
+            return value.first
+        case .tokenIDs, .tokenIDBatches:
+            return nil
+        }
+    }
+
+    var tokenIDs: [Int]? {
+        switch self {
+        case .tokenIDs(let value):
+            return value
+        case .tokenIDBatches(let value):
+            return value.first
+        case .string, .strings:
+            return nil
+        }
     }
 }
 
@@ -316,6 +533,9 @@ public struct OpenAIResponsesRequest: Codable, Equatable, Sendable {
     public let tools: [JSONValue]?
     public let toolChoice: JSONValue?
     public let adapterPath: String?
+    public let draftModel: String?
+    public let draftKind: String?
+    public let draftBlockSize: Int?
     public let user: String?
     public let metadata: JSONValue?
     public let previousResponseID: String?
@@ -325,6 +545,11 @@ public struct OpenAIResponsesRequest: Codable, Equatable, Sendable {
     public let store: Bool?
     public let reasoning: JSONValue?
     public let serviceTier: String?
+    public let n: Int?
+    public let streamOptions: JSONValue?
+    public let modalities: [JSONValue]?
+    public let audio: JSONValue?
+    public let prediction: JSONValue?
     public let stream: Bool?
 
     enum CodingKeys: String, CodingKey {
@@ -355,6 +580,9 @@ public struct OpenAIResponsesRequest: Codable, Equatable, Sendable {
         case tools
         case toolChoice = "tool_choice"
         case adapterPath = "adapter_path"
+        case draftModel = "draft_model"
+        case draftKind = "draft_kind"
+        case draftBlockSize = "draft_block_size"
         case user
         case metadata
         case previousResponseID = "previous_response_id"
@@ -364,6 +592,11 @@ public struct OpenAIResponsesRequest: Codable, Equatable, Sendable {
         case store
         case reasoning
         case serviceTier = "service_tier"
+        case n
+        case streamOptions = "stream_options"
+        case modalities
+        case audio
+        case prediction
         case stream
     }
 
@@ -419,6 +652,9 @@ public struct OpenAIResponsesRequest: Codable, Equatable, Sendable {
                 tools: tools,
                 toolChoice: toolChoice,
                 adapterPath: adapterPath,
+                draftModel: draftModel,
+                draftKind: draftKind,
+                draftBlockSize: draftBlockSize,
                 logitBias: logitBias,
                 logprobs: logprobs,
                 topLogprobs: topLogprobs,
@@ -428,6 +664,11 @@ public struct OpenAIResponsesRequest: Codable, Equatable, Sendable {
                 responseInstructions: instructions,
                 responseTruncation: truncation,
                 responseMetadata: metadata,
+                n: n,
+                streamOptions: streamOptions,
+                modalities: modalities,
+                audio: audio,
+                prediction: prediction,
                 previousResponseID: previousResponseID,
                 include: include,
                 parallelToolCalls: parallelToolCalls,
@@ -437,6 +678,20 @@ public struct OpenAIResponsesRequest: Codable, Equatable, Sendable {
             ),
             stream: stream ?? false
         )
+    }
+}
+
+private extension Dictionary where Key == String, Value == JSONValue {
+    var compatibleDraftModel: String? {
+        self["draft_model"]?.stringValue ?? self["draft-model"]?.stringValue
+    }
+
+    var compatibleDraftKind: String? {
+        self["draft_kind"]?.stringValue ?? self["draft-kind"]?.stringValue
+    }
+
+    var compatibleDraftBlockSize: Int? {
+        self["draft_block_size"]?.intValue ?? self["draft-block-size"]?.intValue
     }
 }
 

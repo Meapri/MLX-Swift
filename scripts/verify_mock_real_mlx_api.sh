@@ -56,7 +56,7 @@ public enum DType: String, Sendable {
     case float64
 }
 
-public final class MLXArray {
+public final class MLXArray: @unchecked Sendable {
     public let data: Data
     public let shape: [Int]
     public let dtype: DType
@@ -71,8 +71,29 @@ public final class MLXArray {
         self.init(Data(), [values.count], dtype: .int32)
     }
 
+    public convenience init(_ value: Float) {
+        self.init(Data(), [], dtype: .float32)
+    }
+
+    public var size: Int {
+        shape.reduce(1, *)
+    }
+
     public static func zeros(like other: MLXArray) -> MLXArray {
         MLXArray(Data(), other.shape, dtype: other.dtype)
+    }
+
+    public static func zeros(_ shape: [Int], dtype: DType = .float32) -> MLXArray {
+        MLXArray(Data(), shape, dtype: dtype)
+    }
+
+    public func asType(_ dtype: DType) -> MLXArray {
+        MLXArray(data, shape, dtype: dtype)
+    }
+
+    public subscript(_ rows: PartialRangeFrom<Int>, _ columns: MLXArray) -> MLXArray {
+        get { self }
+        set {}
     }
 
     public func eval() {}
@@ -86,6 +107,10 @@ public final class MLXArray {
     }
 }
 
+public func + (lhs: MLXArray, rhs: MLXArray) -> MLXArray {
+    lhs
+}
+
 public func stacked(_ arrays: [MLXArray]) -> MLXArray {
     let rowCount = arrays.count
     let columnCount = arrays.first?.shape.first ?? 0
@@ -96,6 +121,10 @@ infix operator .!=: ComparisonPrecedence
 
 public func .!= (lhs: MLXArray, rhs: Int) -> MLXArray {
     MLXArray(Data(), lhs.shape, dtype: .bool)
+}
+
+public enum MLXRandom {
+    public static func seed(_ value: UInt64) {}
 }
 SWIFT
 
@@ -116,7 +145,12 @@ let package = Package(
         .package(name: "MLXSwift", path: "../MLXSwift"),
     ],
     targets: [
-        .target(name: "MLXLMCommon"),
+        .target(
+            name: "MLXLMCommon",
+            dependencies: [
+                .product(name: "MLX", package: "MLXSwift"),
+            ]
+        ),
         .target(name: "MLXLLM", dependencies: ["MLXLMCommon"]),
         .target(name: "MLXVLM", dependencies: ["MLXLMCommon"]),
         .target(
@@ -131,14 +165,28 @@ let package = Package(
 SWIFT
 
 cat > "$MLX_SWIFT_LM_DIR/Sources/MLXLMCommon/MLXLMCommon.swift" <<'SWIFT'
+import CoreGraphics
 import Foundation
+import MLX
 
 public enum MLXLMCommonMockRuntime {
     public static let available = true
 }
 
+public struct LMInputText: Sendable {
+    public var tokens: MLXArray
+
+    public init(tokens: MLXArray = MLXArray([1])) {
+        self.tokens = tokens
+    }
+}
+
 public struct LMInput: Sendable {
-    public init() {}
+    public var text: LMInputText
+
+    public init(text: LMInputText = LMInputText()) {
+        self.text = text
+    }
 }
 
 public protocol Tokenizer: Sendable {
@@ -219,6 +267,61 @@ public enum Generation: Sendable {
     case toolCall(ToolCall)
 }
 
+public protocol LogitProcessor {
+    mutating func prompt(_ prompt: MLXArray)
+    func process(logits: MLXArray) -> MLXArray
+    mutating func didSample(token: MLXArray)
+}
+
+extension LogitProcessor {
+    public mutating func prompt(_ prompt: MLXArray) {}
+    public func process(logits: MLXArray) -> MLXArray { logits }
+    public mutating func didSample(token: MLXArray) {}
+}
+
+public struct MockSampler: Sendable {
+    public init() {}
+}
+
+public struct TokenIterator: Sendable {
+    public init(
+        input: LMInput,
+        model: MockModel,
+        processor: any LogitProcessor,
+        sampler: MockSampler,
+        prefillStepSize: Int,
+        maxTokens: Int?
+    ) throws {}
+}
+
+public func generateTask(
+    promptTokenCount: Int,
+    modelConfiguration: MockModelConfiguration,
+    tokenizer: any Tokenizer,
+    iterator: TokenIterator
+) -> (AsyncStream<Generation>, Task<Void, Never>?) {
+    let stream = AsyncStream<Generation> { continuation in
+        continuation.yield(.chunk("mock"))
+        continuation.yield(.info(GenerateCompletionInfo(promptTokenCount: promptTokenCount)))
+        continuation.finish()
+    }
+    return (stream, nil)
+}
+
+public func generate(
+    input: LMInput,
+    parameters: GenerateParameters,
+    context: ModelContext,
+    draftModel: MockModel,
+    numDraftTokens: Int
+) throws -> AsyncStream<Generation> {
+    AsyncStream { continuation in
+        continuation.yield(.chunk("mock"))
+        continuation.yield(.info(GenerateCompletionInfo()))
+        continuation.finish()
+    }
+}
+
 public enum Chat {
     public struct Message: Sendable {
         public var role: Role
@@ -259,6 +362,7 @@ public enum Chat {
 }
 
 public typealias ToolSpec = [String: any Sendable]
+public typealias Message = [String: any Sendable]
 
 public struct UserInput: Sendable {
     public enum Image: Sendable {
@@ -269,17 +373,121 @@ public struct UserInput: Sendable {
         case url(URL)
     }
 
-    public let chat: [Chat.Message]
-    public let tools: [ToolSpec]?
+    public struct Processing: Sendable {
+        public var resize: CGSize?
 
-    public init(chat: [Chat.Message], tools: [ToolSpec]? = nil) {
+        public init(resize: CGSize? = nil) {
+            self.resize = resize
+        }
+    }
+
+    public var chat: [Chat.Message]
+    public var messages: [Message]?
+    public var images: [Image]
+    public var videos: [Video]
+    public var processing: Processing
+    public var tools: [ToolSpec]?
+    public var additionalContext: [String: any Sendable]?
+
+    public init(
+        chat: [Chat.Message],
+        processing: Processing = Processing(),
+        tools: [ToolSpec]? = nil,
+        additionalContext: [String: any Sendable]? = nil
+    ) {
         self.chat = chat
+        self.messages = nil
+        self.images = []
+        self.videos = []
+        self.processing = processing
         self.tools = tools
+        self.additionalContext = additionalContext
+    }
+
+    public init(
+        messages: [Message],
+        images: [Image] = [],
+        videos: [Video] = [],
+        tools: [ToolSpec]? = nil,
+        additionalContext: [String: any Sendable]? = nil
+    ) {
+        self.chat = []
+        self.messages = messages
+        self.images = images
+        self.videos = videos
+        self.processing = Processing()
+        self.tools = tools
+        self.additionalContext = additionalContext
+    }
+}
+
+public struct MockModel: Sendable {
+    public init() {}
+}
+
+public struct MockModelConfiguration: Sendable {
+    public init() {}
+}
+
+public struct MockTokenizer: Tokenizer {
+    public init() {}
+
+    public func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+        if text.hasPrefix("{") {
+            return [123]
+        }
+        if text.hasPrefix("[") {
+            return [91]
+        }
+        return addSpecialTokens ? [1, 2] : [2]
+    }
+
+    public func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        "mock"
+    }
+
+    public func convertTokenToId(_ token: String) -> Int? {
+        switch token {
+        case "</s>": return 0
+        case "{": return 123
+        case "[": return 91
+        default: return nil
+        }
+    }
+
+    public func convertIdToToken(_ id: Int) -> String? {
+        id == 0 ? "</s>" : nil
+    }
+
+    public let bosToken: String? = "<s>"
+    public let eosToken: String? = "</s>"
+    public let unknownToken: String? = "<unk>"
+}
+
+public struct ModelContext: Sendable {
+    public var model: MockModel
+    public var configuration: MockModelConfiguration
+    public var tokenizer: any Tokenizer
+
+    public init(
+        model: MockModel = MockModel(),
+        configuration: MockModelConfiguration = MockModelConfiguration(),
+        tokenizer: any Tokenizer = MockTokenizer()
+    ) {
+        self.model = model
+        self.configuration = configuration
+        self.tokenizer = tokenizer
     }
 }
 
 public final class ModelContainer: Sendable {
+    private let context = ModelContext()
+
     public init() {}
+
+    public var tokenizer: any Tokenizer {
+        context.tokenizer
+    }
 
     public func prepare(input: consuming sending UserInput) async throws -> sending LMInput {
         LMInput()
@@ -294,6 +502,23 @@ public final class ModelContainer: Sendable {
             continuation.yield(.info(GenerateCompletionInfo()))
             continuation.finish()
         }
+    }
+
+    public func perform<R: Sendable>(
+        _ action: @Sendable (ModelContext) async throws -> sending R
+    ) async rethrows -> sending R {
+        try await action(context)
+    }
+
+    public func perform<Value, R: Sendable>(
+        nonSendable value: consuming Value,
+        _ action: (ModelContext, consuming Value) async throws -> sending R
+    ) async rethrows -> sending R {
+        try await action(context, value)
+    }
+
+    public func update(_ action: @Sendable (ModelContext) -> Void) async {
+        action(context)
     }
 }
 
@@ -350,12 +575,60 @@ public struct GenerateParameters: Sendable {
         self.frequencyContextSize = frequencyContextSize
         self.prefillStepSize = prefillStepSize
     }
+
+    public func processor() -> (any LogitProcessor)? {
+        nil
+    }
+
+    public func sampler() -> MockSampler {
+        MockSampler()
+    }
+}
+
+public protocol ModelAdapter: Sendable {
+    func load(into model: MockModel) throws
+    func unload(from model: MockModel)
+}
+
+public struct MockModelAdapter: ModelAdapter {
+    public init() {}
+    public func load(into model: MockModel) throws {}
+    public func unload(from model: MockModel) {}
+}
+
+public struct ModelAdapterRegistry: Sendable {
+    public init() {}
+
+    public func createAdapter(directory: URL, adapterType: String) throws -> any ModelAdapter {
+        MockModelAdapter()
+    }
+}
+
+public final class ModelAdapterFactory: Sendable {
+    public static let shared = ModelAdapterFactory()
+    public let registry = ModelAdapterRegistry()
+    public init() {}
 }
 SWIFT
 
 cat > "$MLX_SWIFT_LM_DIR/Sources/MLXLLM/MLXLLM.swift" <<'SWIFT'
+import Foundation
+import MLXLMCommon
+
 public enum MLXLLMMockRuntime {
     public static let available = true
+}
+
+public final class LLMModelFactory: Sendable {
+    public static let shared = LLMModelFactory()
+    public init() {}
+
+    public func loadContainer<T>(
+        from directory: URL,
+        using tokenizerLoader: T
+    ) async throws -> MLXLMCommon.ModelContainer {
+        MLXLMCommon.ModelContainer()
+    }
 }
 SWIFT
 

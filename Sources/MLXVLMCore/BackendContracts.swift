@@ -116,6 +116,61 @@ public protocol EmbeddingBackend: Sendable {
     func embed(_ request: EmbeddingRequest) async throws -> CompletedEmbedding
 }
 
+public struct BackendTokenizationResult: Codable, Equatable, Sendable {
+    public let supported: Bool
+    public let backend: String
+    public let tokens: [String]
+    public let tokenIDs: [Int]
+    public let text: String
+
+    public init(
+        supported: Bool = true,
+        backend: String,
+        tokens: [String],
+        tokenIDs: [Int],
+        text: String
+    ) {
+        self.supported = supported
+        self.backend = backend
+        self.tokens = tokens
+        self.tokenIDs = tokenIDs
+        self.text = text
+    }
+}
+
+public struct BackendDetokenizationResult: Codable, Equatable, Sendable {
+    public let supported: Bool
+    public let backend: String
+    public let text: String
+    public let tokenIDs: [Int]
+    public let tokens: [String]
+    public let unknownTokenIDs: [Int]
+
+    public init(
+        supported: Bool = true,
+        backend: String,
+        text: String,
+        tokenIDs: [Int],
+        tokens: [String],
+        unknownTokenIDs: [Int] = []
+    ) {
+        self.supported = supported
+        self.backend = backend
+        self.text = text
+        self.tokenIDs = tokenIDs
+        self.tokens = tokens
+        self.unknownTokenIDs = unknownTokenIDs
+    }
+}
+
+public protocol TokenizationBackend: Sendable {
+    var descriptor: ModelDescriptor { get }
+    var status: BackendStatus { get }
+
+    func tokenize(text: String, addSpecialTokens: Bool) async throws -> BackendTokenizationResult
+    func detokenize(tokenIDs: [Int], skipSpecialTokens: Bool) async throws -> BackendDetokenizationResult
+}
+
 public struct CompatibilityModelContainer: ModelContainer {
     public let context: ModelLoadContext
 

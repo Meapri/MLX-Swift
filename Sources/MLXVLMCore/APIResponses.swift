@@ -226,6 +226,97 @@ public struct OpenAIChatChoice: Codable, Equatable, Sendable {
     }
 }
 
+public struct OpenAICompletionResponse: Codable, Equatable, Sendable {
+    public let id: String
+    public let object: String
+    public let created: Int
+    public let model: String
+    public let choices: [OpenAICompletionChoice]
+    public let usage: OpenAIUsage
+
+    public init(
+        result: CompletedGeneration,
+        id: String = "cmpl-swift",
+        created: Int = Int(Date().timeIntervalSince1970)
+    ) {
+        self.id = id
+        self.object = "text_completion"
+        self.created = created
+        self.model = result.model
+        self.choices = [
+            OpenAICompletionChoice(
+                text: result.text,
+                index: 0,
+                finishReason: result.finishReason
+            )
+        ]
+        self.usage = OpenAIUsage(
+            promptTokens: result.usage.promptTokens,
+            completionTokens: result.usage.completionTokens,
+            totalTokens: result.usage.totalTokens
+        )
+    }
+}
+
+public struct OpenAICompletionChoice: Codable, Equatable, Sendable {
+    public let text: String
+    public let index: Int
+    public let logprobs: JSONValue?
+    public let finishReason: String?
+
+    enum CodingKeys: String, CodingKey {
+        case text
+        case index
+        case logprobs
+        case finishReason = "finish_reason"
+    }
+
+    public init(text: String, index: Int, logprobs: JSONValue? = nil, finishReason: String?) {
+        self.text = text
+        self.index = index
+        self.logprobs = logprobs
+        self.finishReason = finishReason
+    }
+}
+
+public struct OpenAICompletionStreamResponse: Codable, Equatable, Sendable {
+    public let id: String
+    public let object: String
+    public let created: Int
+    public let model: String
+    public let choices: [OpenAICompletionChoice]
+    public let usage: OpenAIUsage?
+
+    public init(
+        model: String,
+        chunk: GenerationChunk,
+        id: String = "cmpl-swift",
+        created: Int = Int(Date().timeIntervalSince1970),
+        usage: GenerationUsage? = nil
+    ) {
+        self.id = id
+        self.object = "text_completion.chunk"
+        self.created = created
+        self.model = model
+        self.choices = [
+            OpenAICompletionChoice(
+                text: chunk.text,
+                index: 0,
+                finishReason: chunk.isFinished ? (chunk.finishReason ?? "stop") : nil
+            )
+        ]
+        self.usage = chunk.isFinished
+            ? usage.map {
+                OpenAIUsage(
+                    promptTokens: $0.promptTokens,
+                    completionTokens: $0.completionTokens,
+                    totalTokens: $0.totalTokens
+                )
+            }
+            : nil
+    }
+}
+
 public struct OpenAIChatCompletionStreamResponse: Codable, Equatable, Sendable {
     public let id: String
     public let object: String
@@ -918,6 +1009,7 @@ public enum OpenAIResponsesStreamFramer {
 public enum GenerationResponseAPI: String, Codable, Equatable, Sendable {
     case ollamaGenerate = "ollama-generate"
     case ollamaChat = "ollama-chat"
+    case openAICompletions = "openai-completions"
     case openAIChat = "openai-chat"
     case openAIResponses = "openai-responses"
 }
@@ -1029,6 +1121,8 @@ public enum GenerationAPIResponseRenderer {
             body = encode(OllamaGenerateResponse(result: result))
         case .ollamaChat:
             body = encode(OllamaChatResponse(result: result))
+        case .openAICompletions:
+            body = encode(OpenAICompletionResponse(result: result))
         case .openAIChat:
             body = encode(OpenAIChatCompletionResponse(result: result))
         case .openAIResponses:
@@ -1067,6 +1161,17 @@ public enum GenerationAPIResponseRenderer {
                     OllamaChatStreamChunk(model: model, chunk: $0, usage: $0.isFinished ? usage : nil)
                 )
             }
+        case .openAICompletions:
+            contentType = "text/event-stream"
+            frames = chunks.map {
+                ResponseStreamFramer.serverSentEvent(
+                    OpenAICompletionStreamResponse(
+                        model: model,
+                        chunk: $0,
+                        usage: $0.isFinished ? usage : nil
+                    )
+                )
+            } + [ResponseStreamFramer.doneServerSentEvent()]
         case .openAIChat:
             contentType = "text/event-stream"
             frames = openAIChatStreamChunks(chunks).map {

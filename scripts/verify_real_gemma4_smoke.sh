@@ -65,6 +65,15 @@ echo "$HEALTH" | grep -q '"backend_ready":true'
 echo "$HEALTH" | grep -q '"backend":"mlx-swift-vlm"'
 echo "$HEALTH" | grep -q '"embedding_backend_ready":false'
 
+TOKENIZE_RESPONSE="$(
+  curl -fsS -m 30 "http://127.0.0.1:$PORT/v1/tokenize" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"gemma4","text":"Hello","add_special_tokens":true}'
+)"
+echo "$TOKENIZE_RESPONSE" | grep -q '"supported":true'
+echo "$TOKENIZE_RESPONSE" | grep -q '"backend":"mlx-swift-vlm"'
+echo "$TOKENIZE_RESPONSE" | grep -q '"token_ids":\['
+
 CHAT_RESPONSE="$(
   curl -fsS -m 60 "http://127.0.0.1:$PORT/v1/chat/completions" \
     -H 'Content-Type: application/json' \

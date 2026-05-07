@@ -395,6 +395,9 @@ public struct GenerationRequestMetadata: Codable, Equatable, Sendable {
     public let toolChoice: JSONValue?
     public let rawOptions: [String: JSONValue]?
     public let adapterPath: String?
+    public let draftModel: String?
+    public let draftKind: String?
+    public let draftBlockSize: Int?
     public let logitBias: JSONValue?
     public let logprobs: Bool?
     public let topLogprobs: Int?
@@ -404,6 +407,11 @@ public struct GenerationRequestMetadata: Codable, Equatable, Sendable {
     public let responseInstructions: String?
     public let responseTruncation: String?
     public let responseMetadata: JSONValue?
+    public let n: Int?
+    public let streamOptions: JSONValue?
+    public let modalities: [JSONValue]?
+    public let audio: JSONValue?
+    public let prediction: JSONValue?
     public let previousResponseID: String?
     public let include: [JSONValue]?
     public let parallelToolCalls: Bool?
@@ -422,6 +430,9 @@ public struct GenerationRequestMetadata: Codable, Equatable, Sendable {
         toolChoice: JSONValue? = nil,
         rawOptions: [String: JSONValue]? = nil,
         adapterPath: String? = nil,
+        draftModel: String? = nil,
+        draftKind: String? = nil,
+        draftBlockSize: Int? = nil,
         logitBias: JSONValue? = nil,
         logprobs: Bool? = nil,
         topLogprobs: Int? = nil,
@@ -431,6 +442,11 @@ public struct GenerationRequestMetadata: Codable, Equatable, Sendable {
         responseInstructions: String? = nil,
         responseTruncation: String? = nil,
         responseMetadata: JSONValue? = nil,
+        n: Int? = nil,
+        streamOptions: JSONValue? = nil,
+        modalities: [JSONValue]? = nil,
+        audio: JSONValue? = nil,
+        prediction: JSONValue? = nil,
         previousResponseID: String? = nil,
         include: [JSONValue]? = nil,
         parallelToolCalls: Bool? = nil,
@@ -448,6 +464,9 @@ public struct GenerationRequestMetadata: Codable, Equatable, Sendable {
         self.toolChoice = toolChoice
         self.rawOptions = rawOptions
         self.adapterPath = adapterPath
+        self.draftModel = draftModel
+        self.draftKind = draftKind
+        self.draftBlockSize = draftBlockSize
         self.logitBias = logitBias
         self.logprobs = logprobs
         self.topLogprobs = topLogprobs
@@ -457,6 +476,11 @@ public struct GenerationRequestMetadata: Codable, Equatable, Sendable {
         self.responseInstructions = responseInstructions
         self.responseTruncation = responseTruncation
         self.responseMetadata = responseMetadata
+        self.n = n
+        self.streamOptions = streamOptions
+        self.modalities = modalities
+        self.audio = audio
+        self.prediction = prediction
         self.previousResponseID = previousResponseID
         self.include = include
         self.parallelToolCalls = parallelToolCalls

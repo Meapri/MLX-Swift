@@ -704,6 +704,15 @@ struct MLXVLMCli {
             let defaultParameters = generationDefaults(from: arguments)
             let defaultAdapterPath = optionalValue(for: "--adapter-path", in: arguments)
             let defaultThinkingStartToken = optionalValue(for: "--thinking-start-token", in: arguments)
+            let defaultDraftModel = optionalValue(for: "--draft-model", in: arguments) ??
+                ProcessInfo.processInfo.environment["MLX_VLM_DRAFT_MODEL"]
+            let defaultDraftKind = optionalValue(for: "--draft-kind", in: arguments) ??
+                ProcessInfo.processInfo.environment["MLX_VLM_DRAFT_KIND"]
+            let defaultDraftBlockSize = Int(
+                optionalValue(for: "--draft-block-size", in: arguments) ??
+                    ProcessInfo.processInfo.environment["MLX_VLM_DRAFT_BLOCK_SIZE"] ??
+                    ""
+            )
             let topLogprobsK = Int(
                 optionalValue(for: "--top-logprobs-k", in: arguments) ??
                     ProcessInfo.processInfo.environment["TOP_LOGPROBS_K"] ??
@@ -723,6 +732,9 @@ struct MLXVLMCli {
                 defaultParameters: defaultParameters,
                 defaultAdapterPath: defaultAdapterPath,
                 defaultThinkingStartToken: defaultThinkingStartToken,
+                defaultDraftModel: defaultDraftModel,
+                defaultDraftKind: defaultDraftKind,
+                defaultDraftBlockSize: defaultDraftBlockSize,
                 topLogprobsK: topLogprobsK
             )
             try server.start()
@@ -883,7 +895,8 @@ struct MLXVLMCli {
           mlx-vlm-swift render-generation-response --api openai-chat --model m --text ok [--stream true] [--chunk o]
           mlx-vlm-swift render-generation-chunks --api openai-chat --model m --prompt-tokens 4 --chunk 1:o [--stream true]
           mlx-vlm-swift self-test
-          mlx-vlm-swift serve --model /path/to/mlx-model-or-hf-id [--use-latest] [--host 127.0.0.1] [--port 11434] [--adapter-path /path/to/adapter] [--max-tokens 512] [--temperature 0.0] [--top-p 1.0] [--top-k 0] [--min-p 0.0] [--seed 0] [--context-length 4096] [--kv-bits 8] [--kv-quant-scheme uniform] [--kv-group-size 64] [--quantized-kv-start 0] [--max-kv-size 4096] [--prefill-step-size 512] [--keep-alive 5m] [--enable-thinking true] [--thinking-budget 1024] [--thinking-start-token <think>] [--top-logprobs-k 20]
+          server routes include /tokenize, /v1/tokenize, /api/tokenize, /detokenize, /v1/detokenize, /api/detokenize
+          mlx-vlm-swift serve --model /path/to/mlx-model-or-hf-id [--use-latest] [--host 127.0.0.1] [--port 11434] [--adapter-path /path/to/adapter] [--draft-model /path/to/draft-or-hf-id] [--draft-kind dflash|mtp] [--draft-block-size 4] [--max-tokens 512] [--temperature 0.0] [--top-p 1.0] [--top-k 0] [--min-p 0.0] [--seed 0] [--context-length 4096] [--kv-bits 8] [--kv-quant-scheme uniform] [--kv-group-size 64] [--quantized-kv-start 0] [--max-kv-size 4096] [--prefill-step-size 512] [--keep-alive 5m] [--enable-thinking true] [--thinking-budget 1024] [--thinking-start-token <think>] [--top-logprobs-k 20]
         """)
     }
 }
@@ -962,6 +975,10 @@ private func normalizedGenerationRequest(
     case "openai-chat":
         return try JSONDecoder()
             .decode(OpenAIChatCompletionRequest.self, from: data)
+            .generationRequest(defaultModel: "default", defaultParameters: defaultParameters)
+    case "openai-completions":
+        return try JSONDecoder()
+            .decode(OpenAICompletionRequest.self, from: data)
             .generationRequest(defaultModel: "default", defaultParameters: defaultParameters)
     case "openai-responses":
         return try JSONDecoder()
@@ -1260,6 +1277,9 @@ final class CompatibilityServer: @unchecked Sendable {
     private let defaultParameters: GenerationParameters
     private let defaultAdapterPath: String?
     private let defaultThinkingStartToken: String?
+    private let defaultDraftModel: String?
+    private let defaultDraftKind: String?
+    private let defaultDraftBlockSize: Int?
     private let topLogprobsK: Int?
     private let deepDiagnostics: Bool
     private let queue = DispatchQueue(label: "mlx-vlm-swift.compatibility-server")
@@ -1275,6 +1295,9 @@ final class CompatibilityServer: @unchecked Sendable {
         defaultParameters: GenerationParameters = GenerationParameters(),
         defaultAdapterPath: String? = nil,
         defaultThinkingStartToken: String? = nil,
+        defaultDraftModel: String? = nil,
+        defaultDraftKind: String? = nil,
+        defaultDraftBlockSize: Int? = nil,
         topLogprobsK: Int? = nil
     ) {
         self.descriptor = descriptor
@@ -1283,6 +1306,9 @@ final class CompatibilityServer: @unchecked Sendable {
         self.defaultParameters = defaultParameters
         self.defaultAdapterPath = defaultAdapterPath?.isEmpty == false ? defaultAdapterPath : nil
         self.defaultThinkingStartToken = defaultThinkingStartToken?.isEmpty == false ? defaultThinkingStartToken : nil
+        self.defaultDraftModel = defaultDraftModel?.isEmpty == false ? defaultDraftModel : nil
+        self.defaultDraftKind = defaultDraftKind?.isEmpty == false ? defaultDraftKind : nil
+        self.defaultDraftBlockSize = defaultDraftBlockSize
         self.topLogprobsK = topLogprobsK
         self.deepDiagnostics = ProcessInfo.processInfo.environment["MLXVLM_SERVER_DEEP_DIAGNOSTICS"] == "1"
     }
@@ -1337,7 +1363,10 @@ final class CompatibilityServer: @unchecked Sendable {
         let thinkingStartToken = defaultThinkingStartToken ?? "request"
         let topLogprobs = topLogprobsK.map(String.init) ?? "request"
         let adapter = defaultAdapterPath ?? "request"
-        print("Default generation parameters: max_tokens=\(defaultParameters.maxTokens), temperature=\(defaultParameters.temperature), top_p=\(defaultParameters.topP), top_k=\(defaultParameters.topK), min_p=\(minP), seed=\(defaultParameters.seed), context_length=\(contextLength), kv_bits=\(kvBits), kv_quant_scheme=\(kvScheme), kv_group_size=\(kvGroupSize), quantized_kv_start=\(quantizedKVStart), prefill_step_size=\(prefillStepSize), keep_alive=\(keepAlive), enable_thinking=\(enableThinking), thinking_budget=\(thinkingBudget), thinking_start_token=\(thinkingStartToken), adapter_path=\(adapter), top_logprobs_k=\(topLogprobs)")
+        let draftModel = defaultDraftModel ?? "request"
+        let draftKind = defaultDraftKind ?? "request"
+        let draftBlockSize = defaultDraftBlockSize.map(String.init) ?? "request"
+        print("Default generation parameters: max_tokens=\(defaultParameters.maxTokens), temperature=\(defaultParameters.temperature), top_p=\(defaultParameters.topP), top_k=\(defaultParameters.topK), min_p=\(minP), seed=\(defaultParameters.seed), context_length=\(contextLength), kv_bits=\(kvBits), kv_quant_scheme=\(kvScheme), kv_group_size=\(kvGroupSize), quantized_kv_start=\(quantizedKVStart), prefill_step_size=\(prefillStepSize), keep_alive=\(keepAlive), enable_thinking=\(enableThinking), thinking_budget=\(thinkingBudget), thinking_start_token=\(thinkingStartToken), adapter_path=\(adapter), draft_model=\(draftModel), draft_kind=\(draftKind), draft_block_size=\(draftBlockSize), top_logprobs_k=\(topLogprobs)")
 
         if MLXBackendFactory.availability().canCreateBackend {
             print("Loading MLX Swift generation backend...")
@@ -1444,6 +1473,9 @@ final class CompatibilityServer: @unchecked Sendable {
                 return (request.applyingServerDefaults(
                     adapterPath: defaultAdapterPath,
                     thinkingStartToken: defaultThinkingStartToken,
+                    draftModel: defaultDraftModel,
+                    draftKind: defaultDraftKind,
+                    draftBlockSize: defaultDraftBlockSize,
                     topLogprobsK: topLogprobsK,
                     tenantID: tenantID
                 ), .ollamaGenerate)
@@ -1460,9 +1492,31 @@ final class CompatibilityServer: @unchecked Sendable {
                 return (request.applyingServerDefaults(
                     adapterPath: defaultAdapterPath,
                     thinkingStartToken: defaultThinkingStartToken,
+                    draftModel: defaultDraftModel,
+                    draftKind: defaultDraftKind,
+                    draftBlockSize: defaultDraftBlockSize,
                     topLogprobsK: topLogprobsK,
                     tenantID: tenantID
                 ), .ollamaChat)
+            case "/completion", "/completions", "/v1/completions":
+                let decoded = try JSONDecoder().decode(OpenAICompletionRequest.self, from: data)
+                let request = try decoded.generationRequest(
+                    defaultModel: descriptor.id,
+                    defaultParameters: defaultParameters
+                )
+                guard request.stream else {
+                    return nil
+                }
+                residency.markLoaded()
+                return (request.applyingServerDefaults(
+                    adapterPath: defaultAdapterPath,
+                    thinkingStartToken: defaultThinkingStartToken,
+                    draftModel: defaultDraftModel,
+                    draftKind: defaultDraftKind,
+                    draftBlockSize: defaultDraftBlockSize,
+                    topLogprobsK: topLogprobsK,
+                    tenantID: tenantID
+                ), .openAICompletions)
             case "/generate", "/chat/completions", "/v1/chat/completions":
                 let decoded = try JSONDecoder().decode(OpenAIChatCompletionRequest.self, from: data)
                 let request = try decoded.generationRequest(
@@ -1476,6 +1530,9 @@ final class CompatibilityServer: @unchecked Sendable {
                 return (request.applyingServerDefaults(
                     adapterPath: defaultAdapterPath,
                     thinkingStartToken: defaultThinkingStartToken,
+                    draftModel: defaultDraftModel,
+                    draftKind: defaultDraftKind,
+                    draftBlockSize: defaultDraftBlockSize,
                     topLogprobsK: topLogprobsK,
                     tenantID: tenantID
                 ), .openAIChat)
@@ -1492,6 +1549,9 @@ final class CompatibilityServer: @unchecked Sendable {
                 return (request.applyingServerDefaults(
                     adapterPath: defaultAdapterPath,
                     thinkingStartToken: defaultThinkingStartToken,
+                    draftModel: defaultDraftModel,
+                    draftKind: defaultDraftKind,
+                    draftBlockSize: defaultDraftBlockSize,
                     topLogprobsK: topLogprobsK,
                     tenantID: tenantID
                 ), .openAIResponses)
@@ -1512,7 +1572,7 @@ final class CompatibilityServer: @unchecked Sendable {
         let contentType: String = switch api {
         case .ollamaGenerate, .ollamaChat:
             "application/x-ndjson"
-        case .openAIChat, .openAIResponses:
+        case .openAICompletions, .openAIChat, .openAIResponses:
             "text/event-stream"
         }
         let header = streamingHTTPHeader(status: "200 OK", contentType: contentType)
@@ -1611,7 +1671,7 @@ final class CompatibilityServer: @unchecked Sendable {
             }
         }
 
-        if api == .openAIChat {
+        if api == .openAICompletions || api == .openAIChat {
             writeData(Data(ResponseStreamFramer.doneServerSentEvent().utf8), to: clientSocket)
         }
     }
@@ -1632,6 +1692,10 @@ final class CompatibilityServer: @unchecked Sendable {
         case .ollamaChat:
             frame = ResponseStreamFramer.jsonLine(
                 OllamaChatStreamChunk(model: model, chunk: chunk, usage: usage)
+            )
+        case .openAICompletions:
+            frame = ResponseStreamFramer.serverSentEvent(
+                OpenAICompletionStreamResponse(model: model, chunk: chunk, usage: usage)
             )
         case .openAIChat:
             frame = ResponseStreamFramer.serverSentEvent(
@@ -1794,6 +1858,10 @@ final class CompatibilityServer: @unchecked Sendable {
             return openAIModelResponse(for: modelPath)
         case "/api/show":
             return parseOllamaShowRequest(from: request)
+        case "/tokenize", "/v1/tokenize", "/api/tokenize":
+            return parseTokenizeRequest(from: request)
+        case "/detokenize", "/v1/detokenize", "/api/detokenize":
+            return parseDetokenizeRequest(from: request)
         case "/unload":
             return encodedResponse(pythonUnloadResponse())
         case "/api/unload":
@@ -1814,6 +1882,8 @@ final class CompatibilityServer: @unchecked Sendable {
             return parseOllamaGenerateRequest(from: request)
         case "/api/chat":
             return parseOllamaChatRequest(from: request)
+        case "/completion", "/completions", "/v1/completions":
+            return parseOpenAICompletionRequest(from: request)
         case "/generate", "/chat/completions", "/v1/chat/completions":
             return parseOpenAIChatRequest(from: request)
         case "/responses", "/v1/responses":
@@ -1892,6 +1962,172 @@ final class CompatibilityServer: @unchecked Sendable {
         }
     }
 
+    private func parseTokenizeRequest(from request: String) -> Data {
+        guard let object = decodedJSONObjectBody(from: request) else {
+            return jsonResponse(["parse_error": "empty or invalid request body"], status: "400 Bad Request")
+        }
+        let requestedModel = object["model"]?.stringValue
+        guard let text = object["prompt"]?.stringValue ??
+            object["text"]?.stringValue ??
+            object["input"]?.stringValue
+        else {
+            return jsonResponse(["parse_error": "tokenize request is missing prompt/text/input"], status: "400 Bad Request")
+        }
+        let addSpecialTokens = object["add_special_tokens"]?.boolValue ??
+            object["add_special"]?.boolValue ??
+            true
+        if let tokenizerBackend = generationBackend as? any TokenizationBackend {
+            do {
+                let result = try waitForAsync {
+                    try await tokenizerBackend.tokenize(text: text, addSpecialTokens: addSpecialTokens)
+                }
+                return jsonResponse([
+                    "model": descriptor.id,
+                    "tokens": result.tokens,
+                    "token_ids": result.tokenIDs,
+                    "ids": result.tokenIDs,
+                    "count": result.tokenIDs.count,
+                    "supported": result.supported,
+                    "backend": result.backend,
+                    "text": result.text,
+                    "requested_model": requestedModel ?? descriptor.id,
+                    "error": "",
+                ])
+            } catch {
+                return jsonResponse(
+                    [
+                        "error": String(describing: error),
+                        "model": descriptor.id,
+                        "backend": tokenizerBackend.status.activeBackend,
+                    ],
+                    status: "500 Internal Server Error"
+                )
+            }
+        }
+        guard let tokenizer = simpleTokenizerForLoadedModel() else {
+            return jsonResponse(
+                [
+                    "error": "tokenizer sidecar files are unavailable or unsupported",
+                    "model": descriptor.id,
+                    "backend": currentBackendStatus.activeBackend,
+                ],
+                status: "400 Bad Request"
+            )
+        }
+        let result = tokenizer.tokenize(text)
+        return jsonResponse([
+            "model": descriptor.id,
+            "tokens": result.tokens,
+            "token_ids": result.tokenIDs,
+            "ids": result.tokenIDs,
+            "count": result.tokenIDs.count,
+            "supported": result.supported,
+            "required_backend": result.requiredBackend,
+            "requested_model": requestedModel ?? descriptor.id,
+            "unknown_tokens": result.unknownTokens,
+            "error": result.error ?? "",
+        ])
+    }
+
+    private func parseDetokenizeRequest(from request: String) -> Data {
+        guard let object = decodedJSONObjectBody(from: request) else {
+            return jsonResponse(["parse_error": "empty or invalid request body"], status: "400 Bad Request")
+        }
+        let requestedModel = object["model"]?.stringValue
+        guard let tokenIDs = object["tokens"]?.arrayValue?.compactMap(\.intValue) ??
+            object["ids"]?.arrayValue?.compactMap(\.intValue) ??
+            object["input_ids"]?.arrayValue?.compactMap(\.intValue)
+        else {
+            return jsonResponse(["parse_error": "detokenize request is missing tokens/ids/input_ids"], status: "400 Bad Request")
+        }
+        let skipSpecial = object["skip_special_tokens"]?.boolValue ??
+            object["skip_special"]?.boolValue ??
+            true
+        if let tokenizerBackend = generationBackend as? any TokenizationBackend {
+            do {
+                let result = try waitForAsync {
+                    try await tokenizerBackend.detokenize(tokenIDs: tokenIDs, skipSpecialTokens: skipSpecial)
+                }
+                return jsonResponse([
+                    "model": descriptor.id,
+                    "text": result.text,
+                    "tokens": result.tokenIDs,
+                    "token_ids": result.tokenIDs,
+                    "token_texts": result.tokens,
+                    "supported": result.supported,
+                    "backend": result.backend,
+                    "requested_model": requestedModel ?? descriptor.id,
+                    "unknown_token_ids": result.unknownTokenIDs,
+                    "error": "",
+                ])
+            } catch {
+                return jsonResponse(
+                    [
+                        "error": String(describing: error),
+                        "model": descriptor.id,
+                        "backend": tokenizerBackend.status.activeBackend,
+                    ],
+                    status: "500 Internal Server Error"
+                )
+            }
+        }
+        guard let tokenizer = simpleTokenizerForLoadedModel() else {
+            return jsonResponse(
+                [
+                    "error": "tokenizer sidecar files are unavailable or unsupported",
+                    "model": descriptor.id,
+                    "backend": currentBackendStatus.activeBackend,
+                ],
+                status: "400 Bad Request"
+            )
+        }
+        let result = tokenizer.detokenize(tokenIDs, skipSpecialTokens: skipSpecial)
+        return jsonResponse([
+            "model": descriptor.id,
+            "text": result.text,
+            "tokens": result.tokenIDs,
+            "token_ids": result.tokenIDs,
+            "supported": result.supported,
+            "required_backend": result.requiredBackend,
+            "requested_model": requestedModel ?? descriptor.id,
+            "unknown_token_ids": result.unknownTokenIDs,
+            "error": result.error ?? "",
+        ])
+    }
+
+    private func decodedJSONObjectBody(from request: String) -> [String: JSONValue]? {
+        guard let body = httpBody(from: request), !body.isEmpty,
+              let json = try? JSONDecoder().decode(JSONValue.self, from: Data(body.utf8))
+        else {
+            return nil
+        }
+        return json.objectValue
+    }
+
+    private func simpleTokenizerForLoadedModel() -> SimpleTokenizer? {
+        guard let catalog = TokenizerCatalogBuilder().catalog(for: descriptor),
+              catalog.error == nil
+        else {
+            return nil
+        }
+        let plan = TokenizerImplementationPlanner().plan(descriptor: descriptor, catalog: catalog)
+        return SimpleTokenizer(catalog: catalog, plan: plan)
+    }
+
+    private func modelNotFoundResponse(_ requestedModel: String) -> Data {
+        jsonResponse(
+            [
+                "error": [
+                    "message": "Model '\(requestedModel)' was not found.",
+                    "type": "invalid_request_error",
+                    "param": "model",
+                    "code": "model_not_found",
+                ]
+            ],
+            status: "404 Not Found"
+        )
+    }
+
     private func parseOllamaGenerateRequest(from request: String) -> Data {
         guard let body = httpBody(from: request), !body.isEmpty else {
             return jsonResponse(["parse_error": "empty request body"], status: "400 Bad Request")
@@ -1908,6 +2144,9 @@ final class CompatibilityServer: @unchecked Sendable {
             ).applyingServerDefaults(
                 adapterPath: defaultAdapterPath,
                 thinkingStartToken: defaultThinkingStartToken,
+                draftModel: defaultDraftModel,
+                draftKind: defaultDraftKind,
+                draftBlockSize: defaultDraftBlockSize,
                 topLogprobsK: topLogprobsK,
                 tenantID: tenantID(from: request)
             )
@@ -1962,6 +2201,15 @@ final class CompatibilityServer: @unchecked Sendable {
 
     private func parseOpenAIChatRequest(from request: String) -> Data {
         parseGenerationRequest(from: request, decode: OpenAIChatCompletionRequest.self, api: .openAIChat) {
+            try $0.generationRequest(
+                defaultModel: descriptor.id,
+                defaultParameters: defaultParameters
+            )
+        }
+    }
+
+    private func parseOpenAICompletionRequest(from request: String) -> Data {
+        parseGenerationRequest(from: request, decode: OpenAICompletionRequest.self, api: .openAICompletions) {
             try $0.generationRequest(
                 defaultModel: descriptor.id,
                 defaultParameters: defaultParameters
@@ -2063,6 +2311,9 @@ final class CompatibilityServer: @unchecked Sendable {
             let normalized = try normalize(decoded).applyingServerDefaults(
                 adapterPath: defaultAdapterPath,
                 thinkingStartToken: defaultThinkingStartToken,
+                draftModel: defaultDraftModel,
+                draftKind: defaultDraftKind,
+                draftBlockSize: defaultDraftBlockSize,
                 topLogprobsK: topLogprobsK,
                 tenantID: tenantID(from: request)
             )
@@ -2256,11 +2507,17 @@ private extension GenerationRequest {
     func applyingServerDefaults(
         adapterPath: String?,
         thinkingStartToken: String?,
+        draftModel: String? = nil,
+        draftKind: String? = nil,
+        draftBlockSize: Int? = nil,
         topLogprobsK: Int? = nil,
         tenantID: String? = nil
     ) -> GenerationRequest {
         let effectiveAdapterPath = metadata.adapterPath ?? adapterPath
         let effectiveThinkingStartToken = metadata.thinkingStartToken ?? thinkingStartToken
+        let effectiveDraftModel = metadata.draftModel ?? draftModel
+        let effectiveDraftKind = metadata.draftKind ?? draftKind
+        let effectiveDraftBlockSize = metadata.draftBlockSize ?? draftBlockSize
         let effectiveTopLogprobs = metadata.topLogprobs.map { requested in
             guard let topLogprobsK else {
                 return requested
@@ -2270,6 +2527,9 @@ private extension GenerationRequest {
         let effectiveTenantID = metadata.tenantID ?? tenantID
         guard effectiveAdapterPath != metadata.adapterPath ||
             effectiveThinkingStartToken != metadata.thinkingStartToken ||
+            effectiveDraftModel != metadata.draftModel ||
+            effectiveDraftKind != metadata.draftKind ||
+            effectiveDraftBlockSize != metadata.draftBlockSize ||
             effectiveTopLogprobs != metadata.topLogprobs ||
             effectiveTenantID != metadata.tenantID
         else {
@@ -2290,6 +2550,9 @@ private extension GenerationRequest {
                 toolChoice: metadata.toolChoice,
                 rawOptions: metadata.rawOptions,
                 adapterPath: effectiveAdapterPath,
+                draftModel: effectiveDraftModel,
+                draftKind: effectiveDraftKind,
+                draftBlockSize: effectiveDraftBlockSize,
                 logitBias: metadata.logitBias,
                 logprobs: metadata.logprobs,
                 topLogprobs: effectiveTopLogprobs,
@@ -2299,6 +2562,11 @@ private extension GenerationRequest {
                 responseInstructions: metadata.responseInstructions,
                 responseTruncation: metadata.responseTruncation,
                 responseMetadata: metadata.responseMetadata,
+                n: metadata.n,
+                streamOptions: metadata.streamOptions,
+                modalities: metadata.modalities,
+                audio: metadata.audio,
+                prediction: metadata.prediction,
                 previousResponseID: metadata.previousResponseID,
                 include: metadata.include,
                 parallelToolCalls: metadata.parallelToolCalls,
@@ -3367,10 +3635,39 @@ enum SelfTest {
         )
         precondition(pythonUnload.unloaded?.adapterName == "/tmp/adapter")
 
+        let completionRequest = try JSONDecoder().decode(
+            OpenAICompletionRequest.self,
+            from: Data("""
+            {"model":"qwen","prompt":"legacy prompt","suffix":" done","max_tokens":7,"temperature":0.2,"top_p":0.9,"top_k":5,"min_p":0.01,"seed":17,"presence_penalty":0.2,"frequency_penalty":0.3,"stop":["END"],"logit_bias":{"4":-3},"logprobs":2,"echo":true,"n":1,"best_of":1,"stream_options":{"include_usage":true},"user":"completion-user","stream":true}
+            """.utf8)
+        )
+        let normalizedCompletion = try completionRequest.generationRequest(defaultModel: "default")
+        precondition(normalizedCompletion.model == "qwen")
+        precondition(normalizedCompletion.stream)
+        precondition(normalizedCompletion.parameters.maxTokens == 7)
+        precondition(normalizedCompletion.parameters.temperature == 0.2)
+        precondition(normalizedCompletion.parameters.topP == 0.9)
+        precondition(normalizedCompletion.parameters.topK == 5)
+        precondition(normalizedCompletion.parameters.minP == 0.01)
+        precondition(normalizedCompletion.parameters.seed == 17)
+        precondition(normalizedCompletion.parameters.presencePenalty == 0.2)
+        precondition(normalizedCompletion.parameters.frequencyPenalty == 0.3)
+        precondition(normalizedCompletion.parameters.stopSequences == ["END"])
+        precondition(normalizedCompletion.metadata.rawPrompt)
+        precondition(normalizedCompletion.metadata.suffix == " done")
+        precondition(normalizedCompletion.metadata.logitBias?["4"]?.intValue == -3)
+        precondition(normalizedCompletion.metadata.logprobs == true)
+        precondition(normalizedCompletion.metadata.topLogprobs == 2)
+        precondition(normalizedCompletion.metadata.responseMetadata?["echo"]?.boolValue == true)
+        precondition(normalizedCompletion.metadata.responseMetadata?["best_of"]?.intValue == 1)
+        precondition(normalizedCompletion.metadata.n == 1)
+        precondition(normalizedCompletion.metadata.streamOptions?["include_usage"]?.boolValue == true)
+        precondition(normalizedCompletion.metadata.user == "completion-user")
+
         let openAIChat = try JSONDecoder().decode(
             OpenAIChatCompletionRequest.self,
             from: Data("""
-            {"model":"qwen","messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"file:///tmp/a.png"}},{"type":"video","video":"file:///tmp/a.mp4","min_pixels":200704,"max_pixels":1003520,"nframes":8,"min_frames":4,"max_frames":16}]}],"max_completion_tokens":8,"temperature":0.5,"top_p":0.8,"top_k":11,"min_p":0.02,"seed":9,"repetition_penalty":1.2,"presence_penalty":0.1,"frequency_penalty":0.4,"stop":"END","logit_bias":{"1":-2},"enable_thinking":true,"thinking_budget":64,"thinking_start_token":"<think>","logprobs":true,"top_logprobs":3,"resize_shape":[224,336],"adapter_path":"/tmp/adapter","user":"user-1","response_format":{"type":"json_object"},"tools":[{"type":"function","function":{"name":"describe"}}],"tool_choice":{"type":"function","function":{"name":"describe"}}}
+            {"model":"qwen","messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"file:///tmp/a.png"}},{"type":"video","video":"file:///tmp/a.mp4","min_pixels":200704,"max_pixels":1003520,"nframes":8,"min_frames":4,"max_frames":16}]}],"max_completion_tokens":8,"temperature":0.5,"top_p":0.8,"top_k":11,"min_p":0.02,"seed":9,"repetition_penalty":1.2,"presence_penalty":0.1,"frequency_penalty":0.4,"stop":"END","logit_bias":{"1":-2},"enable_thinking":true,"thinking_budget":64,"thinking_start_token":"<think>","logprobs":true,"top_logprobs":3,"resize_shape":[224,336],"adapter_path":"/tmp/adapter","draft_model":"/tmp/draft","draft_kind":"dflash","draft_block_size":4,"n":1,"stream_options":{"include_usage":true},"modalities":["text"],"audio":{"voice":"alloy","format":"wav"},"prediction":{"type":"content","content":"cached"},"metadata":{"trace":"chat"},"parallel_tool_calls":true,"store":false,"reasoning":{"effort":"medium"},"service_tier":"default","user":"user-1","response_format":{"type":"json_object"},"tools":[{"type":"function","function":{"name":"describe"}}],"tool_choice":{"type":"function","function":{"name":"describe"}}}
             """.utf8)
         )
         let normalizedChat = try openAIChat.generationRequest(defaultModel: "default")
@@ -3407,17 +3704,49 @@ enum SelfTest {
         precondition(normalizedChat.metadata.topLogprobs == 3)
         precondition(normalizedChat.metadata.resizeShape == [224, 336])
         precondition(normalizedChat.metadata.adapterPath == "/tmp/adapter")
+        precondition(normalizedChat.metadata.draftModel == "/tmp/draft")
+        precondition(normalizedChat.metadata.draftKind == "dflash")
+        precondition(normalizedChat.metadata.draftBlockSize == 4)
+        precondition(normalizedChat.metadata.n == 1)
+        precondition(normalizedChat.metadata.streamOptions?["include_usage"]?.boolValue == true)
+        precondition(normalizedChat.metadata.modalities == [.string("text")])
+        precondition(normalizedChat.metadata.audio?["voice"]?.stringValue == "alloy")
+        precondition(normalizedChat.metadata.prediction?["content"]?.stringValue == "cached")
+        precondition(normalizedChat.metadata.responseMetadata?["trace"]?.stringValue == "chat")
+        precondition(normalizedChat.metadata.parallelToolCalls == true)
+        precondition(normalizedChat.metadata.store == false)
+        precondition(normalizedChat.metadata.serviceTier == "default")
+        precondition(normalizedChat.metadata.responseReasoning?["effort"]?.stringValue == "medium")
         precondition(normalizedChat.metadata.user == "user-1")
         let serverDefaultedChat = normalizedChat.applyingServerDefaults(
             adapterPath: "/tmp/default-adapter",
             thinkingStartToken: "<server-think>",
+            draftModel: "/tmp/default-draft",
+            draftKind: "mtp",
+            draftBlockSize: 8,
             topLogprobsK: 2,
             tenantID: "tenant-a"
         )
         precondition(serverDefaultedChat.metadata.adapterPath == "/tmp/adapter")
         precondition(serverDefaultedChat.metadata.thinkingStartToken == "<think>")
+        precondition(serverDefaultedChat.metadata.draftModel == "/tmp/draft")
+        precondition(serverDefaultedChat.metadata.draftKind == "dflash")
+        precondition(serverDefaultedChat.metadata.draftBlockSize == 4)
         precondition(serverDefaultedChat.metadata.topLogprobs == 2)
         precondition(serverDefaultedChat.metadata.tenantID == "tenant-a")
+        let defaultedDraftOnly = GenerationRequest(
+            model: "qwen",
+            messages: [ChatMessage(role: .user, content: [.text("hi")])]
+        ).applyingServerDefaults(
+            adapterPath: nil,
+            thinkingStartToken: nil,
+            draftModel: "/tmp/default-draft",
+            draftKind: "mtp",
+            draftBlockSize: 8
+        )
+        precondition(defaultedDraftOnly.metadata.draftModel == "/tmp/default-draft")
+        precondition(defaultedDraftOnly.metadata.draftKind == "mtp")
+        precondition(defaultedDraftOnly.metadata.draftBlockSize == 8)
         let chatResponseFormatPlan = ResponseFormatPlanner().plan(
             metadata: normalizedChat.metadata,
             stream: normalizedChat.stream
@@ -3553,7 +3882,7 @@ enum SelfTest {
         let responsesRequest = try JSONDecoder().decode(
             OpenAIResponsesRequest.self,
             from: Data("""
-            {"model":"qwen","instructions":"be concise","input":[{"role":"user","content":[{"type":"input_text","text":"hi"},{"type":"input_image","image_url":"data:image/png;base64,AAECAw=="}]}],"max_output_tokens":6,"temperature":0.4,"top_p":0.7,"top_k":12,"min_p":0.03,"seed":11,"repetition_penalty":1.15,"presence_penalty":0.21,"frequency_penalty":0.31,"stop":["DONE"],"logit_bias":{"2":-1},"enable_thinking":false,"thinking_budget":32,"thinking_start_token":"<reason>","logprobs":true,"top_logprobs":2,"resize_shape":[320],"adapter_path":"/tmp/resp-adapter","user":"resp-user","metadata":{"trace":"abc"},"previous_response_id":"resp-prev","include":["reasoning.encrypted_content"],"parallel_tool_calls":false,"truncation":"auto","store":false,"reasoning":{"effort":"low"},"service_tier":"default","text":{"format":{"type":"json_schema","name":"answer"}},"tools":[{"type":"function","name":"search"}],"tool_choice":"auto"}
+            {"model":"qwen","instructions":"be concise","input":[{"role":"user","content":[{"type":"input_text","text":"hi"},{"type":"input_image","image_url":"data:image/png;base64,AAECAw=="}]}],"max_output_tokens":6,"temperature":0.4,"top_p":0.7,"top_k":12,"min_p":0.03,"seed":11,"repetition_penalty":1.15,"presence_penalty":0.21,"frequency_penalty":0.31,"stop":["DONE"],"logit_bias":{"2":-1},"enable_thinking":false,"thinking_budget":32,"thinking_start_token":"<reason>","logprobs":true,"top_logprobs":2,"resize_shape":[320],"adapter_path":"/tmp/resp-adapter","draft_model":"/tmp/resp-draft","draft_kind":"mtp","draft_block_size":3,"n":1,"stream_options":{"include_usage":true},"modalities":["text","audio"],"audio":{"voice":"verse","format":"mp3"},"prediction":{"type":"content","content":"seed"},"user":"resp-user","metadata":{"trace":"abc"},"previous_response_id":"resp-prev","include":["reasoning.encrypted_content"],"parallel_tool_calls":false,"truncation":"auto","store":false,"reasoning":{"effort":"low"},"service_tier":"default","text":{"format":{"type":"json_schema","name":"answer"}},"tools":[{"type":"function","name":"search"}],"tool_choice":"auto"}
             """.utf8)
         )
         let normalizedResponses = try responsesRequest.generationRequest(defaultModel: "default")
@@ -3581,6 +3910,14 @@ enum SelfTest {
         precondition(normalizedResponses.metadata.tools?.first?["name"]?.stringValue == "search")
         precondition(normalizedResponses.metadata.toolChoice == .string("auto"))
         precondition(normalizedResponses.metadata.adapterPath == "/tmp/resp-adapter")
+        precondition(normalizedResponses.metadata.draftModel == "/tmp/resp-draft")
+        precondition(normalizedResponses.metadata.draftKind == "mtp")
+        precondition(normalizedResponses.metadata.draftBlockSize == 3)
+        precondition(normalizedResponses.metadata.n == 1)
+        precondition(normalizedResponses.metadata.streamOptions?["include_usage"]?.boolValue == true)
+        precondition(normalizedResponses.metadata.modalities == [.string("text"), .string("audio")])
+        precondition(normalizedResponses.metadata.audio?["voice"]?.stringValue == "verse")
+        precondition(normalizedResponses.metadata.prediction?["content"]?.stringValue == "seed")
         precondition(normalizedResponses.metadata.logitBias?["2"]?.intValue == -1)
         precondition(normalizedResponses.metadata.logprobs == true)
         precondition(normalizedResponses.metadata.topLogprobs == 2)
@@ -3960,6 +4297,17 @@ enum SelfTest {
         let openAIResponseJSON = String(decoding: openAIResponseData, as: UTF8.self)
         precondition(openAIResponseJSON.contains("\"object\":\"chat.completion\""))
         precondition(openAIResponseJSON.contains("\"completion_tokens\":1"))
+        let completionResponseJSON = String(
+            decoding: try JSONEncoder().encode(OpenAICompletionResponse(result: result, id: "cmpl-test", created: 0)),
+            as: UTF8.self
+        )
+        precondition(completionResponseJSON.contains("\"object\":\"text_completion\""))
+        precondition(completionResponseJSON.contains("\"text\":\"ok\""))
+        let completionStreamJSON = ResponseStreamFramer.serverSentEvent(
+            OpenAICompletionStreamResponse(model: "qwen", chunk: finalChunk, created: 0, usage: result.usage)
+        )
+        precondition(completionStreamJSON.contains("\"object\":\"text_completion.chunk\""))
+        precondition(completionStreamJSON.contains("\"completion_tokens\":1"))
         let logprob = GenerationTokenLogprob(
             token: "o",
             logprob: -0.25,
