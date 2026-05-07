@@ -57,7 +57,7 @@ With a local Gemma4 MLX model:
 SWIFT_BUILD_JOBS=18 scripts/verify_real_gemma4_smoke.sh
 ```
 
-With a local Qwen2.5-VL MLX model for video input:
+With a local Qwen2.5-VL MLX model for tokenizer, image, video, and streaming input:
 
 ```bash
 MLXVLM_REAL_QWEN25VL_MODEL=/path/to/qwen2.5-vl \

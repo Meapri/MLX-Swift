@@ -29,6 +29,7 @@ SCRATCH_DIR="${MLXVLM_REAL_QWEN25VL_SCRATCH:-${TMPDIR:-/tmp}/mlx-vlm-swift-real-
 READY_TIMEOUT_SECONDS="${MLXVLM_REAL_QWEN25VL_READY_TIMEOUT:-1800}"
 BUILD_DIR="$TMP_ROOT/source"
 SERVER_LOG="$TMP_ROOT/server.log"
+IMAGE="$TMP_ROOT/green.png"
 VIDEO="$TMP_ROOT/green.mp4"
 mkdir -p "$BUILD_DIR"
 
@@ -50,6 +51,11 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+ffmpeg -v error \
+  -f lavfi -i color=c=green:s=64x64 \
+  -frames:v 1 \
+  "$IMAGE"
 
 ffmpeg -v error \
   -f lavfi -i color=c=green:s=64x64:d=1:r=2 \
@@ -94,6 +100,26 @@ HEALTH="$(curl -fsS -m 5 "http://127.0.0.1:$PORT/health")"
 echo "$HEALTH" | grep -q '"backend_ready":true'
 echo "$HEALTH" | grep -q '"backend":"mlx-swift-vlm"'
 
+TOKENIZE_RESPONSE="$(
+  curl -fsS -m 30 "http://127.0.0.1:$PORT/v1/tokenize" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"qwen25vl","text":"Hello","add_special_tokens":true}'
+)"
+echo "$TOKENIZE_RESPONSE" | grep -q '"supported":true'
+echo "$TOKENIZE_RESPONSE" | grep -q '"backend":"mlx-swift-vlm"'
+echo "$TOKENIZE_RESPONSE" | grep -q '"token_ids":\['
+
+GREEN_PNG="$(base64 < "$IMAGE" | tr -d '\n')"
+OPENAI_IMAGE_RESPONSE="$(
+  curl -fsS -m 180 "http://127.0.0.1:$PORT/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"qwen25vl\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Answer with one short sentence about this image.\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,$GREEN_PNG\"}}]}],\"max_tokens\":16,\"temperature\":0}"
+)"
+echo "$OPENAI_IMAGE_RESPONSE" | grep -q '"choices"'
+echo "$OPENAI_IMAGE_RESPONSE" | grep -q '"content":"'
+echo "$OPENAI_IMAGE_RESPONSE" | grep -q '"prompt_tokens"'
+echo "$OPENAI_IMAGE_RESPONSE" | grep -q '"completion_tokens"'
+
 OPENAI_VIDEO_RESPONSE="$(
   curl -fsS -m 180 "http://127.0.0.1:$PORT/v1/chat/completions" \
     -H 'Content-Type: application/json' \
@@ -103,5 +129,20 @@ echo "$OPENAI_VIDEO_RESPONSE" | grep -q '"choices"'
 echo "$OPENAI_VIDEO_RESPONSE" | grep -q '"content":"'
 echo "$OPENAI_VIDEO_RESPONSE" | grep -q '"prompt_tokens"'
 echo "$OPENAI_VIDEO_RESPONSE" | grep -q '"completion_tokens"'
+
+OPENAI_STREAM="$(mktemp)"
+curl -sS -m 180 -i "http://127.0.0.1:$PORT/v1/chat/completions" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen25vl","messages":[{"role":"user","content":"Say hi in one short sentence."}],"max_tokens":16,"temperature":0,"stream":true}' > "$OPENAI_STREAM"
+grep -qi '^Content-Type: text/event-stream' "$OPENAI_STREAM"
+if grep -qi '^Content-Length:' "$OPENAI_STREAM"; then
+  echo "OpenAI Qwen2.5-VL stream unexpectedly included Content-Length"
+  cat "$OPENAI_STREAM"
+  exit 1
+fi
+grep -q 'data: ' "$OPENAI_STREAM"
+grep -q 'data: \[DONE\]' "$OPENAI_STREAM"
+grep -q '"prompt_tokens"' "$OPENAI_STREAM"
+grep -q '"completion_tokens"' "$OPENAI_STREAM"
 
 echo "real Qwen2.5-VL video smoke passed"
