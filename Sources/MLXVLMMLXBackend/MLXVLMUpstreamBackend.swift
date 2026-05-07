@@ -556,6 +556,18 @@ struct MLXVLMStructuredLogitProcessorFactory {
         }
         let tokenizer = await container.tokenizer
         let guidance = JSONSchemaGuidance(responseFormat: request.metadata.responseFormat)
+        if let literal = guidance.forcedJSONLiteral(),
+           let forcedTokenIDs = guidance.forcedLiteralTokenIDs(tokenizer: tokenizer, literal: literal),
+           !forcedTokenIDs.isEmpty
+        {
+            return CompositeLogitProcessor(
+                first: parameters.processor(),
+                second: JSONForcedTokenProcessor(
+                    expectedTokenIDs: forcedTokenIDs,
+                    terminalTokenID: tokenizer.eosTokenId
+                )
+            )
+        }
         if let prefixTokenIDs = guidance.prefixTokenIDs(tokenizer: tokenizer), !prefixTokenIDs.isEmpty {
             return CompositeLogitProcessor(
                 first: parameters.processor(),
@@ -600,16 +612,19 @@ struct CompositeLogitProcessor: LogitProcessor {
 struct JSONSchemaGuidance {
     let rootStart: JSONRootStart
     let requiredProperties: [String]
+    let schema: [String: MLXVLMCore.JSONValue]?
 
     init(responseFormat: MLXVLMCore.JSONValue?) {
         guard let schema = Self.schema(from: responseFormat) else {
             self.rootStart = .either
             self.requiredProperties = []
+            self.schema = nil
             return
         }
         let type = schema["type"]?.stringValue?.lowercased()
         self.rootStart = type == "array" ? .array : .object
         self.requiredProperties = schema["required"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        self.schema = schema
     }
 
     func prefixTokenIDs(tokenizer: Tokenizer) -> [Int]? {
@@ -629,6 +644,25 @@ struct JSONSchemaGuidance {
             .first { !$0.isEmpty }
     }
 
+    func forcedJSONLiteral() -> String? {
+        guard let schema,
+              let value = Self.forcedValue(schema: schema)
+        else {
+            return nil
+        }
+        return Self.literal(value)
+    }
+
+    func forcedLiteralTokenIDs(tokenizer: Tokenizer, literal: String) -> [Int]? {
+        let tokenIDs = tokenizer.encode(text: literal, addSpecialTokens: false)
+        guard !tokenIDs.isEmpty,
+              tokenizer.decode(tokenIds: tokenIDs, skipSpecialTokens: true) == literal
+        else {
+            return nil
+        }
+        return tokenIDs
+    }
+
     private static func schema(from responseFormat: MLXVLMCore.JSONValue?) -> [String: MLXVLMCore.JSONValue]? {
         guard let object = responseFormat?.objectValue else {
             return nil
@@ -640,6 +674,87 @@ struct JSONSchemaGuidance {
             return schema
         }
         return nil
+    }
+
+    private static func forcedValue(schema: [String: MLXVLMCore.JSONValue]) -> MLXVLMCore.JSONValue? {
+        if let value = schema["const"] {
+            return value
+        }
+        if let enumValues = schema["enum"]?.arrayValue, enumValues.count == 1 {
+            return enumValues[0]
+        }
+        if let value = schema["default"] {
+            return value
+        }
+
+        let types = schemaTypes(schema)
+        if types.contains("object") || schema["properties"] != nil {
+            let required = schema["required"]?.arrayValue?.compactMap(\.stringValue) ?? []
+            guard !required.isEmpty,
+                  let properties = schema["properties"]?.objectValue
+            else {
+                return nil
+            }
+            var object: [String: MLXVLMCore.JSONValue] = [:]
+            for key in required {
+                guard let propertySchema = properties[key]?.objectValue,
+                      let propertyValue = forcedValue(schema: propertySchema)
+                else {
+                    return nil
+                }
+                object[key] = propertyValue
+            }
+            return .object(object)
+        }
+
+        if types.contains("array") {
+            if schema["maxItems"]?.intValue == 0 {
+                return .array([])
+            }
+            guard let minItems = schema["minItems"]?.intValue,
+                  minItems > 0,
+                  schema["maxItems"]?.intValue == minItems,
+                  let itemSchema = schema["items"]?.objectValue,
+                  let itemValue = forcedValue(schema: itemSchema)
+            else {
+                return nil
+            }
+            return .array(Array(repeating: itemValue, count: minItems))
+        }
+
+        return nil
+    }
+
+    private static func schemaTypes(_ schema: [String: MLXVLMCore.JSONValue]) -> [String] {
+        if let type = schema["type"]?.stringValue?.lowercased() {
+            return [type]
+        }
+        return schema["type"]?.arrayValue?.compactMap { $0.stringValue?.lowercased() } ?? []
+    }
+
+    private static func literal(_ value: MLXVLMCore.JSONValue) -> String {
+        switch value {
+        case .object(let object):
+            let keys = object.keys.sorted()
+            return "{\(keys.map { "\"\(escapedJSONString($0))\":\(literal(object[$0] ?? .null))" }.joined(separator: ","))}"
+        case .array(let values):
+            return "[\(values.map(literal).joined(separator: ","))]"
+        case .string(let string):
+            return "\"\(escapedJSONString(string))\""
+        case .number(let number):
+            if number.isFinite,
+               number.rounded(.towardZero) == number,
+               number >= Double(Int64.min),
+               number <= Double(Int64.max)
+            {
+                return String(Int64(number))
+            }
+            return String(number)
+        case .bool(let bool):
+            return bool ? "true" : "false"
+        case .null:
+            return "null"
+        }
     }
 
     private static func escapedJSONString(_ string: String) -> String {
@@ -720,6 +835,39 @@ struct JSONStartTokenProcessor: LogitProcessor {
         }
         let masked = MLXArray.zeros(logits.shape, dtype: logits.dtype) + MLXArray(-Float.infinity)
         let indices = MLXArray(allowedTokenIDs).asType(.uint32)
+        masked[0..., indices] = logits[0..., indices]
+        return masked
+    }
+
+    mutating func didSample(token: MLXArray) {
+        generatedTokenCount += token.size
+    }
+}
+
+struct JSONForcedTokenProcessor: LogitProcessor {
+    private let expectedTokenIDs: [Int]
+    private let terminalTokenID: Int?
+    private var generatedTokenCount = 0
+
+    init(expectedTokenIDs: [Int], terminalTokenID: Int?) {
+        self.expectedTokenIDs = expectedTokenIDs
+        self.terminalTokenID = terminalTokenID
+    }
+
+    mutating func prompt(_ prompt: MLXArray) {}
+
+    func process(logits: MLXArray) -> MLXArray {
+        let tokenID: Int?
+        if generatedTokenCount < expectedTokenIDs.count {
+            tokenID = expectedTokenIDs[generatedTokenCount]
+        } else {
+            tokenID = terminalTokenID
+        }
+        guard let tokenID else {
+            return logits
+        }
+        let masked = MLXArray.zeros(logits.shape, dtype: logits.dtype) + MLXArray(-Float.infinity)
+        let indices = MLXArray([tokenID]).asType(.uint32)
         masked[0..., indices] = logits[0..., indices]
         return masked
     }
