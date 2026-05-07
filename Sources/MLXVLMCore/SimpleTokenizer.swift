@@ -65,6 +65,8 @@ public struct SimpleTokenizer: Sendable {
     public func tokenize(_ text: String) -> SimpleTokenizerResult {
         guard plan.requiredBackend == "tokenizers-json-wordlevel" ||
             plan.requiredBackend == "tokenizers-json-wordpiece" ||
+            plan.requiredBackend == "tokenizers-json-unigram" ||
+            plan.requiredBackend == "sentencepiece-unigram-or-tokenizers-json" ||
             plan.requiredBackend == "tokenizers-json-bpe" ||
             plan.requiredBackend == "bpe-vocab-json-merges-txt" ||
             plan.requiredBackend == "wordpiece-vocab-txt" ||
@@ -77,7 +79,7 @@ public struct SimpleTokenizer: Sendable {
                 tokenIDs: [],
                 unknownTokens: [],
                 usedUnknownTokenID: nil,
-                error: "Simple Swift tokenizer currently supports WordLevel tokenizer.json, WordPiece tokenizer.json/vocab.txt, tokenizer.tiktoken exact-piece catalogs, tokenizer.json ByteLevel BPE, and vocab.json plus merges.txt ByteLevel BPE."
+                error: "Simple Swift tokenizer currently supports WordLevel tokenizer.json, WordPiece tokenizer.json/vocab.txt, tokenizer.json Unigram greedy fallback, tokenizer.tiktoken exact-piece catalogs, tokenizer.json ByteLevel BPE, and vocab.json plus merges.txt ByteLevel BPE."
             )
         }
 
@@ -86,6 +88,8 @@ public struct SimpleTokenizer: Sendable {
             result = tokenizeByteLevelBPE(text)
         } else if isWordPieceBackend {
             result = tokenizeWordPiece(text)
+        } else if isUnigramBackend {
+            result = tokenizeUnigram(text)
         } else if isTiktokenBackend {
             result = tokenizeGreedyKnownText(text)
         } else {
@@ -106,6 +110,8 @@ public struct SimpleTokenizer: Sendable {
     public func detokenize(_ tokenIDs: [Int], skipSpecialTokens: Bool = false) -> SimpleDetokenizerResult {
         guard plan.requiredBackend == "tokenizers-json-wordlevel" ||
             plan.requiredBackend == "tokenizers-json-wordpiece" ||
+            plan.requiredBackend == "tokenizers-json-unigram" ||
+            plan.requiredBackend == "sentencepiece-unigram-or-tokenizers-json" ||
             plan.requiredBackend == "tokenizers-json-bpe" ||
             plan.requiredBackend == "bpe-vocab-json-merges-txt" ||
             plan.requiredBackend == "wordpiece-vocab-txt" ||
@@ -117,7 +123,7 @@ public struct SimpleTokenizer: Sendable {
                 text: "",
                 tokenIDs: tokenIDs,
                 unknownTokenIDs: [],
-                error: "Simple Swift detokenizer currently supports WordLevel tokenizer.json, WordPiece tokenizer.json/vocab.txt, tokenizer.tiktoken exact-piece catalogs, tokenizer.json ByteLevel BPE, and vocab.json plus merges.txt ByteLevel BPE."
+                error: "Simple Swift detokenizer currently supports WordLevel tokenizer.json, WordPiece tokenizer.json/vocab.txt, tokenizer.json Unigram greedy fallback, tokenizer.tiktoken exact-piece catalogs, tokenizer.json ByteLevel BPE, and vocab.json plus merges.txt ByteLevel BPE."
             )
         }
 
@@ -138,6 +144,8 @@ public struct SimpleTokenizer: Sendable {
             decodeByteLevel(tokenTexts.joined())
         } else if isWordPieceBackend {
             detokenizeWordPiece(tokenTexts)
+        } else if isUnigramBackend {
+            detokenizeUnigram(tokenTexts)
         } else if isTiktokenBackend {
             tokenTexts.joined()
         } else {
@@ -162,6 +170,11 @@ public struct SimpleTokenizer: Sendable {
     private var isWordPieceBackend: Bool {
         plan.requiredBackend == "tokenizers-json-wordpiece" ||
             plan.requiredBackend == "wordpiece-vocab-txt"
+    }
+
+    private var isUnigramBackend: Bool {
+        plan.requiredBackend == "tokenizers-json-unigram" ||
+            plan.requiredBackend == "sentencepiece-unigram-or-tokenizers-json"
     }
 
     private var isTiktokenBackend: Bool {
@@ -437,6 +450,107 @@ public struct SimpleTokenizer: Sendable {
                 return false
             }
         }
+    }
+
+    private func tokenizeUnigram(_ text: String) -> ([String], [Int], [String]) {
+        var tokens: [String] = []
+        var ids: [Int] = []
+        var unknown: [String] = []
+        for piece in splitUnigramInput(text) {
+            if catalog.isSpecialToken(content: piece), let id = catalog.id(for: piece) {
+                tokens.append(piece)
+                ids.append(id)
+                continue
+            }
+            guard let unigramPieces = greedyUnigram(piece) else {
+                if let unknownID = catalog.unknownTokenID {
+                    tokens.append(piece)
+                    ids.append(unknownID)
+                }
+                unknown.append(piece)
+                continue
+            }
+            tokens.append(contentsOf: unigramPieces.map(\.token))
+            ids.append(contentsOf: unigramPieces.map(\.id))
+        }
+        return (tokens, ids, unknown)
+    }
+
+    private func splitUnigramInput(_ text: String) -> [String] {
+        let specialTokens = catalog.tokens
+            .filter(\.special)
+            .map(\.content)
+            .filter { !$0.isEmpty }
+            .sorted { lhs, rhs in
+                if lhs.count == rhs.count {
+                    return lhs < rhs
+                }
+                return lhs.count > rhs.count
+            }
+
+        var pieces: [String] = []
+        var buffer = ""
+        var index = text.startIndex
+        while index < text.endIndex {
+            if let special = specialTokens.first(where: { text[index...].hasPrefix($0) }) {
+                appendUnigramBuffer(buffer, to: &pieces)
+                buffer.removeAll()
+                pieces.append(special)
+                index = text.index(index, offsetBy: special.count)
+            } else {
+                buffer.append(text[index])
+                index = text.index(after: index)
+            }
+        }
+        appendUnigramBuffer(buffer, to: &pieces)
+        return pieces
+    }
+
+    private func appendUnigramBuffer(_ text: String, to pieces: inout [String]) {
+        let normalized = text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(whereSeparator: \.isWhitespace)
+            .map { "▁\(String($0))" }
+        pieces.append(contentsOf: normalized)
+    }
+
+    private func greedyUnigram(_ text: String) -> [(token: String, id: Int)]? {
+        guard !text.isEmpty else {
+            return []
+        }
+        let rankedTokens = catalog.tokens
+            .filter { !$0.special && $0.content != catalog.unknownToken }
+            .map(\.content)
+            .filter { !$0.isEmpty }
+            .sorted { lhs, rhs in
+                if lhs.count == rhs.count {
+                    return lhs < rhs
+                }
+                return lhs.count > rhs.count
+            }
+
+        var output: [(token: String, id: Int)] = []
+        var index = text.startIndex
+        while index < text.endIndex {
+            if let token = rankedTokens.first(where: { text[index...].hasPrefix($0) }),
+               let id = catalog.id(for: token)
+            {
+                output.append((token, id))
+                index = text.index(index, offsetBy: token.count)
+                continue
+            }
+            return nil
+        }
+        return output
+    }
+
+    private func detokenizeUnigram(_ tokens: [String]) -> String {
+        let joined = tokens.joined()
+        let decoded = joined.replacingOccurrences(of: "▁", with: " ")
+        if decoded.hasPrefix(" ") {
+            return String(decoded.dropFirst())
+        }
+        return decoded
     }
 
     private func tokenizeByteLevelBPE(_ text: String) -> ([String], [Int], [String]) {

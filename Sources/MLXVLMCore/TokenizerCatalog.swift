@@ -127,22 +127,44 @@ public struct TokenizerCatalogBuilder {
             }
             let model = object["model"]?.objectValue
             let modelType = model?["type"]?.stringValue
-            let unknownToken = model?["unk_token"]?.stringValue
+            var unknownToken = model?["unk_token"]?.stringValue
             var tokens: [TokenizerCatalogToken] = []
             var merges: [TokenizerCatalogMerge] = []
 
-            for (content, idValue) in model?["vocab"]?.objectValue ?? [:] {
-                guard let id = idValue.intValue else {
-                    continue
-                }
-                tokens.append(
-                    TokenizerCatalogToken(
-                        content: content,
-                        id: id,
-                        source: "model.vocab",
-                        special: false
+            if let vocab = model?["vocab"]?.objectValue {
+                for (content, idValue) in vocab {
+                    guard let id = idValue.intValue else {
+                        continue
+                    }
+                    tokens.append(
+                        TokenizerCatalogToken(
+                            content: content,
+                            id: id,
+                            source: "model.vocab",
+                            special: false
+                        )
                     )
-                )
+                }
+            } else if let vocab = model?["vocab"]?.arrayValue {
+                for (index, tokenValue) in vocab.enumerated() {
+                    let content: String?
+                    if let token = tokenValue.stringValue {
+                        content = token
+                    } else {
+                        content = tokenValue.arrayValue?.first?.stringValue
+                    }
+                    guard let content else {
+                        continue
+                    }
+                    tokens.append(
+                        TokenizerCatalogToken(
+                            content: content,
+                            id: index,
+                            source: "model.vocab",
+                            special: false
+                        )
+                    )
+                }
             }
 
             for tokenValue in object["added_tokens"]?.arrayValue ?? [] {
@@ -175,6 +197,12 @@ public struct TokenizerCatalogBuilder {
                 {
                     merges.append(TokenizerCatalogMerge(left: left, right: right, rank: rank))
                 }
+            }
+
+            if unknownToken == nil,
+               let unknownTokenID = model?["unk_id"]?.intValue
+            {
+                unknownToken = tokens.first { $0.id == unknownTokenID }?.content
             }
 
             return TokenizerCatalog(

@@ -520,6 +520,43 @@ JSON
 "$BIN" tokenize-simple --model "$WORDPIECE_MODEL_DIR" --text 'Hello swiftly <image> mlx!' | grep -q '##ly'
 "$BIN" detokenize-simple --model "$WORDPIECE_MODEL_DIR" --ids 4,6,7,9,10,8 | grep -q '"text" : "hello swiftly<image> mlx!"'
 
+UNIGRAM_MODEL_DIR="${TMPDIR:-/tmp}/mlx-vlm-swift-verify-unigram"
+rm -rf "$UNIGRAM_MODEL_DIR"
+mkdir -p "$UNIGRAM_MODEL_DIR"
+cat > "$UNIGRAM_MODEL_DIR/config.json" <<'JSON'
+{"model_type":"unigram_test","vocab_size":8}
+JSON
+cat > "$UNIGRAM_MODEL_DIR/tokenizer.json" <<'JSON'
+{
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [
+      ["<unk>", 0.0],
+      ["▁hello", -1.0],
+      ["▁swift", -2.0],
+      ["ly", -3.0],
+      ["▁mlx", -4.0],
+      ["!", -5.0],
+      ["<image>", -6.0]
+    ]
+  },
+  "added_tokens": [
+    {"id": 6, "content": "<image>", "special": true}
+  ],
+  "normalizer": {"type": "NFKC"},
+  "pre_tokenizer": {"type": "Metaspace", "replacement": "▁"},
+  "decoder": {"type": "Metaspace", "replacement": "▁"}
+}
+JSON
+"$BIN" inspect-tokenizer-catalog --model "$UNIGRAM_MODEL_DIR" | grep -q '"modelType" : "Unigram"'
+"$BIN" inspect-tokenizer-plan --model "$UNIGRAM_MODEL_DIR" | grep -q '"requiredBackend" : "tokenizers-json-unigram"'
+"$BIN" inspect-tokenizer-plan --model "$UNIGRAM_MODEL_DIR" | grep -q '"swiftExecutionMode" : "unigram-greedy"'
+"$BIN" inspect-tokenizer-plan --model "$UNIGRAM_MODEL_DIR" | grep -q '"requiresFullTokenizerImplementation" : false'
+"$BIN" tokenize-simple --model "$UNIGRAM_MODEL_DIR" --text 'hello swiftly <image> mlx!' | grep -q '"tokenIDs"'
+"$BIN" tokenize-simple --model "$UNIGRAM_MODEL_DIR" --text 'hello swiftly <image> mlx!' | grep -q '3'
+"$BIN" detokenize-simple --model "$UNIGRAM_MODEL_DIR" --ids 1,2,3,6,4,5 | grep -q '"text" : "hello swiftly<image> mlx!"'
+
 BYTE_BPE_MODEL_DIR="${TMPDIR:-/tmp}/mlx-vlm-swift-verify-byte-bpe"
 rm -rf "$BYTE_BPE_MODEL_DIR"
 mkdir -p "$BYTE_BPE_MODEL_DIR"

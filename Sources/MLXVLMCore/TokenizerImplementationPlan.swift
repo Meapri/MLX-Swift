@@ -214,6 +214,11 @@ public struct TokenizerImplementationPlanner {
         {
             return "wordpiece-greedy"
         }
+        if requiredBackend == "tokenizers-json-unigram" ||
+            requiredBackend == "sentencepiece-unigram-or-tokenizers-json"
+        {
+            return "unigram-greedy"
+        }
         if requiredBackend == "tiktoken-file" {
             return "tiktoken-greedy"
         }
