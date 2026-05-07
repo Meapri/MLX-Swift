@@ -561,6 +561,15 @@ struct MLXVLMCli {
                 defaultParameters: defaultParameters
             )
             printJSON(CompatibilityGenerationEngine(descriptor: descriptor).unavailableEmbeddingReport(for: request))
+        case "preflight-predict":
+            let path = try value(for: "--model", in: arguments)
+            let json = try value(for: "--json", in: arguments)
+            let descriptor = try ModelStore().loadDescriptor(pathOrIdentifier: path)
+            let request = try JSONDecoder().decode(
+                PredictionRequest.self,
+                from: Data(json.utf8)
+            )
+            printJSON(PredictionPreflightPlanner(descriptor: descriptor).plan(request: request))
         case "preflight-model-operation":
             let operation = try value(for: "--operation", in: arguments)
             let json = optionalValue(for: "--json", in: arguments) ?? "{}"
@@ -921,6 +930,7 @@ struct MLXVLMCli {
           mlx-vlm-swift estimate-memory --model /path/to/mlx-model [--context-length 4096] [--kv-bits 8] [--max-kv-size 4096] [--vision-cache-size 8]
           mlx-vlm-swift preflight-generate --model /path/to/mlx-model --api openai-chat --json '{"model":"m","messages":[...]}' [--context-length 4096] [--keep-alive 5m]
           mlx-vlm-swift preflight-embed --model /path/to/mlx-model --api ollama-embed --json '{"model":"m","input":"..."}'
+          mlx-vlm-swift preflight-predict --model /path/to/mlx-model --json '{"model":"m","image":"...","task":"detect"}'
           mlx-vlm-swift preflight-model-operation --operation pull --json '{"model":"m"}'
           mlx-vlm-swift preflight-ollama-blob --digest sha256:abc123
           mlx-vlm-swift preflight-ollama-residency --json '{"model":"m","prompt":"","keep_alive":0}'
@@ -930,7 +940,7 @@ struct MLXVLMCli {
           mlx-vlm-swift render-generation-response --api openai-chat --model m --text ok [--stream true] [--chunk o]
           mlx-vlm-swift render-generation-chunks --api openai-chat --model m --prompt-tokens 4 --chunk 1:o [--stream true]
           mlx-vlm-swift self-test
-          server routes include /tokenize, /v1/tokenize, /api/tokenize, /detokenize, /v1/detokenize, /api/detokenize
+          server routes include /tokenize, /v1/tokenize, /api/tokenize, /detokenize, /v1/detokenize, /api/detokenize, /predict, /v1/predictions, /api/predict
           mlx-vlm-swift serve --model /path/to/mlx-model-or-hf-id [--use-latest] [--host 127.0.0.1] [--port 11434] [--adapter-path /path/to/adapter] [--draft-model /path/to/draft-or-hf-id] [--draft-kind dflash|mtp] [--draft-block-size 4] [--max-tokens 512] [--temperature 0.0] [--top-p 1.0] [--top-k 0] [--min-p 0.0] [--seed 0] [--context-length 4096] [--kv-bits 8] [--kv-quant-scheme uniform] [--kv-group-size 64] [--quantized-kv-start 0] [--max-kv-size 4096] [--prefill-step-size 512] [--keep-alive 5m] [--enable-thinking true] [--thinking-budget 1024] [--thinking-start-token <think>] [--top-logprobs-k 20]
         """)
     }
@@ -1925,6 +1935,8 @@ final class CompatibilityServer: @unchecked Sendable {
             return parseOpenAIChatRequest(from: request)
         case "/responses", "/v1/responses":
             return parseOpenAIResponsesRequest(from: request)
+        case "/predict", "/v1/predictions", "/api/predict":
+            return parsePredictionRequest(from: request)
         case "/api/embed":
             return parseOllamaEmbedRequest(from: request)
         case "/api/embeddings":
@@ -1933,6 +1945,25 @@ final class CompatibilityServer: @unchecked Sendable {
             return parseOpenAIEmbeddingRequest(from: request)
         default:
             return jsonResponse(["error": "Not found", "path": path], status: "404 Not Found")
+        }
+    }
+
+    private func parsePredictionRequest(from request: String) -> Data {
+        guard let body = httpBody(from: request), !body.isEmpty else {
+            return jsonResponse(["error": "Empty prediction request body"], status: "400 Bad Request")
+        }
+        do {
+            let decoded = try JSONDecoder().decode(PredictionRequest.self, from: Data(body.utf8))
+            let report = PredictionPreflightPlanner(
+                descriptor: descriptor,
+                backend: generationBackend?.status ?? .compatibilityShell
+            ).unavailableReport(for: decoded)
+            return encodedResponse(report, status: "501 Not Implemented")
+        } catch {
+            return jsonResponse(
+                ["error": "Invalid prediction request", "details": String(describing: error)],
+                status: "400 Bad Request"
+            )
         }
     }
 

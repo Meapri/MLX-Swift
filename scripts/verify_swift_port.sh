@@ -425,6 +425,10 @@ printf '\244\0\0\0\0\0\0\0%s\000\074\000\100\000\102\000\104' "$SAFETENSORS_HEAD
 "$BIN" validate-model --model "$RFDETR_MODEL_DIR" | grep -q '"passed" : false'
 "$BIN" preflight-generate --model "$RFDETR_MODEL_DIR" --api openai-chat --json '{"model":"rfdetr","messages":[{"role":"user","content":"detect person"}]}' | grep -q '"primaryTask" : "object-detection-or-segmentation"'
 "$BIN" preflight-generate --model "$RFDETR_MODEL_DIR" --api openai-chat --json '{"model":"rfdetr","messages":[{"role":"user","content":"detect person"}]}' | grep -q 'not compatible with text generation endpoints'
+"$BIN" preflight-predict --model "$RFDETR_MODEL_DIR" --json '{"model":"rfdetr","task":"detect","image":"AAECAw=="}' | grep -q '"preferredSwiftEntryPoint" : "rfdetr-predictor"'
+"$BIN" preflight-predict --model "$RFDETR_MODEL_DIR" --json '{"model":"rfdetr","task":"detect","image":"AAECAw=="}' | grep -q '"canAttemptPrediction" : false'
+"$BIN" preflight-predict --model "$RFDETR_MODEL_DIR" --json '{"model":"rfdetr","task":"detect","image":"AAECAw=="}' | grep -q 'Swift predictor inference for rfdetr'
+"$BIN" preflight-predict --model "$RFDETR_MODEL_DIR" --json '{"model":"rfdetr","task":"detect","image":"AAECAw=="}' | grep -q '"kind" : "image"'
 
 SIDECAR_TOKENIZER_MODEL_DIR="${TMPDIR:-/tmp}/mlx-vlm-swift-verify-sidecar-tokenizer"
 rm -rf "$SIDECAR_TOKENIZER_MODEL_DIR"
@@ -791,6 +795,14 @@ curl -fsS "http://127.0.0.1:$PORT/v1/cache/stats" | grep -q '"enabled":false'
 curl -fsS "http://127.0.0.1:$PORT/cache/stats" | grep -q '"enabled":false'
 curl -fsS -X POST "http://127.0.0.1:$PORT/v1/cache/reset" | grep -q '"status":"disabled"'
 curl -fsS -X POST "http://127.0.0.1:$PORT/cache/reset" | grep -q '"enabled":false'
+PREDICT_RESPONSE="$(
+  curl -sS -i "http://127.0.0.1:$PORT/v1/predictions" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"verify","task":"detect","image":"AAECAw=="}'
+)"
+echo "$PREDICT_RESPONSE" | grep -q 'HTTP/1.1 501 Not Implemented'
+echo "$PREDICT_RESPONSE" | grep -q '"canAttemptPrediction":false'
+echo "$PREDICT_RESPONSE" | grep -q '"kind":"image"'
 curl -fsS -X POST "http://127.0.0.1:$PORT/unload" | grep -q '"status":"success"'
 curl -fsS -X POST "http://127.0.0.1:$PORT/unload" | grep -q '"status":"no_model_loaded"'
 LOAD_BEFORE_API_UNLOAD="$(
