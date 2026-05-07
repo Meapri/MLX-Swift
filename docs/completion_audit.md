@@ -31,8 +31,9 @@ Status: not complete. The Swift server is usable for the main Gemma4/OpenAI/Olla
 - `SWIFT_BUILD_JOBS=18 scripts/verify_swift_port.sh`
 - `SWIFT_BUILD_JOBS=18 scripts/verify_mock_real_mlx_api.sh`
 - `SWIFT_BUILD_JOBS=18 scripts/verify_real_gemma4_smoke.sh`
+- `MLXVLM_REAL_QWEN25VL_MODEL=/path/to/qwen2.5-vl SWIFT_BUILD_JOBS=18 scripts/verify_real_qwen25vl_video_smoke.sh`, or `MLXVLM_REAL_QWEN25VL_ALLOW_REMOTE=1 SWIFT_BUILD_JOBS=18 scripts/verify_real_qwen25vl_video_smoke.sh` when remote Hugging Face downloads are acceptable
 
-These gates are necessary but not sufficient for 100% completion because they do not yet include a video-capable real model, full JSON Schema grammar decoding, non-generative model inference, or dependency-free SentencePiece/Unigram execution.
+These gates are necessary but not sufficient for 100% completion because the video-capable real model gate still depends on a local Qwen2.5-VL directory or an explicit remote-download run, and the set still lacks full JSON Schema grammar decoding, non-generative model inference, and dependency-free SentencePiece/Unigram execution.
 
 ## Next Required Work
 

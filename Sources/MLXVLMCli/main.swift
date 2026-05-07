@@ -722,7 +722,8 @@ struct MLXVLMCli {
             let descriptor = try waitForAsync {
                 try await MLXRemoteModelResolver().resolveDescriptor(
                     pathOrIdentifier: path,
-                    useLatest: useLatest
+                    useLatest: useLatest,
+                    progressHandler: remoteResolveProgressHandler(for: path)
                 )
             }
             let server = CompatibilityServer(
@@ -763,6 +764,28 @@ struct MLXVLMCli {
                 return nil
             }
             return arguments[index + 1]
+        }
+    }
+
+    private static func remoteResolveProgressHandler(for model: String) -> @Sendable (Progress) -> Void {
+        { progress in
+            let total = progress.totalUnitCount
+            let completed = progress.completedUnitCount
+            if total > 0 {
+                let percent = min(100.0, max(0.0, Double(completed) / Double(total) * 100.0))
+                fputs(
+                    String(
+                        format: "Resolving remote model %@: %.1f%% (%lld/%lld)\n",
+                        model,
+                        percent,
+                        completed,
+                        total
+                    ),
+                    stderr
+                )
+            } else {
+                fputs("Resolving remote model \(model): \(completed) units\n", stderr)
+            }
         }
     }
 
