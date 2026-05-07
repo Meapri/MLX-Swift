@@ -2,6 +2,8 @@
 
 This repository is now a Swift-first replacement for the Python `mlx-vlm` runtime. The Python package has been removed from the working tree; compatibility work is tracked here so local MLX model directories and Ollama/OpenAI client contracts continue to behave like the Python server while inference runs through Swift.
 
+Completion evidence and remaining 100% parity gaps are tracked in [completion_audit.md](completion_audit.md).
+
 ## Compatibility Contract
 
 The Swift port must keep these inputs compatible with the Python package:
