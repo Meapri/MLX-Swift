@@ -8,6 +8,14 @@ _HALF_SPLIT = "half_split"
 _EVEN_ODD = "even_odd"
 _HALF_COS = "half"
 _FULL_COS = "full"
+_POSITION_SELECTOR_STYLES = {
+    "chunked",
+    "interleaved",
+    "sectioned_half_split",
+    "sectioned_even_odd",
+    "split_select",
+}
+_SELECTED_FREQUENCY_STYLES = {"chunked", "interleaved", "split_select"}
 
 
 def _cumulative_splits(lengths: Sequence[int]):
@@ -44,14 +52,10 @@ def _pairing_for_style(style: str):
     return _HALF_SPLIT
 
 
-def _selector_for_style(style: str, mrope_section: Sequence[int], freq_dim: int):
+def mrope_position_selector(style: str, mrope_section: Sequence[int], freq_dim: int):
     if style == "interleaved":
         return _interleaved_position_selector(mrope_section, freq_dim)
     return _chunked_position_selector(mrope_section, freq_dim)
-
-
-def mrope_position_selector(style: str, mrope_section: Sequence[int], freq_dim: int):
-    return _selector_for_style(style, mrope_section, freq_dim)
 
 
 @lru_cache(maxsize=None)
@@ -426,29 +430,13 @@ def compute_inv_freq(dim: int, base: float):
     return 1.0 / (base ** (mx.arange(0, dim, 2).astype(mx.float32) / dim))
 
 
-def _apply_chunked_mrope(freqs, mrope_section):
-    freqs_t = freqs[0]
-    offset = mrope_section[0]
-    for dim, length in enumerate(mrope_section[1:], start=1):
-        idx = slice(offset, offset + length)
-        freqs_t[..., idx] = freqs[dim, ..., idx]
-        offset += length
-    return freqs_t
-
-
-def _apply_interleaved_mrope(freqs, mrope_section):
-    freqs_t = freqs[0]
-    for dim, offset in enumerate((1, 2), start=1):
-        length = mrope_section[dim] * 3
-        idx = slice(offset, length, 3)
-        freqs_t[..., idx] = freqs[dim, ..., idx]
-    return freqs_t
-
-
-def _apply_split_select_mrope(freqs, mrope_section):
-    split_indices = _cumulative_splits(mrope_section)
-    chunks = mx.split(freqs, split_indices, axis=-1)
-    return mx.concatenate([chunk[i % 3] for i, chunk in enumerate(chunks)], axis=-1)
+@mx.compile
+def _apply_selected_mrope_frequency_layout(freqs, position_selector):
+    indices = mx.broadcast_to(
+        position_selector[None, None, None, :],
+        (1, freqs.shape[1], freqs.shape[2], freqs.shape[3]),
+    )
+    return mx.take_along_axis(freqs, indices, axis=0)[0]
 
 
 def mrope_section_selectors(
@@ -495,7 +483,7 @@ def mrope_section_selectors(
 
 
 @mx.compile
-def _selected_mrope_cos_sin(
+def compute_selected_mrope_cos_sin(
     position_ids,
     inv_freq,
     position_selector,
@@ -507,20 +495,6 @@ def _selected_mrope_cos_sin(
     return mx.cos(emb), mx.sin(emb)
 
 
-def compute_selected_mrope_cos_sin(
-    position_ids,
-    inv_freq,
-    position_selector,
-    frequency_selector,
-):
-    return _selected_mrope_cos_sin(
-        position_ids,
-        inv_freq,
-        position_selector,
-        frequency_selector,
-    )
-
-
 def apply_mrope_frequency_layout(
     freqs,
     mrope_section: Sequence[int],
@@ -529,12 +503,13 @@ def apply_mrope_frequency_layout(
 ):
     mrope_section = list(mrope_section)
 
-    if style == "chunked":
-        return _apply_chunked_mrope(freqs, mrope_section)
-    if style == "interleaved":
-        return _apply_interleaved_mrope(freqs, mrope_section)
-    if style == "split_select":
-        return _apply_split_select_mrope(freqs, mrope_section)
+    if style in _SELECTED_FREQUENCY_STYLES:
+        position_selector = mrope_position_selector(
+            style,
+            mrope_section,
+            freqs.shape[-1],
+        )
+        return _apply_selected_mrope_frequency_layout(freqs, position_selector)
     return freqs
 
 
@@ -550,9 +525,9 @@ def compute_mrope_frequencies(
         return position_ids.astype(mx.float32)[..., None] * inv_freq
 
     # Fast path
-    if style in {"chunked", "interleaved", "split_select"}:
+    if style in _SELECTED_FREQUENCY_STYLES:
         if position_selector is None:
-            position_selector = _selector_for_style(
+            position_selector = mrope_position_selector(
                 style,
                 mrope_section,
                 inv_freq.shape[0],
@@ -600,16 +575,11 @@ class MRoPERotaryEmbedding:
                 rope_parameters=rope_parameters,
             )
         )
-        if style in {
-            "chunked",
-            "interleaved",
-            "sectioned_half_split",
-            "sectioned_even_odd",
-            "split_select",
-        }:
-            self.position_selector = _selector_for_style(
+        if style in _POSITION_SELECTOR_STYLES:
+            self.position_selector = mrope_position_selector(
                 style,
-                self.mrope_section, self.inv_freq.shape[0]
+                self.mrope_section,
+                self.inv_freq.shape[0],
             )
         else:
             self.position_selector = None
@@ -761,7 +731,8 @@ def _maybe_fast_precomputed_rotary(
     if sectioned:
         if cos.ndim != 4:
             return None
-        position_selector = _chunked_position_selector(
+        position_selector = mrope_position_selector(
+            "chunked",
             mrope_section,
             rotary_dim // 2,
         )

@@ -106,13 +106,50 @@ def test_even_odd_precomputed_rotary_fast_path_matches_fallback(cos_layout):
     _assert_pair_close((fast[0][..., 8:], fast[1][..., 8:]), (q[..., 8:], k[..., 8:]))
 
 
-def test_split_select_frequency_fast_path_matches_layout_fallback():
+def _reference_mrope_frequency_layout(freqs, mrope_section, style):
+    if style == "chunked":
+        split_indices = mx.cumsum(mx.array(mrope_section, dtype=mx.int32))[:-1]
+        return mx.concatenate(
+            [
+                chunk[axis]
+                for axis, chunk in enumerate(
+                    mx.split(freqs, split_indices, axis=-1)
+                )
+            ],
+            axis=-1,
+        )
+    if style == "interleaved":
+        selected = []
+        for idx in range(sum(mrope_section)):
+            axis = 0
+            if idx % 3 == 1 and idx < mrope_section[1] * 3:
+                axis = 1
+            elif idx % 3 == 2 and idx < mrope_section[2] * 3:
+                axis = 2
+            selected.append(freqs[axis, ..., idx : idx + 1])
+        return mx.concatenate(selected, axis=-1)
+    if style == "split_select":
+        split_indices = mx.cumsum(mx.array(mrope_section, dtype=mx.int32))[:-1]
+        return mx.concatenate(
+            [
+                chunk[axis % 3]
+                for axis, chunk in enumerate(
+                    mx.split(freqs, split_indices, axis=-1)
+                )
+            ],
+            axis=-1,
+        )
+    return freqs
+
+
+@pytest.mark.parametrize("style", ["chunked", "interleaved", "split_select"])
+def test_selected_frequency_fast_path_matches_layout_reference(style):
     mx.random.seed(3)
     position_ids = _position_ids(batch=2, seq_len=4)
-    inv_freq = mx.random.normal((4,)).astype(mx.float32)
-    mrope_section = [2, 1, 1]
+    mrope_section = [2, 2, 2]
+    inv_freq = mx.random.normal((sum(mrope_section),)).astype(mx.float32)
     position_selector = mrope_position_selector(
-        "split_select",
+        style,
         mrope_section,
         inv_freq.shape[0],
     )
@@ -121,18 +158,20 @@ def test_split_select_frequency_fast_path_matches_layout_fallback():
         position_ids,
         inv_freq,
         mrope_section,
-        style="split_select",
+        style=style,
         position_selector=position_selector,
     )
     freqs = position_ids.astype(mx.float32)[..., None] * inv_freq
-    expected = apply_mrope_frequency_layout(
+    layout = apply_mrope_frequency_layout(
         freqs,
         mrope_section,
-        style="split_select",
+        style=style,
     )
+    expected = _reference_mrope_frequency_layout(freqs, mrope_section, style)
 
-    mx.eval(fast, expected)
+    mx.eval(fast, layout, expected)
     assert _max_diff(fast, expected) < 1e-4
+    assert _max_diff(layout, expected) < 1e-4
 
 
 def _reference_section_selected_mrope_cos_sin(
