@@ -74,6 +74,32 @@ echo "$TOKENIZE_RESPONSE" | grep -q '"supported":true'
 echo "$TOKENIZE_RESPONSE" | grep -q '"backend":"mlx-swift-vlm"'
 echo "$TOKENIZE_RESPONSE" | grep -q '"token_ids":\['
 
+curl -fsS -m 30 -X POST "http://127.0.0.1:$PORT/api/pull" \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$MODEL\"}" | grep -q '"accepted":true'
+curl -fsS -m 30 -X POST "http://127.0.0.1:$PORT/api/create" \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"gemma4-alias\",\"from\":\"$MODEL\"}" | grep -q '"status":"success"'
+curl -fsS -m 30 "http://127.0.0.1:$PORT/api/tags" | grep -q '"model":"gemma4-alias"'
+curl -fsS -m 30 "http://127.0.0.1:$PORT/v1/models/gemma4-alias" | grep -q '"owned_by":"mlx-vlm-swift-alias"'
+curl -fsS -m 30 -X POST "http://127.0.0.1:$PORT/api/show" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gemma4-alias"}' | grep -q '"mlx_vlm.backend_ready"'
+curl -fsS -m 30 -X POST "http://127.0.0.1:$PORT/api/copy" \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"gemma4-alias","destination":"gemma4-copy"}' | grep -q '"status":"success"'
+curl -fsS -m 30 -X POST "http://127.0.0.1:$PORT/api/push" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gemma4-copy"}' | grep -q '"status":"validated"'
+curl -fsS -m 30 -X DELETE "http://127.0.0.1:$PORT/api/delete" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gemma4-copy"}' | grep -q '"status":"deleted"'
+BLOB_HEAD_STATUS="$(curl -sS -m 30 -o /dev/null -w '%{http_code}' -I "http://127.0.0.1:$PORT/api/blobs/sha256:feedface")"
+test "$BLOB_HEAD_STATUS" = "404"
+curl -sS -m 30 -X POST "http://127.0.0.1:$PORT/api/blobs/sha256:feedface" --data-binary 'gemma4-blob' | grep -q '"accepted":true'
+BLOB_HEAD_STATUS="$(curl -sS -m 30 -o /dev/null -w '%{http_code}' -I "http://127.0.0.1:$PORT/api/blobs/sha256:feedface")"
+test "$BLOB_HEAD_STATUS" = "200"
+
 CHAT_RESPONSE="$(
   curl -fsS -m 60 "http://127.0.0.1:$PORT/v1/chat/completions" \
     -H 'Content-Type: application/json' \
