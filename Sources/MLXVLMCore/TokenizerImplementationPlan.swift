@@ -18,6 +18,8 @@ public struct TokenizerImplementationPlan: Codable, Equatable, Sendable {
     public let canUseCatalogPreflight: Bool
     public let swiftExecutionSupported: Bool
     public let swiftExecutionMode: String?
+    public let upstreamTokenizerDelegated: Bool
+    public let upstreamTokenizerBackend: String?
     public let requiresFullTokenizerImplementation: Bool
     public let blockingReasons: [String]
 
@@ -39,6 +41,8 @@ public struct TokenizerImplementationPlan: Codable, Equatable, Sendable {
         canUseCatalogPreflight: Bool,
         swiftExecutionSupported: Bool,
         swiftExecutionMode: String?,
+        upstreamTokenizerDelegated: Bool,
+        upstreamTokenizerBackend: String?,
         requiresFullTokenizerImplementation: Bool,
         blockingReasons: [String]
     ) {
@@ -59,6 +63,8 @@ public struct TokenizerImplementationPlan: Codable, Equatable, Sendable {
         self.canUseCatalogPreflight = canUseCatalogPreflight
         self.swiftExecutionSupported = swiftExecutionSupported
         self.swiftExecutionMode = swiftExecutionMode
+        self.upstreamTokenizerDelegated = upstreamTokenizerDelegated
+        self.upstreamTokenizerBackend = upstreamTokenizerBackend
         self.requiresFullTokenizerImplementation = requiresFullTokenizerImplementation
         self.blockingReasons = blockingReasons
     }
@@ -88,12 +94,15 @@ public struct TokenizerImplementationPlanner {
             catalog: catalog
         )
         let swiftExecutionSupported = swiftExecutionMode != nil
+        let upstreamTokenizerBackend = upstreamTokenizerBackend(requiredBackend: requiredBackend)
+        let upstreamTokenizerDelegated = upstreamTokenizerBackend != nil
         let blockingReasons = blockingReasons(
             metadata: metadata,
             jsonMetadata: jsonMetadata,
             catalog: catalog,
             requiredBackend: requiredBackend,
-            swiftExecutionMode: swiftExecutionMode
+            swiftExecutionMode: swiftExecutionMode,
+            upstreamTokenizerDelegated: upstreamTokenizerDelegated
         )
 
         return TokenizerImplementationPlan(
@@ -114,7 +123,9 @@ public struct TokenizerImplementationPlanner {
             canUseCatalogPreflight: canUseCatalogPreflight,
             swiftExecutionSupported: swiftExecutionSupported,
             swiftExecutionMode: swiftExecutionMode,
-            requiresFullTokenizerImplementation: !swiftExecutionSupported,
+            upstreamTokenizerDelegated: upstreamTokenizerDelegated,
+            upstreamTokenizerBackend: upstreamTokenizerBackend,
+            requiresFullTokenizerImplementation: !swiftExecutionSupported && !upstreamTokenizerDelegated,
             blockingReasons: blockingReasons
         )
     }
@@ -142,7 +153,7 @@ public struct TokenizerImplementationPlanner {
             return "tokenizers-json-\(value)"
         case nil:
             if hasTokenizerModel {
-                return catalog?.modelType == "Unigram" ? "sentencepiece-unigram-model" : "sentencepiece-model"
+                return sentencePieceModelBackend(catalog?.modelType)
             }
             if hasTiktoken {
                 return "tiktoken-file"
@@ -165,7 +176,8 @@ public struct TokenizerImplementationPlanner {
         jsonMetadata: TokenizerJSONMetadata?,
         catalog: TokenizerCatalog?,
         requiredBackend: String,
-        swiftExecutionMode: String?
+        swiftExecutionMode: String?,
+        upstreamTokenizerDelegated: Bool
     ) -> [String] {
         var reasons: [String] = []
         if !metadata.hasTokenizerJSON &&
@@ -185,7 +197,7 @@ public struct TokenizerImplementationPlanner {
         if requiredBackend == "tokenizers-json-unknown" {
             reasons.append("tokenizer.json model type is unavailable.")
         }
-        if swiftExecutionMode != nil {
+        if swiftExecutionMode != nil || upstreamTokenizerDelegated {
             return reasons
         }
         if requiredBackend == "tokenizers-json-wordlevel" {
@@ -198,6 +210,35 @@ public struct TokenizerImplementationPlanner {
             reasons.append("Full Swift tokenizer execution is not implemented yet; catalog preflight only recognizes exact known token strings.")
         }
         return reasons
+    }
+
+    private func sentencePieceModelBackend(_ modelType: String?) -> String {
+        switch modelType {
+        case "Unigram":
+            return "sentencepiece-unigram-model"
+        case "SentencePiece-BPE":
+            return "sentencepiece-bpe-model"
+        case "SentencePiece-Word":
+            return "sentencepiece-word-model"
+        case "SentencePiece-Char":
+            return "sentencepiece-char-model"
+        case .some(let value) where value.hasPrefix("SentencePiece-Unknown-"):
+            return "sentencepiece-unknown-model"
+        default:
+            return "sentencepiece-model"
+        }
+    }
+
+    private func upstreamTokenizerBackend(requiredBackend: String) -> String? {
+        switch requiredBackend {
+        case "sentencepiece-bpe-model",
+             "sentencepiece-word-model",
+             "sentencepiece-char-model",
+             "sentencepiece-unknown-model":
+            return "mlx-swift-lm-tokenizers"
+        default:
+            return nil
+        }
     }
 
     private func swiftExecutionMode(

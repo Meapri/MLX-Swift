@@ -254,7 +254,7 @@ public struct TokenizerCatalogBuilder {
             let unknownToken = tokenizerConfig?["unk_token"]?.stringValue ?? parsed.unknownToken
 
             return TokenizerCatalog(
-                modelType: "Unigram",
+                modelType: parsed.modelType.catalogName,
                 unknownToken: unknownToken,
                 unknownTokenID: unknownToken.flatMap { token in tokens.first { $0.content == token }?.id },
                 tokens: tokens,
@@ -590,10 +590,11 @@ private struct SentencePieceModelProtoParser {
         self.data = data
     }
 
-    func parse() throws -> (tokens: [TokenizerCatalogToken], unknownToken: String?) {
+    func parse() throws -> (tokens: [TokenizerCatalogToken], unknownToken: String?, modelType: SentencePieceModelType) {
         var reader = ProtoReader(data: data)
         var tokens: [TokenizerCatalogToken] = []
         var unknownToken: String?
+        var modelType: SentencePieceModelType = .unigram
         while !reader.isAtEnd {
             let key = try reader.readVarint()
             let field = Int(key >> 3)
@@ -606,11 +607,16 @@ private struct SentencePieceModelProtoParser {
                         unknownToken = piece.token.content
                     }
                 }
+            } else if field == 2, wireType == 2 {
+                let trainerSpecData = try reader.readLengthDelimitedData()
+                if let parsedType = try Self.parseTrainerSpecModelType(trainerSpecData) {
+                    modelType = parsedType
+                }
             } else {
                 try reader.skip(wireType: wireType)
             }
         }
-        return (tokens, unknownToken)
+        return (tokens, unknownToken, modelType)
     }
 
     private static func parsePiece(
@@ -645,6 +651,58 @@ private struct SentencePieceModelProtoParser {
             ),
             pieceType == 2
         )
+    }
+
+    private static func parseTrainerSpecModelType(_ data: Data) throws -> SentencePieceModelType? {
+        var reader = ProtoReader(data: data)
+        while !reader.isAtEnd {
+            let key = try reader.readVarint()
+            let field = Int(key >> 3)
+            let wireType = Int(key & 0x07)
+            if field == 3, wireType == 0 {
+                return SentencePieceModelType(rawValue: Int(try reader.readVarint()))
+            }
+            try reader.skip(wireType: wireType)
+        }
+        return nil
+    }
+}
+
+private enum SentencePieceModelType: Equatable {
+    case unigram
+    case bpe
+    case word
+    case character
+    case unknown(Int)
+
+    init(rawValue: Int) {
+        switch rawValue {
+        case 1:
+            self = .unigram
+        case 2:
+            self = .bpe
+        case 3:
+            self = .word
+        case 4:
+            self = .character
+        default:
+            self = .unknown(rawValue)
+        }
+    }
+
+    var catalogName: String {
+        switch self {
+        case .unigram:
+            return "Unigram"
+        case .bpe:
+            return "SentencePiece-BPE"
+        case .word:
+            return "SentencePiece-Word"
+        case .character:
+            return "SentencePiece-Char"
+        case .unknown(let value):
+            return "SentencePiece-Unknown-\(value)"
+        }
     }
 }
 

@@ -577,6 +577,21 @@ printf '\x0A\x0E\x0A\x05<unk>\x15\x00\x00\x00\x00\x18\x02\x0A\x11\x0A\x08\xE2\x9
 "$BIN" tokenize-simple --model "$SP_MODEL_DIR" --text 'hello swiftly <image> mlx!' | grep -q '3'
 "$BIN" detokenize-simple --model "$SP_MODEL_DIR" --ids 1,2,3,6,4,5 | grep -q '"text" : "hello swiftly<image> mlx!"'
 
+SP_BPE_MODEL_DIR="${TMPDIR:-/tmp}/mlx-vlm-swift-verify-sentencepiece-bpe"
+rm -rf "$SP_BPE_MODEL_DIR"
+mkdir -p "$SP_BPE_MODEL_DIR"
+cat > "$SP_BPE_MODEL_DIR/config.json" <<'JSON'
+{"model_type":"sentencepiece_bpe_test","vocab_size":8}
+JSON
+printf '\x0A\x0E\x0A\x05<unk>\x15\x00\x00\x00\x00\x18\x02\x0A\x11\x0A\x08\xE2\x96\x81hello\x15\x00\x00\x80\xBF\x18\x01\x0A\x11\x0A\x08\xE2\x96\x81swift\x15\x00\x00\x00\xC0\x18\x01\x0A\x0B\x0A\x02ly\x15\x00\x00\x40\xC0\x18\x01\x0A\x0F\x0A\x06\xE2\x96\x81mlx\x15\x00\x00\x80\xC0\x18\x01\x0A\x0A\x0A\x01!\x15\x00\x00\xA0\xC0\x18\x01\x0A\x10\x0A\x07<image>\x15\x00\x00\xC0\xC0\x18\x04\x12\x02\x18\x02' > "$SP_BPE_MODEL_DIR/tokenizer.model"
+"$BIN" inspect-tokenizer-catalog --model "$SP_BPE_MODEL_DIR" | grep -q '"modelType" : "SentencePiece-BPE"'
+"$BIN" inspect-tokenizer-plan --model "$SP_BPE_MODEL_DIR" | grep -q '"requiredBackend" : "sentencepiece-bpe-model"'
+"$BIN" inspect-tokenizer-plan --model "$SP_BPE_MODEL_DIR" | grep -q '"upstreamTokenizerDelegated" : true'
+"$BIN" inspect-tokenizer-plan --model "$SP_BPE_MODEL_DIR" | grep -q '"upstreamTokenizerBackend" : "mlx-swift-lm-tokenizers"'
+"$BIN" inspect-tokenizer-plan --model "$SP_BPE_MODEL_DIR" | grep -q '"swiftExecutionSupported" : false'
+"$BIN" inspect-tokenizer-plan --model "$SP_BPE_MODEL_DIR" | grep -q '"requiresFullTokenizerImplementation" : false'
+"$BIN" tokenize-simple --model "$SP_BPE_MODEL_DIR" --text 'hello swiftly' | grep -q '"supported" : false'
+
 BYTE_BPE_MODEL_DIR="${TMPDIR:-/tmp}/mlx-vlm-swift-verify-byte-bpe"
 rm -rf "$BYTE_BPE_MODEL_DIR"
 mkdir -p "$BYTE_BPE_MODEL_DIR"
