@@ -426,6 +426,8 @@ printf '\244\0\0\0\0\0\0\0%s\000\074\000\100\000\102\000\104' "$SAFETENSORS_HEAD
 "$BIN" preflight-generate --model "$RFDETR_MODEL_DIR" --api openai-chat --json '{"model":"rfdetr","messages":[{"role":"user","content":"detect person"}]}' | grep -q '"primaryTask" : "object-detection-or-segmentation"'
 "$BIN" preflight-generate --model "$RFDETR_MODEL_DIR" --api openai-chat --json '{"model":"rfdetr","messages":[{"role":"user","content":"detect person"}]}' | grep -q 'not compatible with text generation endpoints'
 "$BIN" preflight-predict --model "$RFDETR_MODEL_DIR" --json '{"model":"rfdetr","task":"detect","image":"AAECAw=="}' | grep -q '"preferredSwiftEntryPoint" : "rfdetr-predictor"'
+"$BIN" preflight-predict --model "$RFDETR_MODEL_DIR" --json '{"model":"rfdetr","task":"detect","image":"AAECAw=="}' | grep -q '"predictorRuntimePolicy" : "explicit-501-compatibility-exclusion"'
+"$BIN" preflight-predict --model "$RFDETR_MODEL_DIR" --json '{"model":"rfdetr","task":"detect","image":"AAECAw=="}' | grep -q '"pythonRuntimeRequired" : false'
 "$BIN" preflight-predict --model "$RFDETR_MODEL_DIR" --json '{"model":"rfdetr","task":"detect","image":"AAECAw=="}' | grep -q '"canAttemptPrediction" : false'
 "$BIN" preflight-predict --model "$RFDETR_MODEL_DIR" --json '{"model":"rfdetr","task":"detect","image":"AAECAw=="}' | grep -q 'Swift predictor inference for rfdetr'
 "$BIN" preflight-predict --model "$RFDETR_MODEL_DIR" --json '{"model":"rfdetr","task":"detect","image":"AAECAw=="}' | grep -q '"kind" : "image"'
@@ -825,6 +827,7 @@ PREDICT_RESPONSE="$(
 )"
 echo "$PREDICT_RESPONSE" | grep -q 'HTTP/1.1 501 Not Implemented'
 echo "$PREDICT_RESPONSE" | grep -q '"canAttemptPrediction":false'
+echo "$PREDICT_RESPONSE" | grep -q '"predictorRuntimePolicy":"generation-endpoints-only"'
 echo "$PREDICT_RESPONSE" | grep -q '"kind":"image"'
 curl -fsS -X POST "http://127.0.0.1:$PORT/unload" | grep -q '"status":"success"'
 curl -fsS -X POST "http://127.0.0.1:$PORT/unload" | grep -q '"status":"no_model_loaded"'

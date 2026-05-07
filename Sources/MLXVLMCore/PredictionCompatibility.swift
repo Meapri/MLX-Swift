@@ -110,6 +110,9 @@ public struct PredictionPreflightPlan: Codable, Equatable, Sendable {
     public let requestTask: String?
     public let primaryTask: String
     public let preferredSwiftEntryPoint: String
+    public let predictorRuntimePolicy: String
+    public let compatibilityExclusion: String?
+    public let pythonRuntimeRequired: Bool
     public let capabilities: ModelCapabilityPlan
     public let media: MediaResolutionReport
     public let compatibilityChecks: [CompatibilityCheck]
@@ -122,6 +125,9 @@ public struct PredictionPreflightPlan: Codable, Equatable, Sendable {
         requestTask: String?,
         primaryTask: String,
         preferredSwiftEntryPoint: String,
+        predictorRuntimePolicy: String,
+        compatibilityExclusion: String?,
+        pythonRuntimeRequired: Bool,
         capabilities: ModelCapabilityPlan,
         media: MediaResolutionReport,
         compatibilityChecks: [CompatibilityCheck],
@@ -133,6 +139,9 @@ public struct PredictionPreflightPlan: Codable, Equatable, Sendable {
         self.requestTask = requestTask
         self.primaryTask = primaryTask
         self.preferredSwiftEntryPoint = preferredSwiftEntryPoint
+        self.predictorRuntimePolicy = predictorRuntimePolicy
+        self.compatibilityExclusion = compatibilityExclusion
+        self.pythonRuntimeRequired = pythonRuntimeRequired
         self.capabilities = capabilities
         self.media = media
         self.compatibilityChecks = compatibilityChecks
@@ -187,10 +196,16 @@ public struct PredictionPreflightPlanner {
             }
         )
         var blockingReasons: [String] = []
+        let predictorRuntimePolicy: String
+        let compatibilityExclusion: String?
         if capabilities.supportsTextGeneration {
+            predictorRuntimePolicy = "generation-endpoints-only"
+            compatibilityExclusion = nil
             blockingReasons.append("Model type \(descriptor.canonicalModelType) is a generative model; use Ollama/OpenAI generation endpoints instead of predictor endpoints.")
         } else {
-            blockingReasons.append("Swift predictor inference for \(descriptor.canonicalModelType) (\(capabilities.primaryTask)) is not ported yet.")
+            predictorRuntimePolicy = "explicit-501-compatibility-exclusion"
+            compatibilityExclusion = "\(descriptor.canonicalModelType) uses Python mlx-vlm custom predictor code and is outside the upstream mlx-swift-lm generative VLM runtime; the Swift server preserves request/media diagnostics and fails closed with 501 instead of falling back to Python."
+            blockingReasons.append("Swift predictor inference for \(descriptor.canonicalModelType) (\(capabilities.primaryTask)) is intentionally excluded from the upstream mlx-swift-lm generative runtime path and returns explicit 501 diagnostics.")
         }
         if media.errorCount > 0 {
             blockingReasons.append("\(media.errorCount) media reference(s) are not loadable.")
@@ -201,6 +216,9 @@ public struct PredictionPreflightPlanner {
             requestTask: request.task,
             primaryTask: capabilities.primaryTask,
             preferredSwiftEntryPoint: capabilities.preferredSwiftEntryPoint,
+            predictorRuntimePolicy: predictorRuntimePolicy,
+            compatibilityExclusion: compatibilityExclusion,
+            pythonRuntimeRequired: false,
             capabilities: capabilities,
             media: media,
             compatibilityChecks: compatibility.checks,
