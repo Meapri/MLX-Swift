@@ -609,6 +609,8 @@ grep -q '"logprobs" : \[' "$LOGITS_DECODE_JSON"
 grep -q '"topLogprobs" : \[' "$LOGITS_DECODE_JSON"
 grep -q '"token" : "hello"' "$LOGITS_DECODE_JSON"
 "$BIN" render-generation-response --api openai-chat --model verify --text ok --prompt-tokens 3 --completion-tokens 1 | grep -q '"contentType" : "application\\/json"'
+"$BIN" render-generation-response --api openai-chat --model verify --text '{"answer":"ok","confidence":"high"}' --prompt-tokens 3 --completion-tokens 1 --response-format-json '{"type":"json_schema","schema":{"type":"object","required":["answer","confidence"],"properties":{"answer":{"type":"string"},"confidence":{"type":"string","enum":["low","high"]}},"additionalProperties":false}}' | grep -q '"schemaValid" : true'
+"$BIN" render-generation-response --api openai-chat --model verify --text '{"answer":"ok","confidence":"maybe"}' --prompt-tokens 3 --completion-tokens 1 --response-format-json '{"type":"json_schema","schema":{"type":"object","required":["answer","confidence"],"properties":{"answer":{"type":"string"},"confidence":{"type":"string","enum":["low","high"]}},"additionalProperties":false}}' | grep -q 'does not match allowed enum values'
 "$BIN" render-generation-response --api ollama-generate --model verify --text ok --prompt-tokens 3 --completion-tokens 1 --stream true --chunk o | grep -q '"contentType" : "application\\/x-ndjson"'
 "$BIN" render-generation-response --api openai-chat --model verify --text ok --prompt-tokens 3 --completion-tokens 1 --stream true --chunk o | grep -q 'data: \[DONE\]'
 "$BIN" render-generation-chunks --api openai-chat --model verify --prompt-tokens 3 --stream true --chunk 10:o --chunk 11:k | grep -q '"text" : "ok"'

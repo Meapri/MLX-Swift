@@ -656,6 +656,9 @@ struct MLXVLMCli {
             let completionTokens = Int(optionalValue(for: "--completion-tokens", in: arguments) ?? "0") ?? 0
             let finishReason = optionalValue(for: "--finish-reason", in: arguments) ?? "stop"
             let stream = optionalValue(for: "--stream", in: arguments) == "true"
+            let responseFormat = try optionalValue(for: "--response-format-json", in: arguments).map {
+                try JSONDecoder().decode(JSONValue.self, from: Data($0.utf8))
+            }
             let result = CompletedGeneration(
                 model: model,
                 text: text,
@@ -665,12 +668,21 @@ struct MLXVLMCli {
             let chunks = values(for: "--chunk", in: arguments).map {
                 GenerationChunk(text: $0, tokenID: nil)
             } + (stream ? [GenerationChunk(text: "", isFinished: true, finishReason: finishReason)] : [])
+            let request = responseFormat.map {
+                GenerationRequest(
+                    model: model,
+                    messages: [ChatMessage(role: .user, content: [.text("")])],
+                    metadata: GenerationRequestMetadata(responseFormat: $0),
+                    stream: stream
+                )
+            }
             printJSON(
                 GenerationAPIResponseRenderer.renderCompleted(
                     result,
                     api: api,
                     stream: stream,
-                    chunks: chunks
+                    chunks: chunks,
+                    request: request
                 )
             )
         case "render-generation-chunks":

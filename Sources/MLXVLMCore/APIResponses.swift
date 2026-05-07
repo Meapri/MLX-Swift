@@ -1099,19 +1099,22 @@ public struct GenerationAPIResponseRenderReport: Codable, Equatable, Sendable {
     public let contentType: String
     public let body: String
     public let frameCount: Int
+    public let structuredOutputValidation: StructuredOutputValidationReport?
 
     public init(
         api: GenerationResponseAPI,
         stream: Bool,
         contentType: String,
         body: String,
-        frameCount: Int
+        frameCount: Int,
+        structuredOutputValidation: StructuredOutputValidationReport? = nil
     ) {
         self.api = api
         self.stream = stream
         self.contentType = contentType
         self.body = body
         self.frameCount = frameCount
+        self.structuredOutputValidation = structuredOutputValidation
     }
 }
 
@@ -1146,12 +1149,16 @@ public enum GenerationAPIResponseRenderer {
         case .openAIResponses:
             body = encode(OpenAIResponsesResponse(result: result, request: request))
         }
+        let validation = request.flatMap {
+            StructuredOutputValidator().validate(text: result.text, responseFormat: $0.metadata.responseFormat)
+        }
         return GenerationAPIResponseRenderReport(
             api: api,
             stream: false,
             contentType: "application/json",
             body: body,
-            frameCount: 1
+            frameCount: 1,
+            structuredOutputValidation: validation
         )
     }
 
@@ -1217,12 +1224,16 @@ public enum GenerationAPIResponseRenderer {
                     request: request
                 )
         }
+        let validation = request.flatMap {
+            StructuredOutputValidator().validate(text: chunks.map(\.text).joined(), responseFormat: $0.metadata.responseFormat)
+        }
         return GenerationAPIResponseRenderReport(
             api: api,
             stream: true,
             contentType: contentType,
             body: frames.joined(),
-            frameCount: frames.count
+            frameCount: frames.count,
+            structuredOutputValidation: validation
         )
     }
 

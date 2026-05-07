@@ -102,6 +102,157 @@ public struct JSONSchemaPropertyConstraint: Codable, Equatable, Sendable {
     }
 }
 
+public struct StructuredOutputValidationReport: Codable, Equatable, Sendable {
+    public let requested: Bool
+    public let formatType: String
+    public let validJSON: Bool
+    public let schemaPresent: Bool
+    public let schemaValid: Bool
+    public let errors: [String]
+    public let warnings: [String]
+
+    public init(
+        requested: Bool,
+        formatType: String,
+        validJSON: Bool,
+        schemaPresent: Bool,
+        schemaValid: Bool,
+        errors: [String],
+        warnings: [String]
+    ) {
+        self.requested = requested
+        self.formatType = formatType
+        self.validJSON = validJSON
+        self.schemaPresent = schemaPresent
+        self.schemaValid = schemaValid
+        self.errors = errors
+        self.warnings = warnings
+    }
+}
+
+public struct StructuredOutputValidator {
+    public init() {}
+
+    public func validate(text: String, responseFormat: JSONValue?) -> StructuredOutputValidationReport? {
+        guard let responseFormat else {
+            return nil
+        }
+        let metadata = GenerationRequestMetadata(responseFormat: responseFormat)
+        let plan = ResponseFormatPlanner().plan(metadata: metadata, stream: false)
+        guard plan.requiresJSONMode else {
+            return nil
+        }
+        let decoded: JSONValue
+        do {
+            decoded = try JSONDecoder().decode(JSONValue.self, from: Data(text.utf8))
+        } catch {
+            return StructuredOutputValidationReport(
+                requested: plan.requested,
+                formatType: plan.formatType,
+                validJSON: false,
+                schemaPresent: plan.schemaPresent,
+                schemaValid: false,
+                errors: ["Generated text is not valid JSON: \(error)"],
+                warnings: plan.warnings
+            )
+        }
+
+        var errors: [String] = []
+        if plan.formatType == "json_object", decoded.objectValue == nil {
+            errors.append("JSON object response_format requires an object root.")
+        }
+        if let schema = Self.schemaValue(from: responseFormat) {
+            errors.append(contentsOf: validate(value: decoded, schema: schema, path: "$"))
+        }
+        return StructuredOutputValidationReport(
+            requested: plan.requested,
+            formatType: plan.formatType,
+            validJSON: true,
+            schemaPresent: plan.schemaPresent,
+            schemaValid: errors.isEmpty,
+            errors: errors,
+            warnings: plan.warnings + (plan.schemaConstraints?.requiresFullGrammarDFA == true
+                ? ["Validation is post-generation; full token-level grammar/DFA constraints are still required for strict decoding."]
+                : [])
+        )
+    }
+
+    private func validate(value: JSONValue, schema: JSONValue, path: String) -> [String] {
+        guard let object = schema.objectValue else {
+            return []
+        }
+        var errors: [String] = []
+        let types = schemaTypes(object)
+        if !types.isEmpty, !types.contains(jsonType(value)) {
+            errors.append("\(path) expected \(types.joined(separator: "|")) but got \(jsonType(value)).")
+            return errors
+        }
+        if let enumValues = object["enum"]?.arrayValue, !enumValues.isEmpty, !enumValues.contains(value) {
+            errors.append("\(path) does not match allowed enum values.")
+        }
+        if let properties = object["properties"]?.objectValue {
+            guard let valueObject = value.objectValue else {
+                return errors
+            }
+            let required = object["required"]?.arrayValue?.compactMap(\.stringValue) ?? []
+            for name in required where valueObject[name] == nil {
+                errors.append("\(path).\(name) is required.")
+            }
+            for (name, propertySchema) in properties {
+                if let propertyValue = valueObject[name] {
+                    errors.append(contentsOf: validate(value: propertyValue, schema: propertySchema, path: "\(path).\(name)"))
+                }
+            }
+            if object["additionalProperties"]?.boolValue == false {
+                let allowed = Set(properties.keys)
+                for name in valueObject.keys where !allowed.contains(name) {
+                    errors.append("\(path).\(name) is not allowed by additionalProperties=false.")
+                }
+            }
+        }
+        if let itemSchema = object["items"], let array = value.arrayValue {
+            for (index, item) in array.enumerated() {
+                errors.append(contentsOf: validate(value: item, schema: itemSchema, path: "\(path)[\(index)]"))
+            }
+        }
+        return errors
+    }
+
+    private static func schemaValue(from responseFormat: JSONValue) -> JSONValue? {
+        guard let object = responseFormat.objectValue else {
+            return nil
+        }
+        if let schema = object["schema"] {
+            return schema
+        }
+        return object["json_schema"]?["schema"]
+    }
+
+    private func schemaTypes(_ object: [String: JSONValue]) -> [String] {
+        if let type = object["type"]?.stringValue {
+            return [type]
+        }
+        return object["type"]?.arrayValue?.compactMap(\.stringValue) ?? []
+    }
+
+    private func jsonType(_ value: JSONValue) -> String {
+        switch value {
+        case .object:
+            return "object"
+        case .array:
+            return "array"
+        case .string:
+            return "string"
+        case .number:
+            return "number"
+        case .bool:
+            return "boolean"
+        case .null:
+            return "null"
+        }
+    }
+}
+
 public struct ResponseFormatPlanner {
     public init() {}
 
