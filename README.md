@@ -81,6 +81,26 @@ MLXVLM_REAL_QWEN_VL_LABEL=Qwen3-VL \
 SWIFT_BUILD_JOBS=18 scripts/verify_real_qwen25vl_video_smoke.sh
 ```
 
+It can also target other video-capable upstream VLMs, such as SmolVLM2:
+
+```bash
+MLXVLM_REAL_QWEN_VL_MODEL=mlx-community/SmolVLM2-256M-Video-Instruct-mlx \
+MLXVLM_REAL_QWEN_VL_ALLOW_REMOTE=1 \
+MLXVLM_REAL_QWEN_VL_DOWNLOAD_DIR="$HOME/Models/mlx-community-SmolVLM2-256M-Video-Instruct-mlx" \
+MLXVLM_REAL_QWEN_VL_LABEL=SmolVLM2 \
+SWIFT_BUILD_JOBS=18 scripts/verify_real_qwen25vl_video_smoke.sh
+```
+
+For image-only VLM families such as FastVLM:
+
+```bash
+MLXVLM_REAL_IMAGE_MODEL=mlx-community/FastVLM-0.5B-bf16 \
+MLXVLM_REAL_IMAGE_ALLOW_REMOTE=1 \
+MLXVLM_REAL_IMAGE_DOWNLOAD_DIR="$HOME/Models/mlx-community-FastVLM-0.5B-bf16" \
+MLXVLM_REAL_IMAGE_LABEL=FastVLM \
+SWIFT_BUILD_JOBS=18 scripts/verify_real_vlm_image_smoke.sh
+```
+
 ## Port Notes
 
 See [docs/swift_port.md](docs/swift_port.md) for the running compatibility map, implemented parity areas, and known remaining gaps.
