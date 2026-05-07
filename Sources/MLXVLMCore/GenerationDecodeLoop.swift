@@ -6,19 +6,22 @@ public struct GenerationDecodeToken: Codable, Equatable, Sendable {
     public let probability: Double?
     public let logProbability: Double?
     public let rank: Int?
+    public let logprob: GenerationTokenLogprob?
 
     public init(
         tokenID: Int,
         text: String,
         probability: Double? = nil,
         logProbability: Double? = nil,
-        rank: Int? = nil
+        rank: Int? = nil,
+        logprob: GenerationTokenLogprob? = nil
     ) {
         self.tokenID = tokenID
         self.text = text
         self.probability = probability
         self.logProbability = logProbability
         self.rank = rank
+        self.logprob = logprob
     }
 
     public init(sampledToken: SampledToken, text: String) {
@@ -131,12 +134,12 @@ public struct GenerationDecodeLoop: Sendable {
 
         if eosTokenIDs.contains(token.tokenID) {
             let emitted = assembler.append(
-                GenerationChunk(text: "", tokenID: token.tokenID, isFinished: true, finishReason: "stop")
+                GenerationChunk(text: "", tokenID: token.tokenID, logprob: token.logprob, isFinished: true, finishReason: "stop")
             )
             return record(token: token, emitted: emitted, shouldContinue: false)
         }
 
-        var emitted = assembler.append(GenerationChunk(text: token.text, tokenID: token.tokenID))
+        var emitted = assembler.append(GenerationChunk(text: token.text, tokenID: token.tokenID, logprob: token.logprob))
         if !assembler.snapshot.isFinished,
            assembler.snapshot.usage.completionTokens >= maxCompletionTokens
         {

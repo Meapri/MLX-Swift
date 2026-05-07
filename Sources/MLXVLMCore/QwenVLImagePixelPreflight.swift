@@ -174,8 +174,9 @@ public struct QwenVLImagePixelPreflightPlanner {
         )
     }
 
-    public func plan(reference: String) -> QwenVLImagePixelPreflightImage {
-        let media = resolver.resolve(reference: reference, kind: .image)
+    public func plan(reference: ImageReference) -> QwenVLImagePixelPreflightImage {
+        let media = resolver.resolve(reference: reference.url, kind: .image)
+            .withImageOptions(reference)
         guard media.isLoadable else {
             return QwenVLImagePixelPreflightImage(
                 media: media,
@@ -192,11 +193,10 @@ public struct QwenVLImagePixelPreflightPlanner {
         }
 
         do {
-            let image = try loadImage(reference: reference, media: media)
-            let gridPlan = try QwenVLImageGridPlanner.imagePlan(
-                height: image.height,
-                width: image.width,
-                config: config
+            let image = try loadImage(reference: reference.url, media: media)
+            let gridPlan = try imagePlan(
+                dimensions: (height: image.height, width: image.width),
+                reference: reference
             )
             let rgb = try prepareRGBTensor(image: image, gridPlan: gridPlan)
             let patchShape = patchTensorShape(gridPlan: gridPlan)
@@ -228,6 +228,54 @@ public struct QwenVLImagePixelPreflightPlanner {
                 error: String(describing: error)
             )
         }
+    }
+
+    public func plan(reference: String) -> QwenVLImagePixelPreflightImage {
+        plan(reference: ImageReference(url: reference))
+    }
+
+    private func imageGridConfig(for reference: ImageReference) -> QwenVLImageGridConfig {
+        QwenVLImageGridConfig(
+            patchSize: config.patchSize,
+            temporalPatchSize: config.temporalPatchSize,
+            mergeSize: config.mergeSize,
+            minPixels: reference.minPixels ?? config.minPixels,
+            maxPixels: reference.maxPixels ?? config.maxPixels
+        )
+    }
+
+    private func imagePlan(
+        dimensions: (height: Int, width: Int),
+        reference: ImageReference
+    ) throws -> QwenVLImageGridPlan {
+        let imageConfig = imageGridConfig(for: reference)
+        if let resizedHeight = reference.resizedHeight,
+           let resizedWidth = reference.resizedWidth
+        {
+            let resized = try QwenVLImageGridPlanner.smartResizeImage(
+                height: resizedHeight,
+                width: resizedWidth,
+                config: imageConfig
+            )
+            let grid = QwenVLGridTHW(
+                temporal: 1,
+                height: resized.height / imageConfig.patchSize,
+                width: resized.width / imageConfig.patchSize
+            )
+            return QwenVLImageGridPlan(
+                originalHeight: dimensions.height,
+                originalWidth: dimensions.width,
+                resizedHeight: resized.height,
+                resizedWidth: resized.width,
+                grid: grid,
+                placeholderTokenCount: grid.product / (imageConfig.mergeSize * imageConfig.mergeSize)
+            )
+        }
+        return try QwenVLImageGridPlanner.imagePlan(
+            height: dimensions.height,
+            width: dimensions.width,
+            config: imageConfig
+        )
     }
 
     private func loadImage(reference: String, media: MediaReferenceSummary) throws -> CGImage {

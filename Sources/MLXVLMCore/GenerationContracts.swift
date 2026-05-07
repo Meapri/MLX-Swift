@@ -10,16 +10,31 @@ public enum MessageRole: String, Codable, Sendable {
 
 public enum ContentPart: Codable, Equatable, Sendable {
     case text(String)
-    case imageURL(String)
-    case audioURL(String)
-    case videoURL(String)
+    case imagePlaceholder
+    case imageURL(ImageReference)
+    case audioPlaceholder
+    case audioURL(AudioReference)
+    case videoURL(VideoReference)
 
     enum CodingKeys: String, CodingKey {
         case type
         case text
+        case content
+        case image
         case imageURL = "image_url"
+        case detail
+        case resizedHeight = "resized_height"
+        case resizedWidth = "resized_width"
         case inputAudio = "input_audio"
         case video
+        case videoURL = "video_url"
+        case inputVideo = "input_video"
+        case minPixels = "min_pixels"
+        case maxPixels = "max_pixels"
+        case fps
+        case nframes
+        case minFrames = "min_frames"
+        case maxFrames = "max_frames"
     }
 
     public init(from decoder: Decoder) throws {
@@ -27,23 +42,44 @@ public enum ContentPart: Codable, Equatable, Sendable {
         let type = try container.decode(String.self, forKey: .type)
         switch type {
         case "text", "input_text", "output_text":
-            self = .text(try container.decode(String.self, forKey: .text))
-        case "image_url", "input_image":
-            if let raw = try? container.decode(String.self, forKey: .imageURL) {
-                self = .imageURL(raw)
+            if let text = try? container.decode(String.self, forKey: .text) {
+                self = .text(text)
             } else {
-                let nested = try container.decode(ImageURL.self, forKey: .imageURL)
-                self = .imageURL(nested.url)
+                self = .text(try container.decode(String.self, forKey: .content))
             }
+        case "image":
+            if let url = Self.decodeOptionalImageURL(container, key: .image) {
+                self = .imageURL(Self.imageReference(url: url, container: container))
+            } else {
+                self = .imagePlaceholder
+            }
+        case "image_url", "input_image":
+            if let url = Self.decodeOptionalImageURL(container, key: .imageURL) {
+                self = .imageURL(Self.imageReference(url: url, container: container))
+            } else {
+                self = .imagePlaceholder
+            }
+        case "audio":
+            self = .audioPlaceholder
         case "input_audio":
             if let raw = try? container.decode(String.self, forKey: .inputAudio) {
-                self = .audioURL(raw)
+                self = .audioURL(AudioReference(data: raw))
             } else {
                 let nested = try container.decode(InputAudio.self, forKey: .inputAudio)
-                self = .audioURL(nested.data)
+                self = .audioURL(AudioReference(data: nested.data, format: nested.format))
             }
-        case "video":
-            self = .videoURL((try? container.decode(String.self, forKey: .video)) ?? "")
+        case "video", "input_video", "video_url":
+            self = .videoURL(
+                VideoReference(
+                    url: Self.decodeOptionalVideoURL(container) ?? "",
+                    minPixels: try? container.decode(Int.self, forKey: .minPixels),
+                    maxPixels: try? container.decode(Int.self, forKey: .maxPixels),
+                    fps: try? container.decode(Double.self, forKey: .fps),
+                    nframes: try? container.decode(Int.self, forKey: .nframes),
+                    minFrames: try? container.decode(Int.self, forKey: .minFrames),
+                    maxFrames: try? container.decode(Int.self, forKey: .maxFrames)
+                )
+            )
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type,
@@ -53,21 +89,86 @@ public enum ContentPart: Codable, Equatable, Sendable {
         }
     }
 
+    private static func decodeOptionalImageURL(
+        _ container: KeyedDecodingContainer<CodingKeys>,
+        key: CodingKeys
+    ) -> String? {
+        if let raw = try? container.decode(String.self, forKey: key) {
+            return raw
+        }
+        if let nested = try? container.decode(ImageURL.self, forKey: key) {
+            return nested.url
+        }
+        return nil
+    }
+
+    private static func decodeOptionalVideoURL(_ container: KeyedDecodingContainer<CodingKeys>) -> String? {
+        if let raw = try? container.decode(String.self, forKey: .video) {
+            return raw
+        }
+        if let raw = try? container.decode(String.self, forKey: .videoURL) {
+            return raw
+        }
+        if let nested = try? container.decode(ImageURL.self, forKey: .videoURL) {
+            return nested.url
+        }
+        if let raw = try? container.decode(String.self, forKey: .inputVideo) {
+            return raw
+        }
+        if let nested = try? container.decode(ImageURL.self, forKey: .inputVideo) {
+            return nested.url
+        }
+        return nil
+    }
+
+    private static func imageReference(
+        url: String,
+        container: KeyedDecodingContainer<CodingKeys>
+    ) -> ImageReference {
+        ImageReference(
+            url: url,
+            detail: try? container.decode(String.self, forKey: .detail),
+            resizedHeight: try? container.decode(Int.self, forKey: .resizedHeight),
+            resizedWidth: try? container.decode(Int.self, forKey: .resizedWidth),
+            minPixels: try? container.decode(Int.self, forKey: .minPixels),
+            maxPixels: try? container.decode(Int.self, forKey: .maxPixels)
+        )
+    }
+
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch self {
         case .text(let text):
             try container.encode("text", forKey: .type)
             try container.encode(text, forKey: .text)
-        case .imageURL(let url):
+        case .imagePlaceholder:
+            try container.encode("image", forKey: .type)
+        case .imageURL(let image):
             try container.encode("image_url", forKey: .type)
-            try container.encode(ImageURL(url: url), forKey: .imageURL)
-        case .audioURL(let url):
+            try container.encode(ImageURL(url: image.url), forKey: .imageURL)
+            try container.encodeIfPresent(image.detail, forKey: .detail)
+            try container.encodeIfPresent(image.resizedHeight, forKey: .resizedHeight)
+            try container.encodeIfPresent(image.resizedWidth, forKey: .resizedWidth)
+            try container.encodeIfPresent(image.minPixels, forKey: .minPixels)
+            try container.encodeIfPresent(image.maxPixels, forKey: .maxPixels)
+        case .audioPlaceholder:
+            try container.encode("audio", forKey: .type)
+        case .audioURL(let audio):
             try container.encode("input_audio", forKey: .type)
-            try container.encode(url, forKey: .inputAudio)
+            if audio.format == nil {
+                try container.encode(audio.data, forKey: .inputAudio)
+            } else {
+                try container.encode(InputAudio(data: audio.data, format: audio.format), forKey: .inputAudio)
+            }
         case .videoURL(let url):
             try container.encode("video", forKey: .type)
-            try container.encode(url, forKey: .video)
+            try container.encode(url.url, forKey: .video)
+            try container.encodeIfPresent(url.minPixels, forKey: .minPixels)
+            try container.encodeIfPresent(url.maxPixels, forKey: .maxPixels)
+            try container.encodeIfPresent(url.fps, forKey: .fps)
+            try container.encodeIfPresent(url.nframes, forKey: .nframes)
+            try container.encodeIfPresent(url.minFrames, forKey: .minFrames)
+            try container.encodeIfPresent(url.maxFrames, forKey: .maxFrames)
         }
     }
 }
@@ -80,6 +181,31 @@ public struct ImageURL: Codable, Equatable, Sendable {
     }
 }
 
+public struct ImageReference: Codable, Equatable, Sendable {
+    public let url: String
+    public let detail: String?
+    public let resizedHeight: Int?
+    public let resizedWidth: Int?
+    public let minPixels: Int?
+    public let maxPixels: Int?
+
+    public init(
+        url: String,
+        detail: String? = nil,
+        resizedHeight: Int? = nil,
+        resizedWidth: Int? = nil,
+        minPixels: Int? = nil,
+        maxPixels: Int? = nil
+    ) {
+        self.url = url
+        self.detail = detail
+        self.resizedHeight = resizedHeight
+        self.resizedWidth = resizedWidth
+        self.minPixels = minPixels
+        self.maxPixels = maxPixels
+    }
+}
+
 public struct InputAudio: Codable, Equatable, Sendable {
     public let data: String
     public let format: String?
@@ -87,6 +213,44 @@ public struct InputAudio: Codable, Equatable, Sendable {
     public init(data: String, format: String? = nil) {
         self.data = data
         self.format = format
+    }
+}
+
+public struct AudioReference: Codable, Equatable, Sendable {
+    public let data: String
+    public let format: String?
+
+    public init(data: String, format: String? = nil) {
+        self.data = data
+        self.format = format
+    }
+}
+
+public struct VideoReference: Codable, Equatable, Sendable {
+    public let url: String
+    public let minPixels: Int?
+    public let maxPixels: Int?
+    public let fps: Double?
+    public let nframes: Int?
+    public let minFrames: Int?
+    public let maxFrames: Int?
+
+    public init(
+        url: String,
+        minPixels: Int? = nil,
+        maxPixels: Int? = nil,
+        fps: Double? = nil,
+        nframes: Int? = nil,
+        minFrames: Int? = nil,
+        maxFrames: Int? = nil
+    ) {
+        self.url = url
+        self.minPixels = minPixels
+        self.maxPixels = maxPixels
+        self.fps = fps
+        self.nframes = nframes
+        self.minFrames = minFrames
+        self.maxFrames = maxFrames
     }
 }
 
@@ -138,7 +302,9 @@ public struct GenerationParameters: Codable, Equatable, Sendable {
     public var kvBits: Double?
     public var kvQuantizationScheme: String?
     public var kvGroupSize: Int?
+    public var quantizedKVStart: Int?
     public var maxKVSize: Int?
+    public var prefillStepSize: Int?
     public var visionCacheSize: Int?
     public var quantizeActivations: Bool?
     public var repetitionPenalty: Double?
@@ -168,7 +334,9 @@ public struct GenerationParameters: Codable, Equatable, Sendable {
         kvBits: Double? = nil,
         kvQuantizationScheme: String? = nil,
         kvGroupSize: Int? = nil,
+        quantizedKVStart: Int? = nil,
         maxKVSize: Int? = nil,
+        prefillStepSize: Int? = nil,
         visionCacheSize: Int? = nil,
         quantizeActivations: Bool? = nil,
         repetitionPenalty: Double? = nil,
@@ -197,7 +365,9 @@ public struct GenerationParameters: Codable, Equatable, Sendable {
         self.kvBits = kvBits
         self.kvQuantizationScheme = kvQuantizationScheme
         self.kvGroupSize = kvGroupSize
+        self.quantizedKVStart = quantizedKVStart
         self.maxKVSize = maxKVSize
+        self.prefillStepSize = prefillStepSize
         self.visionCacheSize = visionCacheSize
         self.quantizeActivations = quantizeActivations
         self.repetitionPenalty = repetitionPenalty
@@ -231,6 +401,16 @@ public struct GenerationRequestMetadata: Codable, Equatable, Sendable {
     public let resizeShape: [Int]?
     public let thinkingStartToken: String?
     public let user: String?
+    public let responseInstructions: String?
+    public let responseTruncation: String?
+    public let responseMetadata: JSONValue?
+    public let previousResponseID: String?
+    public let include: [JSONValue]?
+    public let parallelToolCalls: Bool?
+    public let store: Bool?
+    public let serviceTier: String?
+    public let responseReasoning: JSONValue?
+    public let tenantID: String?
 
     public init(
         responseFormat: JSONValue? = nil,
@@ -247,7 +427,17 @@ public struct GenerationRequestMetadata: Codable, Equatable, Sendable {
         topLogprobs: Int? = nil,
         resizeShape: [Int]? = nil,
         thinkingStartToken: String? = nil,
-        user: String? = nil
+        user: String? = nil,
+        responseInstructions: String? = nil,
+        responseTruncation: String? = nil,
+        responseMetadata: JSONValue? = nil,
+        previousResponseID: String? = nil,
+        include: [JSONValue]? = nil,
+        parallelToolCalls: Bool? = nil,
+        store: Bool? = nil,
+        serviceTier: String? = nil,
+        responseReasoning: JSONValue? = nil,
+        tenantID: String? = nil
     ) {
         self.responseFormat = responseFormat
         self.rawPrompt = rawPrompt
@@ -264,6 +454,16 @@ public struct GenerationRequestMetadata: Codable, Equatable, Sendable {
         self.resizeShape = resizeShape
         self.thinkingStartToken = thinkingStartToken
         self.user = user
+        self.responseInstructions = responseInstructions
+        self.responseTruncation = responseTruncation
+        self.responseMetadata = responseMetadata
+        self.previousResponseID = previousResponseID
+        self.include = include
+        self.parallelToolCalls = parallelToolCalls
+        self.store = store
+        self.serviceTier = serviceTier
+        self.responseReasoning = responseReasoning
+        self.tenantID = tenantID
     }
 }
 
@@ -291,7 +491,9 @@ public struct GenerationRequest: Codable, Equatable, Sendable {
 
 public struct GenerationChunk: Codable, Equatable, Sendable {
     public let text: String
+    public let reasoning: String?
     public let tokenID: Int?
+    public let logprob: GenerationTokenLogprob?
     public let isFinished: Bool
     public let finishReason: String?
     public let promptTokenCount: Int?
@@ -300,7 +502,9 @@ public struct GenerationChunk: Codable, Equatable, Sendable {
 
     public init(
         text: String,
+        reasoning: String? = nil,
         tokenID: Int? = nil,
+        logprob: GenerationTokenLogprob? = nil,
         isFinished: Bool = false,
         finishReason: String? = nil,
         promptTokenCount: Int? = nil,
@@ -308,12 +512,45 @@ public struct GenerationChunk: Codable, Equatable, Sendable {
         toolCalls: [GenerationToolCall] = []
     ) {
         self.text = text
+        self.reasoning = reasoning
         self.tokenID = tokenID
+        self.logprob = logprob
         self.isFinished = isFinished
         self.finishReason = finishReason
         self.promptTokenCount = promptTokenCount
         self.completionTokenCount = completionTokenCount
         self.toolCalls = toolCalls
+    }
+}
+
+public struct GenerationTokenLogprob: Codable, Equatable, Sendable {
+    public let token: String
+    public let logprob: Double
+    public let bytes: [Int]?
+    public let topLogprobs: [GenerationTopLogprob]
+
+    public init(
+        token: String,
+        logprob: Double,
+        bytes: [Int]? = nil,
+        topLogprobs: [GenerationTopLogprob] = []
+    ) {
+        self.token = token
+        self.logprob = logprob
+        self.bytes = bytes
+        self.topLogprobs = topLogprobs
+    }
+}
+
+public struct GenerationTopLogprob: Codable, Equatable, Sendable {
+    public let token: String
+    public let logprob: Double
+    public let bytes: [Int]?
+
+    public init(token: String, logprob: Double, bytes: [Int]? = nil) {
+        self.token = token
+        self.logprob = logprob
+        self.bytes = bytes
     }
 }
 
@@ -359,19 +596,22 @@ public struct CompletedGeneration: Codable, Equatable, Sendable {
     public let finishReason: String
     public let usage: GenerationUsage
     public let toolCalls: [GenerationToolCall]
+    public let logprobs: [GenerationTokenLogprob]
 
     public init(
         model: String,
         text: String,
         finishReason: String = "stop",
         usage: GenerationUsage = GenerationUsage(),
-        toolCalls: [GenerationToolCall] = []
+        toolCalls: [GenerationToolCall] = [],
+        logprobs: [GenerationTokenLogprob] = []
     ) {
         self.model = model
         self.text = text
         self.finishReason = finishReason
         self.usage = usage
         self.toolCalls = toolCalls
+        self.logprobs = logprobs
     }
 }
 
@@ -422,6 +662,8 @@ public struct EmbeddingUnavailableReport: Codable, Equatable, Sendable {
     public let model: String
     public let canonicalModelType: String
     public let backend: BackendStatus
+    public let fallbackPolicy: String
+    public let unavailableReason: String
     public let request: EmbeddingRequest
     public let inputCount: Int
 
@@ -430,12 +672,20 @@ public struct EmbeddingUnavailableReport: Codable, Equatable, Sendable {
         model: String,
         canonicalModelType: String,
         backend: BackendStatus,
+        fallbackPolicy: String = "diagnostic-501-no-generated-embedding",
+        unavailableReason: String? = nil,
         request: EmbeddingRequest
     ) {
         self.error = error
         self.model = model
         self.canonicalModelType = canonicalModelType
         self.backend = backend
+        self.fallbackPolicy = fallbackPolicy
+        self.unavailableReason = unavailableReason ?? (
+            backend.activeBackend == "mlx-swift-vlm"
+                ? "The generation backend is loaded, but no MLXEmbedders-compatible embedding backend is available for this model directory."
+                : "The Swift embedding backend is not available in this build."
+        )
         self.request = request
         self.inputCount = max(request.texts.count, request.tokenIDInputs?.count ?? 0)
     }

@@ -3,11 +3,12 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+SWIFT_BUILD_JOBS="${SWIFT_BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)}"
 
 export CLANG_MODULE_CACHE_PATH="$ROOT_DIR/.build/clang-module-cache"
 mkdir -p "$CLANG_MODULE_CACHE_PATH"
 
-swift build --disable-sandbox
+swift build --disable-sandbox --jobs "$SWIFT_BUILD_JOBS"
 
 BIN="$ROOT_DIR/.build/arm64-apple-macosx/debug/mlx-vlm-swift"
 "$BIN" self-test
@@ -17,6 +18,14 @@ grep -q '"requiredFileName" : "default.metallib"' "$MLX_METAL_JSON"
 grep -q '"checkedPaths" : \[' "$MLX_METAL_JSON"
 grep -q '"destinationPaths" : \[' "$MLX_METAL_JSON"
 grep -q '"installed" : false' "$MLX_METAL_JSON"
+RUNTIME_PACKAGE_JSON="$(mktemp)"
+"$BIN" inspect-runtime-package > "$RUNTIME_PACKAGE_JSON"
+grep -q '"runtimePackageReady"' "$RUNTIME_PACKAGE_JSON"
+grep -q '"requiredEnvironment" : \[' "$RUNTIME_PACKAGE_JSON"
+grep -q '"MLXVLM_ENABLE_REAL_MLX_API=1"' "$RUNTIME_PACKAGE_JSON"
+grep -q '"requiredRuntimeFiles" : \[' "$RUNTIME_PACKAGE_JSON"
+grep -q '"default.metallib"' "$RUNTIME_PACKAGE_JSON"
+grep -q '"metalLibrary"' "$RUNTIME_PACKAGE_JSON"
 
 MODEL_DIR="${TMPDIR:-/tmp}/mlx-vlm-swift-verify-model"
 rm -rf "$MODEL_DIR"
@@ -107,6 +116,7 @@ JSON
 SAFETENSORS_HEADER='{"model.embed_tokens.weight":{"dtype":"F16","shape":[2,1],"data_offsets":[0,4]},"visual.patch_embed.proj.weight":{"dtype":"F16","shape":[2,1],"data_offsets":[4,8]}}'
 printf '\244\0\0\0\0\0\0\0%s\000\074\000\100\000\102\000\104' "$SAFETENSORS_HEADER" > "$MODEL_DIR/model.safetensors"
 printf '\244\0\0\0\0\0\0\0%s\000\074\000\100\000\102\000\104' "$SAFETENSORS_HEADER" > "$MODEL_DIR/adapters.safetensors"
+printf '\000\000\000\030ftypmp42' > "$MODEL_DIR/tiny.mp4"
 
 "$BIN" inspect --model "$MODEL_DIR" | grep -q '"canonicalModelType" : "qwen2_vl"'
 "$BIN" inspect --model "$MODEL_DIR" | grep -q '"modelType" : "BPE"'
@@ -352,6 +362,23 @@ JSON
 "$BIN" inspect-chat-template-plan --model "$MISTRAL_TEMPLATE_MODEL_DIR" | grep -q '"canRenderNatively" : true'
 "$BIN" preflight-generate --model "$MISTRAL_TEMPLATE_MODEL_DIR" --api openai-chat --json '{"model":"verify","messages":[{"role":"system","content":"sys"},{"role":"user","content":"hello"},{"role":"assistant","content":"ok"}]}' | grep -q '"promptStyle" : "mistralInstruct"'
 "$BIN" preflight-generate --model "$MISTRAL_TEMPLATE_MODEL_DIR" --api openai-chat --json '{"model":"verify","messages":[{"role":"system","content":"sys"},{"role":"user","content":"hello"},{"role":"assistant","content":"ok"}]}' | grep -Fq '[INST] sys'
+
+GEMMA4_TEMPLATE_MODEL_DIR="${TMPDIR:-/tmp}/mlx-vlm-swift-verify-gemma4-template"
+rm -rf "$GEMMA4_TEMPLATE_MODEL_DIR"
+mkdir -p "$GEMMA4_TEMPLATE_MODEL_DIR"
+cat > "$GEMMA4_TEMPLATE_MODEL_DIR/config.json" <<'JSON'
+{"model_type":"gemma4","vocab_size":262144,"image_token_id":258880,"audio_token_id":258881,"boi_token_id":255999,"eoi_token_id":258882,"eot_token_id":106}
+JSON
+cat > "$GEMMA4_TEMPLATE_MODEL_DIR/tokenizer_config.json" <<'JSON'
+{"image_token":"<|image|>","audio_token":"<|audio|>","chat_template":"{{ bos_token }}{% for message in messages %}<|turn>{{ message['role'] }}\n{{ message['content'] }}<turn|>{% endfor %}{% if add_generation_prompt %}<|turn>model\n{% endif %}"}
+JSON
+"$BIN" inspect-chat-template-plan --model "$GEMMA4_TEMPLATE_MODEL_DIR" | grep -q '"requiredRenderer" : "gemma4-chat-builtin"'
+"$BIN" inspect-chat-template-plan --model "$GEMMA4_TEMPLATE_MODEL_DIR" | grep -q '"canRenderNatively" : true'
+"$BIN" inspect-ollama-show --model "$GEMMA4_TEMPLATE_MODEL_DIR" | grep -q '"mlx_vlm.audio_token_id" : 258881'
+"$BIN" inspect-ollama-show --model "$GEMMA4_TEMPLATE_MODEL_DIR" | grep -q '"mlx_vlm.end_turn_token_id" : 106'
+"$BIN" preflight-generate --model "$GEMMA4_TEMPLATE_MODEL_DIR" --api openai-chat --json '{"model":"verify","messages":[{"role":"system","content":"sys"},{"role":"user","content":[{"type":"image"},{"type":"text","text":"hello"}]}],"enable_thinking":true,"tools":[{"type":"function","function":{"name":"lookup","description":"Lookup docs","parameters":{"type":"object"}}}]}' | grep -q '"promptStyle" : "gemma4Chat"'
+"$BIN" preflight-generate --model "$GEMMA4_TEMPLATE_MODEL_DIR" --api openai-chat --json '{"model":"verify","messages":[{"role":"system","content":"sys"},{"role":"user","content":[{"type":"image"},{"type":"text","text":"hello"}]}],"enable_thinking":true,"tools":[{"type":"function","function":{"name":"lookup","description":"Lookup docs","parameters":{"type":"object"}}}]}' | grep -Fq '<|turn>system\n<|think|>\nsys<|tool>declaration:lookup'
+"$BIN" preflight-generate --model "$GEMMA4_TEMPLATE_MODEL_DIR" --api openai-chat --json '{"model":"verify","messages":[{"role":"system","content":"sys"},{"role":"user","content":[{"type":"image"},{"type":"text","text":"hello"}]}],"enable_thinking":true,"tools":[{"type":"function","function":{"name":"lookup","description":"Lookup docs","parameters":{"type":"object"}}}]}' | grep -Fq '<|turn>user\n<|image|> hello<turn|>\n<|turn>model\n'
 LOAD_JSON="$(mktemp)"
 "$BIN" plan-model-load --model "$MODEL_DIR" > "$LOAD_JSON"
 grep -q '"canLoadMetadata" : true' "$LOAD_JSON"
@@ -490,7 +517,12 @@ JSON
 "$BIN" detokenize-simple --model "$BYTE_BPE_MODEL_DIR" --ids 10,11,12 | grep -q '"text" : "hello world!"'
 "$BIN" decode-token-stream --model "$BYTE_BPE_MODEL_DIR" --ids 10,11,12,13,14 | grep -q '"textDelta" : " world"'
 "$BIN" decode-token-stream --model "$BYTE_BPE_MODEL_DIR" --ids 10,11,12,13,14 | grep -q '"skippedSpecialToken" : true'
-"$BIN" simulate-logits-decode --model "$BYTE_BPE_MODEL_DIR" --prompt-tokens 2 --max-tokens 3 --logits 0,0,0,0,0,0,0,0,0,0,5,0,0,0,0 --logits 0,0,0,0,0,0,0,0,0,0,0,5,0,0,0 --logits 0,0,0,0,0,0,0,0,0,0,0,0,5,0,0 | grep -q '"text" : "hello world!"'
+LOGITS_DECODE_JSON="$(mktemp)"
+"$BIN" simulate-logits-decode --model "$BYTE_BPE_MODEL_DIR" --prompt-tokens 2 --max-tokens 3 --top-logprobs 2 --logits 0,0,0,0,0,0,0,0,0,0,5,0,0,0,0 --logits 0,0,0,0,0,0,0,0,0,0,0,5,0,0,0 --logits 0,0,0,0,0,0,0,0,0,0,0,0,5,0,0 > "$LOGITS_DECODE_JSON"
+grep -q '"text" : "hello world!"' "$LOGITS_DECODE_JSON"
+grep -q '"logprobs" : \[' "$LOGITS_DECODE_JSON"
+grep -q '"topLogprobs" : \[' "$LOGITS_DECODE_JSON"
+grep -q '"token" : "hello"' "$LOGITS_DECODE_JSON"
 "$BIN" render-generation-response --api openai-chat --model verify --text ok --prompt-tokens 3 --completion-tokens 1 | grep -q '"contentType" : "application\\/json"'
 "$BIN" render-generation-response --api ollama-generate --model verify --text ok --prompt-tokens 3 --completion-tokens 1 --stream true --chunk o | grep -q '"contentType" : "application\\/x-ndjson"'
 "$BIN" render-generation-response --api openai-chat --model verify --text ok --prompt-tokens 3 --completion-tokens 1 --stream true --chunk o | grep -q 'data: \[DONE\]'
@@ -518,6 +550,8 @@ JSON
 "$BIN" sample-logits --logits 0.1,0.9,0.2 --temperature 0 | grep -q '"tokenID" : 1'
 "$BIN" sample-logits --logits 0.1,0.9,0.8 --temperature 0 --repeat-penalty 2.0 --repeat-last-n 1 --recent-token-ids 1 | grep -q '"tokenID" : 2'
 "$BIN" sample-logits --logits 0.1,0.9,0.2 --temperature 0.7 --top-k 2 --top-p 0.8 --min-p 0.1 --seed 7 | grep -q '"sampler" : "temperature"'
+"$BIN" sample-logits --logits 3.0,2.0,1.5,0.4,0.1 --temperature 0.8 --top-p 0.95 --typical-p 0.7 --tfs-z 0.8 --seed 11 | grep -q '"sampler" : "temperature"'
+"$BIN" sample-logits --logits 0.1,0.2,0.3 --temperature 0 --logit-bias 0:5.0 | grep -q '"tokenID" : 0'
 "$BIN" simulate-decode-loop --model verify --prompt-tokens 4 --max-tokens 4 --stop END --token 10:he --token 11:llo --token 12:ENDtail | grep -q '"text" : "hello"'
 "$BIN" simulate-decode-loop --model verify --prompt-tokens 1 --max-tokens 4 --eos 2 --token 1:a --token '2:</s>' --token 3:b | grep -q '"completionTokens" : 2'
 "$BIN" simulate-decode-loop --model verify --prompt-tokens 1 --max-tokens 2 --token 1:a --token 2:b --token 3:c | grep -q '"finishReason" : "length"'
@@ -553,11 +587,20 @@ grep -q '"audio"' "$MESSAGE_METADATA_JSON"
 "$BIN" preflight-generate --model "$MODEL_DIR" --api openai-responses --json '{"model":"verify","input":"schema","text":{"format":{"type":"json_schema","schema":{"type":"object"}}},"stream":true}' | grep -q '"streamFraming" : "api-native-stream"'
 "$BIN" preflight-generate --model "$MODEL_DIR" --api openai-responses --json '{"model":"verify","input":"schema","text":{"format":{"type":"json_schema","schema":{"type":"object"}}},"tools":[{"type":"function","name":"search"}],"tool_choice":"auto","stream":true}' | grep -q '"toolNames" : \['
 RESPONSES_EXTRAS_JSON="$(mktemp)"
-"$BIN" preflight-generate --model "$MODEL_DIR" --api openai-responses --json '{"model":"verify","input":"responses extras","top_k":14,"min_p":0.07,"repetition_penalty":1.3,"logit_bias":{"2":-1},"enable_thinking":false,"thinking_budget":8,"thinking_start_token":"<reason>","user":"resp"}' > "$RESPONSES_EXTRAS_JSON"
+"$BIN" preflight-generate --model "$MODEL_DIR" --api openai-responses --json '{"model":"verify","input":"responses extras","max_completion_tokens":9,"top_k":14,"min_p":0.07,"repetition_penalty":1.3,"presence_penalty":0.22,"frequency_penalty":0.32,"logit_bias":{"2":-1},"enable_thinking":false,"thinking_budget":8,"thinking_start_token":"<reason>","logprobs":true,"top_logprobs":2,"resize_shape":[256],"adapter_path":"/tmp/resp-adapter","user":"resp"}' > "$RESPONSES_EXTRAS_JSON"
+grep -q '"maxTokens" : 9' "$RESPONSES_EXTRAS_JSON"
 grep -q '"topK" : 14' "$RESPONSES_EXTRAS_JSON"
+grep -q '"presencePenalty" : 0.22' "$RESPONSES_EXTRAS_JSON"
+grep -q '"frequencyPenalty" : 0.32' "$RESPONSES_EXTRAS_JSON"
+grep -q '"logprobs" : true' "$RESPONSES_EXTRAS_JSON"
+grep -q '"topLogprobs" : 2' "$RESPONSES_EXTRAS_JSON"
+grep -q '"resizeShape"' "$RESPONSES_EXTRAS_JSON"
+grep -q '"adapterPath" : "\\/tmp\\/resp-adapter"' "$RESPONSES_EXTRAS_JSON"
 grep -q '"thinkingStartToken" : "<reason>"' "$RESPONSES_EXTRAS_JSON"
 "$BIN" preflight-embed --model "$MODEL_DIR" --api ollama-embed --json '{"model":"verify","input":["alpha","beta"],"truncate":false,"keep_alive":"5m","options":{"num_ctx":1024}}' | grep -q '"inputCount" : 2'
 "$BIN" preflight-embed --model "$MODEL_DIR" --api ollama-embed --json '{"model":"verify","input":["alpha","beta"],"truncate":false,"keep_alive":"5m","options":{"num_ctx":1024}}' | grep -q '"keepAlive" : "5m"'
+"$BIN" preflight-embed --model "$MODEL_DIR" --api ollama-embed --json '{"model":"verify","input":["alpha","beta"],"truncate":false,"keep_alive":"5m","options":{"num_ctx":1024}}' | grep -q '"fallbackPolicy" : "diagnostic-501-no-generated-embedding"'
+"$BIN" preflight-embed --model "$MODEL_DIR" --api ollama-embed --json '{"model":"verify","input":["alpha","beta"],"truncate":false,"keep_alive":"5m","options":{"num_ctx":1024}}' | grep -q '"unavailableReason"'
 "$BIN" preflight-embed --model "$MODEL_DIR" --api ollama-embeddings --json '{"model":"verify","prompt":"legacy"}' | grep -q '"texts" :'
 "$BIN" preflight-embed --model "$MODEL_DIR" --api openai-embeddings --json '{"model":"verify","input":[[1,2,3],[4,5]]}' | grep -q '"tokenIDInputs"'
 "$BIN" preflight-model-operation --operation pull --json '{"model":"verify"}' | grep -q '"accepted" : false'
@@ -568,6 +611,15 @@ grep -q '"thinkingStartToken" : "<reason>"' "$RESPONSES_EXTRAS_JSON"
 "$BIN" preflight-ollama-residency --json '{"model":"verify","prompt":"","keep_alive":"5m"}' | grep -q '"action" : "load"'
 "$BIN" preflight-generate --model "$MODEL_DIR" --api ollama-generate --json '{"model":"verify","prompt":"look","images":["iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABDQottAAAAABJRU5ErkJggg=="]}' | grep -q '"totalRGBByteCount" : 9408'
 "$BIN" inspect-media --api ollama-generate --json '{"model":"verify","prompt":"look","images":["AAECAw==","data:image/png;base64,AAECAw==","https://example.invalid/i.png"],"options":{"stop":["</s>"],"seed":7}}' | grep -q '"source" : "dataURI"'
+VIDEO_MEDIA_JSON="$(mktemp)"
+"$BIN" inspect-media --api openai-chat --json "{\"model\":\"verify\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"video\",\"video\":\"$MODEL_DIR/tiny.mp4\",\"max_pixels\":50176,\"fps\":1},{\"type\":\"video_url\",\"video_url\":{\"url\":\"data:video/mp4;base64,AAAA\"},\"nframes\":4},{\"type\":\"input_video\",\"input_video\":\"data:video/mp4;base64,AAAA\",\"min_frames\":2,\"max_frames\":8},{\"type\":\"text\",\"text\":\"look\"}]}]}" > "$VIDEO_MEDIA_JSON"
+grep -q '"kind" : "video"' "$VIDEO_MEDIA_JSON"
+grep -q '"source" : "filePath"' "$VIDEO_MEDIA_JSON"
+grep -q '"source" : "dataURI"' "$VIDEO_MEDIA_JSON"
+grep -q '"videoMaxPixels" : 50176' "$VIDEO_MEDIA_JSON"
+grep -q '"videoNFrames" : 4' "$VIDEO_MEDIA_JSON"
+grep -q '"videoMinFrames" : 2' "$VIDEO_MEDIA_JSON"
+grep -q '"videoMaxFrames" : 8' "$VIDEO_MEDIA_JSON"
 "$BIN" plan-qwen-vl-images --api ollama-generate --json '{"model":"verify","prompt":"look","images":["iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABDQottAAAAABJRU5ErkJggg=="]}' | grep -q '"placeholderTokenCount" : 4'
 "$BIN" plan-qwen-vl-pixels --api ollama-generate --json '{"model":"verify","prompt":"look","images":["iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABDQottAAAAABJRU5ErkJggg=="]}' | grep -q '"rgbByteCount" : 9408'
 "$BIN" plan-qwen-vl-pixels --api ollama-generate --json '{"model":"verify","prompt":"look","images":["iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABDQottAAAAABJRU5ErkJggg=="]}' | grep -q '"patchFloat32ByteCount" : 75264'
@@ -580,7 +632,7 @@ grep -q '"thinkingStartToken" : "<reason>"' "$RESPONSES_EXTRAS_JSON"
 "$BIN" plan-qwen-vl-image-grid --height 224 --width 224 | grep -q '"placeholderTokenCount" : 64'
 
 PORT="${MLX_VLM_SWIFT_VERIFY_PORT:-11454}"
-"$BIN" serve --model "$MODEL_DIR" --port "$PORT" >/tmp/mlx-vlm-swift-verify-server.log 2>&1 &
+"$BIN" serve --model "$MODEL_DIR" --host 127.0.0.1 --port "$PORT" --adapter-path "$MODEL_DIR" --enable-thinking true --thinking-budget 7 --thinking-start-token '<think>' >/tmp/mlx-vlm-swift-verify-server.log 2>&1 &
 PID=$!
 trap 'kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true' EXIT
 sleep 0.5
@@ -592,6 +644,12 @@ fi
 
 curl -fsS "http://127.0.0.1:$PORT/health" | grep -q '"backend_ready":false'
 curl -fsS "http://127.0.0.1:$PORT/health" | grep -q '"model_loaded":true'
+curl -fsS "http://127.0.0.1:$PORT/health" | grep -q '"loaded_adapter"'
+curl -fsS "http://127.0.0.1:$PORT/health" | grep -q '"status":"healthy"'
+curl -fsS "http://127.0.0.1:$PORT/health" | grep -q '"loaded_model"'
+curl -fsS "http://127.0.0.1:$PORT/health" | grep -q '"loaded_context_size"'
+curl -fsS "http://127.0.0.1:$PORT/health" | grep -q '"continuous_batching_enabled":false'
+curl -fsS "http://127.0.0.1:$PORT/health" | grep -q '"apc_enabled":false'
 curl -fsS "http://127.0.0.1:$PORT/api/tags" | grep -q '"models"'
 MODEL_ID="$(basename "$MODEL_DIR")"
 curl -fsS "http://127.0.0.1:$PORT/v1/models?limit=20" | grep -q '"object":"list"'
@@ -608,6 +666,18 @@ curl -fsS -X POST "http://127.0.0.1:$PORT/api/show" \
   -d "{\"model\":\"$MODEL_ID\",\"verbose\":true}" | grep -q '"mlx_vlm.backend_ready"'
 curl -fsS "http://127.0.0.1:$PORT/backend/status" | grep -q '"generationUnavailable"'
 curl -fsS "http://127.0.0.1:$PORT/api/ps" | grep -q '"size_vram"'
+curl -fsS "http://127.0.0.1:$PORT/v1/cache/stats" | grep -q '"enabled":false'
+curl -fsS "http://127.0.0.1:$PORT/cache/stats" | grep -q '"enabled":false'
+curl -fsS -X POST "http://127.0.0.1:$PORT/v1/cache/reset" | grep -q '"status":"disabled"'
+curl -fsS -X POST "http://127.0.0.1:$PORT/cache/reset" | grep -q '"enabled":false'
+curl -fsS -X POST "http://127.0.0.1:$PORT/unload" | grep -q '"status":"success"'
+curl -fsS -X POST "http://127.0.0.1:$PORT/unload" | grep -q '"status":"no_model_loaded"'
+LOAD_BEFORE_API_UNLOAD="$(
+  curl -sS -X POST "http://127.0.0.1:$PORT/api/generate" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"verify","prompt":"","keep_alive":"5m"}'
+)"
+echo "$LOAD_BEFORE_API_UNLOAD" | grep -q '"done_reason":"load"'
 curl -fsS "http://127.0.0.1:$PORT/api/unload" | grep -q '"unloaded":true'
 curl -fsS "http://127.0.0.1:$PORT/api/ps" | grep -q '"models":\[\]'
 LOAD_RESPONSE="$(

@@ -1,5 +1,17 @@
 import Foundation
 
+public struct HuggingFaceCachedModel: Codable, Equatable, Sendable {
+    public let id: String
+    public let path: String
+    public let created: Int
+
+    public init(id: String, path: String, created: Int) {
+        self.id = id
+        self.path = path
+        self.created = created
+    }
+}
+
 public struct HuggingFaceCacheResolver {
     public let fileManager: FileManager
     public let environment: [String: String]
@@ -28,6 +40,43 @@ public struct HuggingFaceCacheResolver {
             }
         }
         return nil
+    }
+
+    public func cachedMLXModels() -> [HuggingFaceCachedModel] {
+        var models: [HuggingFaceCachedModel] = []
+        var seen: Set<String> = []
+        for cacheRoot in cacheRoots() {
+            guard let entries = try? fileManager.contentsOfDirectory(
+                at: cacheRoot,
+                includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            ) else {
+                continue
+            }
+            for entry in entries where entry.lastPathComponent.hasPrefix("models--") {
+                guard (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true,
+                      let snapshot = resolveSnapshot(in: entry),
+                      isProbablyMLXModel(at: snapshot)
+                else {
+                    continue
+                }
+                let id = String(entry.lastPathComponent.dropFirst("models--".count))
+                    .replacingOccurrences(of: "--", with: "/")
+                guard seen.insert(id).inserted else {
+                    continue
+                }
+                let values = try? snapshot.resourceValues(forKeys: [.contentModificationDateKey])
+                let created = Int((values?.contentModificationDate ?? .distantPast).timeIntervalSince1970)
+                models.append(HuggingFaceCachedModel(
+                    id: id,
+                    path: snapshot.standardizedFileURL.path,
+                    created: max(created, 0)
+                ))
+            }
+        }
+        return models.sorted { lhs, rhs in
+            lhs.id.localizedStandardCompare(rhs.id) == .orderedAscending
+        }
     }
 
     public func cacheRoots() -> [URL] {
@@ -91,5 +140,14 @@ public struct HuggingFaceCacheResolver {
             .appendingPathComponent("snapshots", isDirectory: true)
             .appendingPathComponent(snapshotName, isDirectory: true)
         return fileManager.fileExists(atPath: snapshotURL.path) ? snapshotURL : nil
+    }
+
+    private func isProbablyMLXModel(at url: URL) -> Bool {
+        let required = [
+            "config.json",
+            "model.safetensors.index.json",
+            "tokenizer_config.json",
+        ]
+        return required.allSatisfy { fileManager.fileExists(atPath: url.appendingPathComponent($0).path) }
     }
 }

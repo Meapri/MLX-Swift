@@ -77,8 +77,10 @@ public struct ModelStore {
 
     public func loadDescriptor(pathOrIdentifier: String) throws -> ModelDescriptor {
         let resolved = try resolveModelURL(pathOrIdentifier: pathOrIdentifier)
-        let modelURL = resolved.url
+        return try loadDescriptor(modelURL: resolved.url, identifier: resolved.identifier)
+    }
 
+    public func loadDescriptor(modelURL: URL, identifier: String? = nil) throws -> ModelDescriptor {
         let config = try loadConfig(in: modelURL)
         guard let rawModelType = config["model_type"]?.stringValue else {
             throw ModelStoreError.invalidConfig("missing string field 'model_type'")
@@ -96,7 +98,9 @@ public struct ModelStore {
         let safetensorsMetadata = weightFiles.map {
             SafetensorsMetadataReader.readFileMetadata(at: modelURL.appendingPathComponent($0.name))
         }
-        let tokenizerMetadata = try TokenizerMetadataLoader(fileManager: fileManager).load(from: modelURL)
+        let tokenizerMetadata = try TokenizerMetadataLoader(fileManager: fileManager)
+            .load(from: modelURL)
+            .mergingTokenIDs(from: config)
         let processorMetadata = ProcessorMetadataLoader(fileManager: fileManager).load(from: modelURL)
         let adapterMetadata = try AdapterMetadataLoader(fileManager: fileManager).load(from: modelURL)
         let quantizationMetadata = QuantizationMetadataLoader().load(config: config)
@@ -107,7 +111,7 @@ public struct ModelStore {
         )
 
         return ModelDescriptor(
-            id: resolved.identifier ?? modelURL.lastPathComponent,
+            id: identifier ?? modelURL.lastPathComponent,
             path: modelURL.path,
             rawModelType: rawModelType,
             canonicalModelType: canonicalType,

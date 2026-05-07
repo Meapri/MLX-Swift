@@ -41,10 +41,64 @@ public struct MLXMetalLibraryReport: Codable, Equatable, Sendable {
     }
 }
 
+public struct MLXRuntimePackageReport: Codable, Equatable, Sendable {
+    public let availability: MLXBackendAvailability
+    public let metalLibrary: MLXMetalLibraryReport
+    public let runtimePackageReady: Bool
+    public let requiredEnvironment: [String]
+    public let requiredRuntimeFiles: [String]
+    public let blockingReasons: [String]
+
+    public init(
+        availability: MLXBackendAvailability,
+        metalLibrary: MLXMetalLibraryReport
+    ) {
+        self.availability = availability
+        self.metalLibrary = metalLibrary
+        self.runtimePackageReady = availability.canCreateBackend && metalLibrary.ready
+        self.requiredEnvironment = [
+            "MLXVLM_ENABLE_MLX_BACKEND=1",
+            "MLXVLM_ENABLE_TOKENIZER_INTEGRATIONS=1",
+            "MLXVLM_ENABLE_REAL_MLX_API=1",
+        ]
+        self.requiredRuntimeFiles = [MLXMetalLibrarySupport.defaultMetallibName]
+
+        var reasons = availability.blockingReasons
+        if !metalLibrary.ready {
+            reasons.append(contentsOf: metalLibrary.instructions)
+            if metalLibrary.instructions.isEmpty {
+                reasons.append("Package \(MLXMetalLibrarySupport.defaultMetallibName) next to the executable or in \(MLXMetalLibrarySupport.swiftPMBundleDirectory).")
+            }
+        }
+        reasons.append(contentsOf: metalLibrary.errors)
+        self.blockingReasons = reasons
+    }
+}
+
 public enum MLXMetalLibrarySupport {
     public static let defaultMetallibName = "default.metallib"
     public static let upstreamMetallibName = "mlx.metallib"
     public static let swiftPMBundleDirectory = "mlx-swift_Cmlx.bundle"
+
+    public static func runtimePackageReport(
+        rootPath: String = FileManager.default.currentDirectoryPath,
+        fileManager: FileManager = .default,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        currentDirectory: String = FileManager.default.currentDirectoryPath,
+        executablePath: String? = CommandLine.arguments.first,
+        install: Bool = false
+    ) -> MLXRuntimePackageReport {
+        MLXRuntimePackageReport(
+            availability: MLXBackendFactory.availability(rootPath: rootPath),
+            metalLibrary: ensureDefaultLibraryAvailable(
+                fileManager: fileManager,
+                environment: environment,
+                currentDirectory: currentDirectory,
+                executablePath: executablePath,
+                install: install
+            )
+        )
+    }
 
     public static func ensureDefaultLibraryAvailable(
         fileManager: FileManager = .default,

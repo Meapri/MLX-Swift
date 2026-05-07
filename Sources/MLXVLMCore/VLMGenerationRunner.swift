@@ -47,7 +47,8 @@ public struct VLMGenerationRunner: Sendable {
             promptTokenCount: processed.tokenIDs?.count ?? 0,
             api: api,
             stream: request.stream,
-            chunks: chunks
+            chunks: chunks,
+            request: request
         )
     }
 }

@@ -93,7 +93,11 @@ public struct ModelCapabilityPlanner {
             type == "qwen2_vl" ||
             type == "qwen2_5_vl" ||
             type == "qwen3_vl" ||
-            type == "qwen3_vl_moe"
+            type == "qwen3_vl_moe" ||
+            type == "qwen3_5" ||
+            type == "qwen3_5_moe" ||
+            type == "qwen3_omni_moe" ||
+            type == "gemma4"
     }
 
     private func supportsAudio(_ type: String) -> Bool {

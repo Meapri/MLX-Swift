@@ -50,10 +50,24 @@ public struct TokenizerMetadata: Codable, Equatable, Sendable {
     public let imageTokenID: Int?
     public let videoToken: String?
     public let videoTokenID: Int?
+    public let audioToken: String?
+    public let audioTokenID: Int?
     public let visionStartToken: String?
     public let visionStartTokenID: Int?
     public let visionEndToken: String?
     public let visionEndTokenID: Int?
+    public let beginImageToken: String?
+    public let beginImageTokenID: Int?
+    public let endImageToken: String?
+    public let endImageTokenID: Int?
+    public let beginAudioToken: String?
+    public let beginAudioTokenID: Int?
+    public let endAudioToken: String?
+    public let endAudioTokenID: Int?
+    public let startTurnToken: String?
+    public let startTurnTokenID: Int?
+    public let endTurnToken: String?
+    public let endTurnTokenID: Int?
 
     public init(
         hasTokenizerJSON: Bool,
@@ -71,10 +85,24 @@ public struct TokenizerMetadata: Codable, Equatable, Sendable {
         imageTokenID: Int?,
         videoToken: String?,
         videoTokenID: Int?,
+        audioToken: String?,
+        audioTokenID: Int?,
         visionStartToken: String?,
         visionStartTokenID: Int?,
         visionEndToken: String?,
-        visionEndTokenID: Int?
+        visionEndTokenID: Int?,
+        beginImageToken: String?,
+        beginImageTokenID: Int?,
+        endImageToken: String?,
+        endImageTokenID: Int?,
+        beginAudioToken: String?,
+        beginAudioTokenID: Int?,
+        endAudioToken: String?,
+        endAudioTokenID: Int?,
+        startTurnToken: String?,
+        startTurnTokenID: Int?,
+        endTurnToken: String?,
+        endTurnTokenID: Int?
     ) {
         self.hasTokenizerJSON = hasTokenizerJSON
         self.hasTokenizerModel = hasTokenizerModel
@@ -91,10 +119,63 @@ public struct TokenizerMetadata: Codable, Equatable, Sendable {
         self.imageTokenID = imageTokenID
         self.videoToken = videoToken
         self.videoTokenID = videoTokenID
+        self.audioToken = audioToken
+        self.audioTokenID = audioTokenID
         self.visionStartToken = visionStartToken
         self.visionStartTokenID = visionStartTokenID
         self.visionEndToken = visionEndToken
         self.visionEndTokenID = visionEndTokenID
+        self.beginImageToken = beginImageToken
+        self.beginImageTokenID = beginImageTokenID
+        self.endImageToken = endImageToken
+        self.endImageTokenID = endImageTokenID
+        self.beginAudioToken = beginAudioToken
+        self.beginAudioTokenID = beginAudioTokenID
+        self.endAudioToken = endAudioToken
+        self.endAudioTokenID = endAudioTokenID
+        self.startTurnToken = startTurnToken
+        self.startTurnTokenID = startTurnTokenID
+        self.endTurnToken = endTurnToken
+        self.endTurnTokenID = endTurnTokenID
+    }
+
+    public func mergingTokenIDs(from config: JSONValue) -> TokenizerMetadata {
+        let object = config.objectValue ?? [:]
+        return TokenizerMetadata(
+            hasTokenizerJSON: hasTokenizerJSON,
+            hasTokenizerModel: hasTokenizerModel,
+            hasTiktoken: hasTiktoken,
+            hasVocabJSON: hasVocabJSON,
+            hasMergesTXT: hasMergesTXT,
+            hasVocabTXT: hasVocabTXT,
+            hasTokenizerConfig: hasTokenizerConfig,
+            hasSpecialTokensMap: hasSpecialTokensMap,
+            tokenizerJSONMetadata: tokenizerJSONMetadata,
+            chatTemplateSource: chatTemplateSource,
+            chatTemplate: chatTemplate,
+            imageToken: imageToken,
+            imageTokenID: imageTokenID ?? object["image_token_id"]?.intValue,
+            videoToken: videoToken,
+            videoTokenID: videoTokenID ?? object["video_token_id"]?.intValue,
+            audioToken: audioToken,
+            audioTokenID: audioTokenID ?? object["audio_token_id"]?.intValue,
+            visionStartToken: visionStartToken,
+            visionStartTokenID: visionStartTokenID ?? object["vision_start_token_id"]?.intValue,
+            visionEndToken: visionEndToken,
+            visionEndTokenID: visionEndTokenID ?? object["vision_end_token_id"]?.intValue,
+            beginImageToken: beginImageToken,
+            beginImageTokenID: beginImageTokenID ?? object["boi_token_id"]?.intValue,
+            endImageToken: endImageToken,
+            endImageTokenID: endImageTokenID ?? object["eoi_token_id"]?.intValue,
+            beginAudioToken: beginAudioToken,
+            beginAudioTokenID: beginAudioTokenID ?? object["boa_token_id"]?.intValue,
+            endAudioToken: endAudioToken,
+            endAudioTokenID: endAudioTokenID ?? object["eoa_token_id"]?.intValue,
+            startTurnToken: startTurnToken,
+            startTurnTokenID: startTurnTokenID ?? object["sot_token_id"]?.intValue,
+            endTurnToken: endTurnToken,
+            endTurnTokenID: endTurnTokenID ?? object["eot_token_id"]?.intValue
+        )
     }
 }
 
@@ -118,6 +199,7 @@ public struct TokenizerMetadataLoader {
         let tokenizerConfig = try loadJSONObjectIfPresent(tokenizerConfigURL)
         let specialTokensMap = try loadJSONObjectIfPresent(specialTokensMapURL)
         let addedTokens = tokenizerConfig?["added_tokens_decoder"]?.objectValue
+        let tokenizerJSONAddedTokenIDs = loadTokenizerJSONAddedTokenIDs(tokenizerJSONURL)
         let tokenizerJSONMetadata = loadTokenizerJSONMetadata(tokenizerJSONURL)
 
         let chatTemplate = try loadChatTemplate(modelURL: modelURL, tokenizerConfig: tokenizerConfig)
@@ -140,28 +222,77 @@ public struct TokenizerMetadataLoader {
                 key: "image_token",
                 defaultValue: "<|image_pad|>"
             ),
-            imageTokenID: tokenID(tokenizerConfig: tokenizerConfig, addedTokens: addedTokens, key: "image_token_id", token: "<|image_pad|>"),
+            imageTokenID: tokenID(tokenizerConfig: tokenizerConfig, addedTokens: addedTokens, tokenizerJSONAddedTokenIDs: tokenizerJSONAddedTokenIDs, key: "image_token_id", token: "<|image_pad|>"),
             videoToken: tokenString(
                 explicit: tokenizerConfig?["video_token"],
                 specialTokensMap: specialTokensMap,
                 key: "video_token",
                 defaultValue: "<|video_pad|>"
             ),
-            videoTokenID: tokenID(tokenizerConfig: tokenizerConfig, addedTokens: addedTokens, key: "video_token_id", token: "<|video_pad|>"),
+            videoTokenID: tokenID(tokenizerConfig: tokenizerConfig, addedTokens: addedTokens, tokenizerJSONAddedTokenIDs: tokenizerJSONAddedTokenIDs, key: "video_token_id", token: "<|video_pad|>"),
+            audioToken: tokenString(
+                explicit: tokenizerConfig?["audio_token"],
+                specialTokensMap: specialTokensMap,
+                key: "audio_token",
+                defaultValue: "<|audio|>"
+            ),
+            audioTokenID: tokenID(tokenizerConfig: tokenizerConfig, addedTokens: addedTokens, tokenizerJSONAddedTokenIDs: tokenizerJSONAddedTokenIDs, key: "audio_token_id", token: "<|audio|>"),
             visionStartToken: tokenString(
                 explicit: tokenizerConfig?["vision_start_token"],
                 specialTokensMap: specialTokensMap,
                 key: "vision_start_token",
                 defaultValue: "<|vision_start|>"
             ),
-            visionStartTokenID: tokenID(tokenizerConfig: tokenizerConfig, addedTokens: addedTokens, key: "vision_start_token_id", token: "<|vision_start|>"),
+            visionStartTokenID: tokenID(tokenizerConfig: tokenizerConfig, addedTokens: addedTokens, tokenizerJSONAddedTokenIDs: tokenizerJSONAddedTokenIDs, key: "vision_start_token_id", token: "<|vision_start|>"),
             visionEndToken: tokenString(
                 explicit: tokenizerConfig?["vision_end_token"],
                 specialTokensMap: specialTokensMap,
                 key: "vision_end_token",
                 defaultValue: "<|vision_end|>"
             ),
-            visionEndTokenID: tokenID(tokenizerConfig: tokenizerConfig, addedTokens: addedTokens, key: "vision_end_token_id", token: "<|vision_end|>")
+            visionEndTokenID: tokenID(tokenizerConfig: tokenizerConfig, addedTokens: addedTokens, tokenizerJSONAddedTokenIDs: tokenizerJSONAddedTokenIDs, key: "vision_end_token_id", token: "<|vision_end|>"),
+            beginImageToken: tokenString(
+                explicit: tokenizerConfig?["boi_token"],
+                specialTokensMap: specialTokensMap,
+                key: "boi_token",
+                defaultValue: "<|image>"
+            ),
+            beginImageTokenID: tokenID(tokenizerConfig: tokenizerConfig, addedTokens: addedTokens, tokenizerJSONAddedTokenIDs: tokenizerJSONAddedTokenIDs, key: "boi_token_id", token: "<|image>"),
+            endImageToken: tokenString(
+                explicit: tokenizerConfig?["eoi_token"],
+                specialTokensMap: specialTokensMap,
+                key: "eoi_token",
+                defaultValue: "<image|>"
+            ),
+            endImageTokenID: tokenID(tokenizerConfig: tokenizerConfig, addedTokens: addedTokens, tokenizerJSONAddedTokenIDs: tokenizerJSONAddedTokenIDs, key: "eoi_token_id", token: "<image|>"),
+            beginAudioToken: tokenString(
+                explicit: tokenizerConfig?["boa_token"],
+                specialTokensMap: specialTokensMap,
+                key: "boa_token",
+                defaultValue: "<|audio>"
+            ),
+            beginAudioTokenID: tokenID(tokenizerConfig: tokenizerConfig, addedTokens: addedTokens, tokenizerJSONAddedTokenIDs: tokenizerJSONAddedTokenIDs, key: "boa_token_id", token: "<|audio>"),
+            endAudioToken: tokenString(
+                explicit: tokenizerConfig?["eoa_token"],
+                specialTokensMap: specialTokensMap,
+                key: "eoa_token",
+                defaultValue: "<audio|>"
+            ),
+            endAudioTokenID: tokenID(tokenizerConfig: tokenizerConfig, addedTokens: addedTokens, tokenizerJSONAddedTokenIDs: tokenizerJSONAddedTokenIDs, key: "eoa_token_id", token: "<audio|>"),
+            startTurnToken: tokenString(
+                explicit: tokenizerConfig?["sot_token"],
+                specialTokensMap: specialTokensMap,
+                key: "sot_token",
+                defaultValue: "<|turn>"
+            ),
+            startTurnTokenID: tokenID(tokenizerConfig: tokenizerConfig, addedTokens: addedTokens, tokenizerJSONAddedTokenIDs: tokenizerJSONAddedTokenIDs, key: "sot_token_id", token: "<|turn>"),
+            endTurnToken: tokenString(
+                explicit: tokenizerConfig?["eot_token"],
+                specialTokensMap: specialTokensMap,
+                key: "eot_token",
+                defaultValue: "<turn|>"
+            ),
+            endTurnTokenID: tokenID(tokenizerConfig: tokenizerConfig, addedTokens: addedTokens, tokenizerJSONAddedTokenIDs: tokenizerJSONAddedTokenIDs, key: "eot_token_id", token: "<turn|>")
         )
     }
 
@@ -243,6 +374,27 @@ public struct TokenizerMetadataLoader {
         }
     }
 
+    private func loadTokenizerJSONAddedTokenIDs(_ url: URL) -> [String: Int] {
+        guard fileManager.fileExists(atPath: url.path),
+              let data = try? Data(contentsOf: url),
+              let json = try? JSONDecoder().decode(JSONValue.self, from: data),
+              let tokens = json.objectValue?["added_tokens"]?.arrayValue
+        else {
+            return [:]
+        }
+        var result: [String: Int] = [:]
+        for token in tokens {
+            guard let object = token.objectValue,
+                  let content = object["content"]?.stringValue,
+                  let id = object["id"]?.intValue
+            else {
+                continue
+            }
+            result[content] = id
+        }
+        return result
+    }
+
     private func tokenString(
         explicit: JSONValue?,
         specialTokensMap: [String: JSONValue]?,
@@ -266,6 +418,7 @@ public struct TokenizerMetadataLoader {
     private func tokenID(
         tokenizerConfig: [String: JSONValue]?,
         addedTokens: [String: JSONValue]?,
+        tokenizerJSONAddedTokenIDs: [String: Int],
         key: String,
         token: String
     ) -> Int? {
@@ -284,6 +437,6 @@ public struct TokenizerMetadataLoader {
                 return intID
             }
         }
-        return nil
+        return tokenizerJSONAddedTokenIDs[token]
     }
 }

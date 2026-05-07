@@ -5,6 +5,7 @@ public enum PromptRenderStyle: String, Codable, Equatable, Sendable {
     case qwenChat
     case llama3Chat
     case mistralInstruct
+    case gemma4Chat
 }
 
 public struct GenerationPreflightPlan: Codable, Equatable, Sendable {
@@ -125,8 +126,12 @@ public struct ChatMessageMetadataPlan: Codable, Equatable, Sendable {
         switch part {
         case .text:
             return "text"
+        case .imagePlaceholder:
+            return "image"
         case .imageURL:
             return "image"
+        case .audioPlaceholder:
+            return "audio"
         case .audioURL:
             return "audio"
         case .videoURL:
@@ -156,7 +161,8 @@ public struct GenerationPreflightPlanner {
     public func plan(request: GenerationRequest) -> GenerationPreflightPlan {
         let builder = QwenVLPromptBuilder(
             imageToken: descriptor.tokenizerMetadata.imageToken ?? "<|image_pad|>",
-            videoToken: descriptor.tokenizerMetadata.videoToken ?? "<|video_pad|>"
+            videoToken: descriptor.tokenizerMetadata.videoToken ?? "<|video_pad|>",
+            audioToken: descriptor.tokenizerMetadata.audioToken ?? "<audio>"
         )
         let style = promptStyle(for: descriptor)
         let modelPrompt = switch style {
@@ -168,6 +174,12 @@ public struct GenerationPreflightPlanner {
             builder.llama3ChatPrompt(messages: request.messages)
         case .mistralInstruct:
             builder.mistralInstructPrompt(messages: request.messages)
+        case .gemma4Chat:
+            builder.gemma4ChatPrompt(
+                messages: request.messages,
+                tools: request.metadata.tools,
+                enableThinking: request.parameters.enableThinking == true
+            )
         }
         let plainPrompt = builder.plainPrompt(messages: request.messages)
         let promptRender = OllamaPromptRenderer(builder: builder).render(
@@ -243,10 +255,22 @@ public struct GenerationPreflightPlanner {
 
     private func promptStyle(for descriptor: ModelDescriptor) -> PromptRenderStyle {
         switch descriptor.canonicalModelType {
-        case "qwen2_vl", "qwen2_5_vl":
+        case "qwen2_vl",
+             "qwen2_5_vl",
+             "qwen3_vl",
+             "qwen3_vl_moe",
+             "qwen3_5",
+             "qwen3_5_moe",
+             "qwen3_omni_moe":
             return .qwenChat
         default:
+            if descriptor.canonicalModelType == "gemma4" {
+                return .gemma4Chat
+            }
             let template = descriptor.tokenizerMetadata.chatTemplate ?? ""
+            if template.contains("<|turn>"), template.contains("<turn|>") {
+                return .gemma4Chat
+            }
             if template.contains("<|start_header_id|>"),
                template.contains("<|end_header_id|>"),
                template.contains("<|eot_id|>")
@@ -262,7 +286,13 @@ public struct GenerationPreflightPlanner {
 
     private func qwenDefaultPatchSize() -> Int {
         switch descriptor.canonicalModelType {
-        case "qwen2_vl", "qwen2_5_vl":
+        case "qwen2_vl",
+             "qwen2_5_vl",
+             "qwen3_vl",
+             "qwen3_vl_moe",
+             "qwen3_5",
+             "qwen3_5_moe",
+             "qwen3_omni_moe":
             return 14
         default:
             return 14
@@ -307,6 +337,20 @@ public struct GenerationPreflightPlanner {
         if imagePixels.errorCount > imageInputs.errorCount {
             reasons.append("\(imagePixels.errorCount) image input(s) could not be decoded and resized.")
         }
+        if media.imageCount > 1, singleImageOnlyModels.contains(descriptor.canonicalModelType) {
+            reasons.append("Model type \(descriptor.canonicalModelType) matches Python mlx-vlm single-image-only behavior and does not support multi-image chat.")
+        }
         return reasons
+    }
+
+    private var singleImageOnlyModels: Set<String> {
+        [
+            "llava_next",
+            "llava_bunny",
+            "paligemma",
+            "multi_modality",
+            "mllama",
+            "falcon_ocr",
+        ]
     }
 }

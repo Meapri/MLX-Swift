@@ -25,12 +25,12 @@ public struct MLXGenerateParametersPlan: Codable, Equatable, Sendable {
 
     public init(runtime: GenerationRuntimePlan) {
         self.sourceAPI = "mlx-swift-lm GenerateParameters"
-        self.prefillStepSize = 512
+        self.prefillStepSize = runtime.prefillStepSize ?? 512
         self.maxTokens = runtime.maxCompletionTokens
         self.maxKVSize = runtime.maxKVSize
         self.kvBits = runtime.kvBits.flatMap(Self.integralInt)
         self.kvGroupSize = runtime.kvGroupSize ?? 64
-        self.quantizedKVStart = 0
+        self.quantizedKVStart = runtime.quantizedKVStart ?? 0
         self.temperature = Float(runtime.sampling.temperature)
         self.topP = Float(runtime.sampling.topP)
         self.topK = runtime.sampling.topK
@@ -67,9 +67,6 @@ public struct MLXGenerateParametersPlan: Codable, Equatable, Sendable {
         var warnings: [String] = []
         if runtime.kvBits != nil && kvBits == nil {
             warnings.append("mlx-swift-lm GenerateParameters expects integral kvBits.")
-        }
-        if runtime.sampling.seed != 0 {
-            warnings.append("Seed handling is outside GenerateParameters and must be applied through MLX random state when the real backend is wired.")
         }
         if runtime.sampling.penalizeNewline != nil {
             warnings.append("Newline penalty is not represented directly in mlx-swift-lm GenerateParameters.")

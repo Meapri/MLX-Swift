@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+SWIFT_BUILD_JOBS="${SWIFT_BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)}"
 
 MODEL="${MLXVLM_REAL_SMOKE_MODEL:-/Users/naen/.cache/huggingface/hub/models--mlx-community--gemma-4-e4b-it-4bit/snapshots/cc3b666c01c20395e0dcebd53854504c7d9821f9}"
 
@@ -41,7 +42,7 @@ export MLXVLM_ENABLE_TOKENIZER_INTEGRATIONS=1
 export MLXVLM_ENABLE_REAL_MLX_API=1
 export CLANG_MODULE_CACHE_PATH="$BUILD_DIR/.build/clang-module-cache"
 
-swift build --disable-sandbox --scratch-path "$SCRATCH_DIR" --product mlx-vlm-swift
+swift build --disable-sandbox --jobs "$SWIFT_BUILD_JOBS" --scratch-path "$SCRATCH_DIR" --product mlx-vlm-swift
 BIN="$SCRATCH_DIR/arm64-apple-macosx/debug/mlx-vlm-swift"
 
 "$BIN" serve --model "$MODEL" --port "$PORT" --max-tokens 8 --temperature 0.0 > "$SERVER_LOG" 2>&1 &
@@ -73,12 +74,69 @@ echo "$CHAT_RESPONSE" | grep -q '"content":"Hello\."'
 echo "$CHAT_RESPONSE" | grep -q '"prompt_tokens":16'
 echo "$CHAT_RESPONSE" | grep -q '"completion_tokens":2'
 
+JSON_MODE_RESPONSE="$(
+  curl -fsS -m 90 "http://127.0.0.1:$PORT/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"gemma4","messages":[{"role":"user","content":"Say hello."}],"response_format":{"type":"json_object"},"max_tokens":4,"temperature":0}'
+)"
+echo "$JSON_MODE_RESPONSE" | grep -q '"content":"{' || echo "$JSON_MODE_RESPONSE" | grep -q '"content":"\['
+
 TOOL_RESPONSE="$(
   curl -fsS -m 60 "http://127.0.0.1:$PORT/v1/chat/completions" \
     -H 'Content-Type: application/json' \
     -d '{"model":"gemma4","messages":[{"role":"user","content":"Say hi."}],"tools":[{"type":"function","function":{"name":"lookup","description":"lookup","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}],"max_tokens":8,"temperature":0}'
 )"
 echo "$TOOL_RESPONSE" | grep -q '"choices"'
+
+TOOL_CALL_RESPONSE="$(
+  curl -fsS -m 120 "http://127.0.0.1:$PORT/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"gemma4","messages":[{"role":"system","content":"You must answer only by calling the lookup function. Do not write ordinary text."},{"role":"user","content":"Use the lookup function with query exactly swift mlx."}],"tools":[{"type":"function","function":{"name":"lookup","description":"lookup information","parameters":{"type":"object","properties":{"query":{"type":"string","description":"search query"}},"required":["query"]}}}],"tool_choice":{"type":"function","function":{"name":"lookup"}},"max_tokens":64,"temperature":0}'
+)"
+echo "$TOOL_CALL_RESPONSE" | grep -q '"finish_reason":"tool_calls"'
+echo "$TOOL_CALL_RESPONSE" | grep -q '"tool_calls"'
+echo "$TOOL_CALL_RESPONSE" | grep -q '"name":"lookup"'
+echo "$TOOL_CALL_RESPONSE" | grep -q '"arguments":"{\\"query\\":\\"swift mlx\\"}"'
+
+RESPONSES_TOOL_CALL_RESPONSE="$(
+  curl -fsS -m 120 "http://127.0.0.1:$PORT/v1/responses" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"gemma4","input":[{"role":"system","content":"You must answer only by calling the lookup function. Do not write ordinary text."},{"role":"user","content":"Use the lookup function with query exactly swift mlx."}],"tools":[{"type":"function","function":{"name":"lookup","description":"lookup information","parameters":{"type":"object","properties":{"query":{"type":"string","description":"search query"}},"required":["query"]}}}],"tool_choice":{"type":"function","function":{"name":"lookup"}},"max_output_tokens":64,"temperature":0,"top_p":1,"truncation":"auto","user":"gemma-user","metadata":{"trace":"gemma-smoke"}}'
+)"
+echo "$RESPONSES_TOOL_CALL_RESPONSE" | grep -q '"object":"response"'
+echo "$RESPONSES_TOOL_CALL_RESPONSE" | grep -q '"max_output_tokens":64'
+echo "$RESPONSES_TOOL_CALL_RESPONSE" | grep -q '"temperature":0'
+echo "$RESPONSES_TOOL_CALL_RESPONSE" | grep -q '"top_p":1'
+echo "$RESPONSES_TOOL_CALL_RESPONSE" | grep -q '"truncation":"auto"'
+echo "$RESPONSES_TOOL_CALL_RESPONSE" | grep -q '"user":"gemma-user"'
+echo "$RESPONSES_TOOL_CALL_RESPONSE" | grep -q '"metadata":{"trace":"gemma-smoke"}'
+echo "$RESPONSES_TOOL_CALL_RESPONSE" | grep -q '"type":"function_call"'
+echo "$RESPONSES_TOOL_CALL_RESPONSE" | grep -q '"call_id"'
+echo "$RESPONSES_TOOL_CALL_RESPONSE" | grep -q '"name":"lookup"'
+echo "$RESPONSES_TOOL_CALL_RESPONSE" | grep -q '"arguments":"{\\"query\\":\\"swift mlx\\"}"'
+
+RESPONSES_TOOL_STREAM="$(mktemp)"
+curl -sS -m 120 -i "http://127.0.0.1:$PORT/v1/responses" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gemma4","input":[{"role":"system","content":"You must answer only by calling the lookup function. Do not write ordinary text."},{"role":"user","content":"Use the lookup function with query exactly swift mlx."}],"tools":[{"type":"function","function":{"name":"lookup","description":"lookup information","parameters":{"type":"object","properties":{"query":{"type":"string","description":"search query"}},"required":["query"]}}}],"tool_choice":{"type":"function","function":{"name":"lookup"}},"max_output_tokens":64,"temperature":0,"top_p":1,"truncation":"auto","user":"gemma-user","metadata":{"trace":"gemma-smoke"},"stream":true}' > "$RESPONSES_TOOL_STREAM"
+grep -qi '^Content-Type: text/event-stream' "$RESPONSES_TOOL_STREAM"
+if grep -qi '^Content-Length:' "$RESPONSES_TOOL_STREAM"; then
+  echo "OpenAI Responses tool stream unexpectedly included Content-Length"
+  cat "$RESPONSES_TOOL_STREAM"
+  exit 1
+fi
+grep -q 'event: response.function_call_arguments.done' "$RESPONSES_TOOL_STREAM"
+grep -q '"max_output_tokens":64' "$RESPONSES_TOOL_STREAM"
+grep -q '"temperature":0' "$RESPONSES_TOOL_STREAM"
+grep -q '"top_p":1' "$RESPONSES_TOOL_STREAM"
+grep -q '"truncation":"auto"' "$RESPONSES_TOOL_STREAM"
+grep -q '"user":"gemma-user"' "$RESPONSES_TOOL_STREAM"
+grep -q '"metadata":{"trace":"gemma-smoke"}' "$RESPONSES_TOOL_STREAM"
+grep -q '"type":"function_call"' "$RESPONSES_TOOL_STREAM"
+grep -q '"call_id"' "$RESPONSES_TOOL_STREAM"
+grep -q '"name":"lookup"' "$RESPONSES_TOOL_STREAM"
+grep -q '"arguments":"{\\"query\\":\\"swift mlx\\"}"' "$RESPONSES_TOOL_STREAM"
+grep -q 'data: \[DONE\]' "$RESPONSES_TOOL_STREAM"
 
 GREEN_PNG="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 OLLAMA_IMAGE_RESPONSE="$(
@@ -131,5 +189,7 @@ EMBEDDING_RESPONSE="$(
 echo "$EMBEDDING_RESPONSE" | grep -q 'HTTP/1.1 501 Not Implemented'
 echo "$EMBEDDING_RESPONSE" | grep -q '"activeBackend":"mlx-swift-vlm"'
 echo "$EMBEDDING_RESPONSE" | grep -q '"inputCount":1'
+echo "$EMBEDDING_RESPONSE" | grep -q '"fallbackPolicy":"diagnostic-501-no-generated-embedding"'
+echo "$EMBEDDING_RESPONSE" | grep -q '"unavailableReason"'
 
 echo "real Gemma4 smoke passed"

@@ -259,6 +259,9 @@ struct MLXVLMCli {
             printJSON(MLXBackendFactory.availability(rootPath: root))
         case "inspect-mlx-metal-library":
             printJSON(MLXMetalLibrarySupport.ensureDefaultLibraryAvailable(install: false))
+        case "inspect-runtime-package":
+            let root = optionalValue(for: "--root", in: arguments) ?? FileManager.default.currentDirectoryPath
+            printJSON(MLXMetalLibrarySupport.runtimePackageReport(rootPath: root, install: false))
         case "preflight-mlx-backend-load":
             let path = try value(for: "--model", in: arguments)
             let root = optionalValue(for: "--root", in: arguments) ?? FileManager.default.currentDirectoryPath
@@ -582,12 +585,15 @@ struct MLXVLMCli {
             let recentTokenIDs = try optionalValue(for: "--recent-token-ids", in: arguments)
                 .map(parseIntCSV) ?? []
             let newlineTokenID = optionalValue(for: "--newline-token-id", in: arguments).flatMap(Int.init)
+            let logitBias = try optionalValue(for: "--logit-bias", in: arguments)
+                .map(parseLogitBiasCSV) ?? [:]
             let samplingPlan = GenerationSamplingPlanner().plan(parameters: generationDefaults(from: arguments))
             printJSON(
                 try GenerationLogitsSampler(plan: samplingPlan).sample(
                     logits: logits,
                     recentTokenIDs: recentTokenIDs,
-                    newlineTokenID: newlineTokenID
+                    newlineTokenID: newlineTokenID,
+                    logitBias: logitBias
                 )
             )
         case "simulate-decode-loop":
@@ -613,6 +619,9 @@ struct MLXVLMCli {
             let recentTokenIDs = try optionalValue(for: "--recent-token-ids", in: arguments)
                 .map(parseIntCSV) ?? []
             let newlineTokenID = optionalValue(for: "--newline-token-id", in: arguments).flatMap(Int.init)
+            let logitBias = try optionalValue(for: "--logit-bias", in: arguments)
+                .map(parseLogitBiasCSV) ?? [:]
+            let topLogprobs = Int(optionalValue(for: "--top-logprobs", in: arguments) ?? "0") ?? 0
             let descriptor = try ModelStore().loadDescriptor(pathOrIdentifier: path)
             guard let catalog = TokenizerCatalogBuilder().catalog(for: descriptor) else {
                 throw CLIError.missingTokenizerJSON(path)
@@ -628,7 +637,9 @@ struct MLXVLMCli {
                     stopSequences: values(for: "--stop", in: arguments),
                     samplingPlan: samplingPlan,
                     tokenizer: SimpleTokenizer(catalog: catalog, plan: plan),
-                    newlineTokenID: newlineTokenID
+                    newlineTokenID: newlineTokenID,
+                    logitBias: logitBias,
+                    topLogprobs: topLogprobs
                 ).run(
                     logitsRows: logitsRows,
                     recentTokenIDs: recentTokenIDs
@@ -688,13 +699,31 @@ struct MLXVLMCli {
             try SelfTest.run()
         case "serve":
             let path = try value(for: "--model", in: arguments)
+            let host = optionalValue(for: "--host", in: arguments) ?? "127.0.0.1"
             let port = UInt16(optionalValue(for: "--port", in: arguments) ?? "11434") ?? 11434
             let defaultParameters = generationDefaults(from: arguments)
-            let descriptor = try ModelStore().loadDescriptor(pathOrIdentifier: path)
+            let defaultAdapterPath = optionalValue(for: "--adapter-path", in: arguments)
+            let defaultThinkingStartToken = optionalValue(for: "--thinking-start-token", in: arguments)
+            let topLogprobsK = Int(
+                optionalValue(for: "--top-logprobs-k", in: arguments) ??
+                    ProcessInfo.processInfo.environment["TOP_LOGPROBS_K"] ??
+                    "0"
+            ).map { max(0, min($0, 20)) }
+            let useLatest = hasFlag("--use-latest", in: arguments)
+            let descriptor = try waitForAsync {
+                try await MLXRemoteModelResolver().resolveDescriptor(
+                    pathOrIdentifier: path,
+                    useLatest: useLatest
+                )
+            }
             let server = CompatibilityServer(
                 descriptor: descriptor,
+                host: host,
                 port: port,
-                defaultParameters: defaultParameters
+                defaultParameters: defaultParameters,
+                defaultAdapterPath: defaultAdapterPath,
+                defaultThinkingStartToken: defaultThinkingStartToken,
+                topLogprobsK: topLogprobsK
             )
             try server.start()
         default:
@@ -754,6 +783,21 @@ struct MLXVLMCli {
         }
     }
 
+    private static func parseLogitBiasCSV(_ value: String) throws -> [Int: Double] {
+        var result: [Int: Double] = [:]
+        for part in value.split(separator: ",") {
+            let pair = part.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+            guard pair.count == 2,
+                  let tokenID = Int(pair[0].trimmingCharacters(in: .whitespaces)),
+                  let bias = Double(pair[1].trimmingCharacters(in: .whitespaces))
+            else {
+                throw CLIError.invalidLogitBias(value)
+            }
+            result[tokenID] = bias
+        }
+        return result
+    }
+
     private static func parseDecodeToken(_ value: String) throws -> GenerationDecodeToken {
         let parts = value.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
         guard parts.count == 2,
@@ -810,6 +854,7 @@ struct MLXVLMCli {
           mlx-vlm-swift backend-plan [--root /path/to/repo]
           mlx-vlm-swift backend-availability [--root /path/to/repo]
           mlx-vlm-swift inspect-mlx-metal-library
+          mlx-vlm-swift inspect-runtime-package [--root /path/to/repo]
           mlx-vlm-swift preflight-mlx-backend-load --model /path/to/mlx-model [--tensor model.embed_tokens.weight] [--max-tensors 16] [--max-total-bytes 67108864] [--skip-weight-payloads]
           mlx-vlm-swift inspect-mlx-container --model /path/to/mlx-model [--tensor model.embed_tokens.weight] [--max-tensors 16] [--max-total-bytes 67108864] [--skip-weight-payloads]
           mlx-vlm-swift inspect-mlx-module-plan --model /path/to/mlx-model [--tensor model.embed_tokens.weight] [--max-tensors 16] [--max-total-bytes 67108864] [--skip-weight-payloads]
@@ -832,13 +877,13 @@ struct MLXVLMCli {
           mlx-vlm-swift preflight-model-operation --operation pull --json '{"model":"m"}'
           mlx-vlm-swift preflight-ollama-blob --digest sha256:abc123
           mlx-vlm-swift preflight-ollama-residency --json '{"model":"m","prompt":"","keep_alive":0}'
-          mlx-vlm-swift sample-logits --logits 0.1,0.9,0.2 [--temperature 0.7] [--top-k 40] [--top-p 0.9] [--min-p 0.05] [--seed 42] [--recent-token-ids 1,2,3]
+          mlx-vlm-swift sample-logits --logits 0.1,0.9,0.2 [--temperature 0.7] [--top-k 40] [--top-p 0.9] [--min-p 0.05] [--typical-p 0.8] [--tfs-z 0.8] [--seed 42] [--recent-token-ids 1,2,3] [--logit-bias 1:-2,4:1.5]
           mlx-vlm-swift simulate-decode-loop --model m --prompt-tokens 4 --max-tokens 8 --token 1:he --token 2:llo --stop END [--eos 151643]
-          mlx-vlm-swift simulate-logits-decode --model /path/to/mlx-model --prompt-tokens 4 --max-tokens 8 --logits 0.1,0.9,0.2 [--temperature 0.7] [--eos 151643]
+          mlx-vlm-swift simulate-logits-decode --model /path/to/mlx-model --prompt-tokens 4 --max-tokens 8 --logits 0.1,0.9,0.2 [--temperature 0.7] [--top-logprobs 2] [--logit-bias 1:-2] [--eos 151643]
           mlx-vlm-swift render-generation-response --api openai-chat --model m --text ok [--stream true] [--chunk o]
           mlx-vlm-swift render-generation-chunks --api openai-chat --model m --prompt-tokens 4 --chunk 1:o [--stream true]
           mlx-vlm-swift self-test
-          mlx-vlm-swift serve --model /path/to/mlx-model [--port 11434] [--max-tokens 512] [--temperature 0.0] [--top-p 1.0] [--top-k 0] [--min-p 0.0] [--seed 0] [--context-length 4096] [--kv-bits 8] [--kv-quant-scheme uniform] [--keep-alive 5m]
+          mlx-vlm-swift serve --model /path/to/mlx-model-or-hf-id [--use-latest] [--host 127.0.0.1] [--port 11434] [--adapter-path /path/to/adapter] [--max-tokens 512] [--temperature 0.0] [--top-p 1.0] [--top-k 0] [--min-p 0.0] [--seed 0] [--context-length 4096] [--kv-bits 8] [--kv-quant-scheme uniform] [--kv-group-size 64] [--quantized-kv-start 0] [--max-kv-size 4096] [--prefill-step-size 512] [--keep-alive 5m] [--enable-thinking true] [--thinking-budget 1024] [--thinking-start-token <think>] [--top-logprobs-k 20]
         """)
     }
 }
@@ -858,7 +903,13 @@ private func generationDefaults(from arguments: [String]) -> GenerationParameter
         kvBits: optionalArgumentValue(for: "--kv-bits", in: arguments).flatMap(Double.init),
         kvQuantizationScheme: optionalArgumentValue(for: "--kv-quant-scheme", in: arguments),
         kvGroupSize: optionalArgumentValue(for: "--kv-group-size", in: arguments).flatMap(Int.init),
+        quantizedKVStart: optionalArgumentValue(for: "--quantized-kv-start", in: arguments)
+            .flatMap(Int.init)
+            ?? ProcessInfo.processInfo.environment["QUANTIZED_KV_START"].flatMap(Int.init),
         maxKVSize: optionalArgumentValue(for: "--max-kv-size", in: arguments).flatMap(Int.init),
+        prefillStepSize: optionalArgumentValue(for: "--prefill-step-size", in: arguments)
+            .flatMap(Int.init)
+            ?? ProcessInfo.processInfo.environment["PREFILL_STEP_SIZE"].flatMap(Int.init),
         visionCacheSize: optionalArgumentValue(for: "--vision-cache-size", in: arguments).flatMap(Int.init),
         quantizeActivations: optionalArgumentValue(for: "--quantize-activations", in: arguments).flatMap(parseBool),
         repetitionPenalty: optionalArgumentValue(for: "--repeat-penalty", in: arguments).flatMap(Double.init),
@@ -869,7 +920,9 @@ private func generationDefaults(from arguments: [String]) -> GenerationParameter
         mirostat: optionalArgumentValue(for: "--mirostat", in: arguments).flatMap(Int.init),
         mirostatTau: optionalArgumentValue(for: "--mirostat-tau", in: arguments).flatMap(Double.init),
         mirostatEta: optionalArgumentValue(for: "--mirostat-eta", in: arguments).flatMap(Double.init),
-        keepAlive: optionalArgumentValue(for: "--keep-alive", in: arguments)
+        keepAlive: optionalArgumentValue(for: "--keep-alive", in: arguments),
+        enableThinking: optionalArgumentValue(for: "--enable-thinking", in: arguments).flatMap(parseBool),
+        thinkingBudget: optionalArgumentValue(for: "--thinking-budget", in: arguments).flatMap(Int.init)
     )
 }
 
@@ -975,6 +1028,42 @@ private extension MediaReferenceSummary {
         if let error {
             result["error"] = error
         }
+        if let imageDetail {
+            result["image_detail"] = imageDetail
+        }
+        if let imageResizedHeight {
+            result["image_resized_height"] = imageResizedHeight
+        }
+        if let imageResizedWidth {
+            result["image_resized_width"] = imageResizedWidth
+        }
+        if let imageMinPixels {
+            result["image_min_pixels"] = imageMinPixels
+        }
+        if let imageMaxPixels {
+            result["image_max_pixels"] = imageMaxPixels
+        }
+        if let audioFormat {
+            result["audio_format"] = audioFormat
+        }
+        if let videoMinPixels {
+            result["video_min_pixels"] = videoMinPixels
+        }
+        if let videoMaxPixels {
+            result["video_max_pixels"] = videoMaxPixels
+        }
+        if let videoFPS {
+            result["video_fps"] = videoFPS
+        }
+        if let videoNFrames {
+            result["video_nframes"] = videoNFrames
+        }
+        if let videoMinFrames {
+            result["video_min_frames"] = videoMinFrames
+        }
+        if let videoMaxFrames {
+            result["video_max_frames"] = videoMaxFrames
+        }
         return result
     }
 }
@@ -1059,9 +1148,11 @@ enum CLIError: Error, CustomStringConvertible {
     case missingTokenizerJSON(String)
     case invalidIntegerList(String)
     case invalidDoubleList(String)
+    case invalidLogitBias(String)
     case invalidDecodeToken(String)
     case unsupportedAPI(String)
     case unsupportedPromptStyle(String)
+    case asyncResultMissing
 
     var description: String {
         switch self {
@@ -1075,12 +1166,16 @@ enum CLIError: Error, CustomStringConvertible {
             return "Invalid comma-separated integer list: \(value)"
         case .invalidDoubleList(let value):
             return "Invalid comma-separated number list: \(value)"
+        case .invalidLogitBias(let value):
+            return "Invalid comma-separated logit bias list: \(value). Expected <token-id>:<bias>,..."
         case .invalidDecodeToken(let value):
             return "Invalid decode token: \(value). Expected <token-id>:<text>."
         case .unsupportedAPI(let api):
             return "Unsupported API formatter: \(api)"
         case .unsupportedPromptStyle(let style):
             return "Unsupported prompt style: \(style)"
+        case .asyncResultMissing:
+            return "Async operation completed without a result."
         }
     }
 }
@@ -1160,22 +1255,35 @@ struct ServerGenerationUnavailableReport: Codable, Equatable, Sendable {
 
 final class CompatibilityServer: @unchecked Sendable {
     private let descriptor: ModelDescriptor
+    private let host: String
     private let port: UInt16
     private let defaultParameters: GenerationParameters
+    private let defaultAdapterPath: String?
+    private let defaultThinkingStartToken: String?
+    private let topLogprobsK: Int?
     private let deepDiagnostics: Bool
     private let queue = DispatchQueue(label: "mlx-vlm-swift.compatibility-server")
     private var residency = OllamaModelResidency()
     private var generationBackend: (any VLMBackend)?
     private var embeddingBackend: (any EmbeddingBackend)?
+    private var embeddingBackendUnavailableReason: String?
 
     init(
         descriptor: ModelDescriptor,
+        host: String = "127.0.0.1",
         port: UInt16,
-        defaultParameters: GenerationParameters = GenerationParameters()
+        defaultParameters: GenerationParameters = GenerationParameters(),
+        defaultAdapterPath: String? = nil,
+        defaultThinkingStartToken: String? = nil,
+        topLogprobsK: Int? = nil
     ) {
         self.descriptor = descriptor
+        self.host = host
         self.port = port
         self.defaultParameters = defaultParameters
+        self.defaultAdapterPath = defaultAdapterPath?.isEmpty == false ? defaultAdapterPath : nil
+        self.defaultThinkingStartToken = defaultThinkingStartToken?.isEmpty == false ? defaultThinkingStartToken : nil
+        self.topLogprobsK = topLogprobsK
         self.deepDiagnostics = ProcessInfo.processInfo.environment["MLXVLM_SERVER_DEEP_DIAGNOSTICS"] == "1"
     }
 
@@ -1197,7 +1305,7 @@ final class CompatibilityServer: @unchecked Sendable {
         address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         address.sin_family = sa_family_t(AF_INET)
         address.sin_port = port.bigEndian
-        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        address.sin_addr = in_addr(s_addr: inet_addr(host))
 
         let bindResult = withUnsafePointer(to: &address) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
@@ -1214,14 +1322,22 @@ final class CompatibilityServer: @unchecked Sendable {
             throw ServerError.listenFailed(errno)
         }
 
-        print("mlx-vlm-swift compatibility server listening on http://127.0.0.1:\(port)")
+        print("mlx-vlm-swift compatibility server listening on http://\(host):\(port)")
         print("Loaded model descriptor: \(descriptor.id) (\(descriptor.canonicalModelType))")
         let minP = defaultParameters.minP.map { String($0) } ?? "default"
         let contextLength = defaultParameters.contextLength.map { String($0) } ?? "auto"
         let kvBits = defaultParameters.kvBits.map { String($0) } ?? "off"
         let kvScheme = defaultParameters.kvQuantizationScheme ?? "default"
+        let kvGroupSize = defaultParameters.kvGroupSize.map(String.init) ?? "default"
+        let quantizedKVStart = defaultParameters.quantizedKVStart.map(String.init) ?? "default"
+        let prefillStepSize = defaultParameters.prefillStepSize.map(String.init) ?? "default"
         let keepAlive = defaultParameters.keepAlive ?? "default"
-        print("Default generation parameters: max_tokens=\(defaultParameters.maxTokens), temperature=\(defaultParameters.temperature), top_p=\(defaultParameters.topP), top_k=\(defaultParameters.topK), min_p=\(minP), seed=\(defaultParameters.seed), context_length=\(contextLength), kv_bits=\(kvBits), kv_quant_scheme=\(kvScheme), keep_alive=\(keepAlive)")
+        let enableThinking = defaultParameters.enableThinking.map { String($0) } ?? "request"
+        let thinkingBudget = defaultParameters.thinkingBudget.map { String($0) } ?? "request"
+        let thinkingStartToken = defaultThinkingStartToken ?? "request"
+        let topLogprobs = topLogprobsK.map(String.init) ?? "request"
+        let adapter = defaultAdapterPath ?? "request"
+        print("Default generation parameters: max_tokens=\(defaultParameters.maxTokens), temperature=\(defaultParameters.temperature), top_p=\(defaultParameters.topP), top_k=\(defaultParameters.topK), min_p=\(minP), seed=\(defaultParameters.seed), context_length=\(contextLength), kv_bits=\(kvBits), kv_quant_scheme=\(kvScheme), kv_group_size=\(kvGroupSize), quantized_kv_start=\(quantizedKVStart), prefill_step_size=\(prefillStepSize), keep_alive=\(keepAlive), enable_thinking=\(enableThinking), thinking_budget=\(thinkingBudget), thinking_start_token=\(thinkingStartToken), adapter_path=\(adapter), top_logprobs_k=\(topLogprobs)")
 
         if MLXBackendFactory.availability().canCreateBackend {
             print("Loading MLX Swift generation backend...")
@@ -1239,8 +1355,10 @@ final class CompatibilityServer: @unchecked Sendable {
                 embeddingBackend = try waitForAsync {
                     try await MLXBackendFactory.makeEmbeddingBackendAsync(descriptor: self.descriptor)
                 }
+                embeddingBackendUnavailableReason = nil
                 print("MLX Swift embedding backend ready.")
             } catch {
+                embeddingBackendUnavailableReason = String(describing: error)
                 print("MLX Swift embedding backend failed to load; serving embedding diagnostics: \(error)")
             }
         }
@@ -1306,6 +1424,7 @@ final class CompatibilityServer: @unchecked Sendable {
         guard let body = httpBody(from: rawRequest), !body.isEmpty else {
             return nil
         }
+        let tenantID = tenantID(from: rawRequest)
         let data = Data(body.utf8)
         do {
             switch path {
@@ -1322,7 +1441,12 @@ final class CompatibilityServer: @unchecked Sendable {
                     return nil
                 }
                 residency.markLoaded()
-                return (request, .ollamaGenerate)
+                return (request.applyingServerDefaults(
+                    adapterPath: defaultAdapterPath,
+                    thinkingStartToken: defaultThinkingStartToken,
+                    topLogprobsK: topLogprobsK,
+                    tenantID: tenantID
+                ), .ollamaGenerate)
             case "/api/chat":
                 let decoded = try JSONDecoder().decode(OllamaChatRequest.self, from: data)
                 let request = try decoded.generationRequest(
@@ -1333,7 +1457,12 @@ final class CompatibilityServer: @unchecked Sendable {
                     return nil
                 }
                 residency.markLoaded()
-                return (request, .ollamaChat)
+                return (request.applyingServerDefaults(
+                    adapterPath: defaultAdapterPath,
+                    thinkingStartToken: defaultThinkingStartToken,
+                    topLogprobsK: topLogprobsK,
+                    tenantID: tenantID
+                ), .ollamaChat)
             case "/generate", "/chat/completions", "/v1/chat/completions":
                 let decoded = try JSONDecoder().decode(OpenAIChatCompletionRequest.self, from: data)
                 let request = try decoded.generationRequest(
@@ -1344,7 +1473,28 @@ final class CompatibilityServer: @unchecked Sendable {
                     return nil
                 }
                 residency.markLoaded()
-                return (request, .openAIChat)
+                return (request.applyingServerDefaults(
+                    adapterPath: defaultAdapterPath,
+                    thinkingStartToken: defaultThinkingStartToken,
+                    topLogprobsK: topLogprobsK,
+                    tenantID: tenantID
+                ), .openAIChat)
+            case "/responses", "/v1/responses":
+                let decoded = try JSONDecoder().decode(OpenAIResponsesRequest.self, from: data)
+                let request = try decoded.generationRequest(
+                    defaultModel: descriptor.id,
+                    defaultParameters: defaultParameters
+                )
+                guard request.stream else {
+                    return nil
+                }
+                residency.markLoaded()
+                return (request.applyingServerDefaults(
+                    adapterPath: defaultAdapterPath,
+                    thinkingStartToken: defaultThinkingStartToken,
+                    topLogprobsK: topLogprobsK,
+                    tenantID: tenantID
+                ), .openAIResponses)
             default:
                 return nil
             }
@@ -1367,6 +1517,11 @@ final class CompatibilityServer: @unchecked Sendable {
         }
         let header = streamingHTTPHeader(status: "200 OK", contentType: contentType)
         writeData(Data(header.utf8), to: clientSocket)
+        if api == .openAIResponses {
+            for frame in OpenAIResponsesStreamFramer.initialFrames(model: request.model, request: request) {
+                writeData(Data(frame.utf8), to: clientSocket)
+            }
+        }
 
         let processed = try backend.process(request)
         var assembler = GenerationOutputAssembler(
@@ -1376,18 +1531,46 @@ final class CompatibilityServer: @unchecked Sendable {
         )
         let stream = try await backend.generate(request)
         var wroteFinishedChunk = false
+        var openAIThinkingSplitter = StreamingThinkingOutputSplitter()
+        var openAIResponsesText = ""
+        var openAIResponsesToolCalls: [GenerationToolCall] = []
         for try await chunk in stream {
             let emitted = assembler.append(chunk)
             for output in emitted {
-                writeStreamFrame(
-                    output,
-                    model: request.model,
-                    api: api,
-                    usage: output.isFinished ? assembler.snapshot.usage : nil,
-                    to: clientSocket
-                )
-                if output.isFinished {
-                    wroteFinishedChunk = true
+                if api == .openAIResponses {
+                    openAIResponsesToolCalls += output.toolCalls
+                    if output.isFinished {
+                        for frame in OpenAIResponsesStreamFramer.finalFrames(
+                            model: request.model,
+                            text: openAIResponsesText,
+                            usage: assembler.snapshot.usage,
+                            toolCalls: openAIResponsesToolCalls,
+                            request: request
+                        ) {
+                            writeData(Data(frame.utf8), to: clientSocket)
+                        }
+                        wroteFinishedChunk = true
+                    } else if !output.text.isEmpty {
+                        openAIResponsesText += output.text
+                        let frame = OpenAIResponsesStreamFramer.deltaFrame(delta: output.text)
+                        writeData(Data(frame.utf8), to: clientSocket)
+                    }
+                    continue
+                }
+                let streamChunks = api == .openAIChat
+                    ? openAIThinkingSplitter.process(output)
+                    : [output]
+                for streamChunk in streamChunks {
+                    writeStreamFrame(
+                        streamChunk,
+                        model: request.model,
+                        api: api,
+                        usage: streamChunk.isFinished ? assembler.snapshot.usage : nil,
+                        to: clientSocket
+                    )
+                    if streamChunk.isFinished {
+                        wroteFinishedChunk = true
+                    }
                 }
             }
             if assembler.snapshot.isFinished {
@@ -1396,13 +1579,36 @@ final class CompatibilityServer: @unchecked Sendable {
         }
 
         if !wroteFinishedChunk, let finalChunk = assembler.finish() {
-            writeStreamFrame(
-                finalChunk,
-                model: request.model,
-                api: api,
-                usage: assembler.snapshot.usage,
-                to: clientSocket
-            )
+            if api == .openAIResponses {
+                if !finalChunk.text.isEmpty {
+                    openAIResponsesText += finalChunk.text
+                    let frame = OpenAIResponsesStreamFramer.deltaFrame(delta: finalChunk.text)
+                    writeData(Data(frame.utf8), to: clientSocket)
+                }
+                for frame in OpenAIResponsesStreamFramer.finalFrames(
+                    model: request.model,
+                    text: openAIResponsesText,
+                    usage: assembler.snapshot.usage,
+                    toolCalls: openAIResponsesToolCalls + finalChunk.toolCalls,
+                    request: request
+                ) {
+                    writeData(Data(frame.utf8), to: clientSocket)
+                }
+                wroteFinishedChunk = true
+            } else {
+            let streamChunks = api == .openAIChat
+                ? openAIThinkingSplitter.process(finalChunk)
+                : [finalChunk]
+            for streamChunk in streamChunks {
+                writeStreamFrame(
+                    streamChunk,
+                    model: request.model,
+                    api: api,
+                    usage: streamChunk.isFinished ? assembler.snapshot.usage : nil,
+                    to: clientSocket
+                )
+            }
+            }
         }
 
         if api == .openAIChat {
@@ -1443,7 +1649,7 @@ final class CompatibilityServer: @unchecked Sendable {
             "Cache-Control: no-cache\r\n" +
             "Access-Control-Allow-Origin: *\r\n" +
             "Access-Control-Allow-Methods: GET, POST, HEAD, OPTIONS\r\n" +
-            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" +
+            "Access-Control-Allow-Headers: Content-Type, Authorization, X-APC-Tenant, X-Tenant-Id\r\n" +
             "Connection: close\r\n" +
             "\r\n"
     }
@@ -1513,6 +1719,28 @@ final class CompatibilityServer: @unchecked Sendable {
         return 0
     }
 
+    private func tenantID(from request: String) -> String? {
+        headerValue("X-APC-Tenant", from: request) ?? headerValue("X-Tenant-Id", from: request)
+    }
+
+    private func headerValue(_ name: String, from request: String) -> String? {
+        let lowercasedName = name.lowercased()
+        guard let headerEnd = request.range(of: "\r\n\r\n") else {
+            return nil
+        }
+        for line in request[..<headerEnd.lowerBound].split(separator: "\r\n") {
+            let parts = line.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2,
+                  parts[0].trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == lowercasedName
+            else {
+                continue
+            }
+            let value = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+            return value.isEmpty ? nil : value
+        }
+        return nil
+    }
+
     private func route(request: String) -> Data {
         let firstLine = request.split(separator: "\r\n", maxSplits: 1).first ?? ""
         let parts = firstLine.split(separator: " ")
@@ -1527,13 +1755,20 @@ final class CompatibilityServer: @unchecked Sendable {
         case "/health":
             return jsonResponse(
                 [
-                    "status": "ok",
+                    "status": "healthy",
                     "model": descriptor.id,
+                    "loaded_model": descriptor.path,
                     "model_loaded": residency.isLoaded,
+                    "loaded_context_size": loadedContextSize.map { $0 as Any } ?? NSNull(),
+                    "loaded_tool_parser": loadedToolParser.map { $0 as Any } ?? NSNull(),
+                    "continuous_batching_enabled": generationBackend != nil,
+                    "apc_enabled": false,
                     "backend_ready": currentBackendStatus.ready,
                     "backend": currentBackendStatus.activeBackend,
                     "embedding_backend_ready": embeddingBackend != nil,
                     "embedding_backend": embeddingBackend?.status.activeBackend ?? "unavailable",
+                    "embedding_backend_unavailable_reason": embeddingBackendUnavailableReason ?? "",
+                    "loaded_adapter": defaultAdapterPath ?? "",
                 ]
             )
         case "/backend/status":
@@ -1544,15 +1779,24 @@ final class CompatibilityServer: @unchecked Sendable {
             return encodedResponse(OllamaTagsResponse(models: [OllamaModelTag(descriptor: descriptor)]))
         case "/api/ps":
             return encodedResponse(residency.runningModelsResponse(descriptor: descriptor))
-        case "/models", "/v1/models":
+        case "/v1/cache/stats", "/cache/stats":
+            return encodedResponse(APCCacheStatusResponse(backend: currentBackendStatus))
+        case "/v1/cache/reset", "/cache/reset":
             return encodedResponse(
-                OpenAIModelListResponse(models: [OpenAIModelResponse(id: descriptor.id)])
+                APCCacheStatusResponse(
+                    backend: currentBackendStatus,
+                    status: "disabled"
+                )
             )
+        case "/models", "/v1/models":
+            return encodedResponse(openAIModelListResponse())
         case let modelPath where modelPath.hasPrefix("/v1/models/") || modelPath.hasPrefix("/models/"):
             return openAIModelResponse(for: modelPath)
         case "/api/show":
             return parseOllamaShowRequest(from: request)
-        case "/unload", "/api/unload":
+        case "/unload":
+            return encodedResponse(pythonUnloadResponse())
+        case "/api/unload":
             return encodedResponse(residency.unload(model: descriptor.id))
         case "/api/create":
             return parseModelOperationRequest(from: request, operation: "create")
@@ -1588,20 +1832,37 @@ final class CompatibilityServer: @unchecked Sendable {
     private func openAIModelResponse(for path: String) -> Data {
         let prefix = path.hasPrefix("/v1/models/") ? "/v1/models/" : "/models/"
         let requestedID = String(path.dropFirst(prefix.count))
-        guard requestedID == descriptor.id else {
-            return jsonResponse(
-                [
-                    "error": [
-                        "message": "Model '\(requestedID)' was not found.",
-                        "type": "invalid_request_error",
-                        "param": "model",
-                        "code": "model_not_found",
-                    ]
-                ],
-                status: "404 Not Found"
-            )
+        if requestedID == descriptor.id {
+            return encodedResponse(OpenAIModelResponse(id: descriptor.id))
         }
-        return encodedResponse(OpenAIModelResponse(id: descriptor.id))
+        if let cached = cachedOpenAIModels().first(where: { $0.id == requestedID }) {
+            return encodedResponse(cached)
+        }
+        return jsonResponse(
+            [
+                "error": [
+                    "message": "Model '\(requestedID)' was not found.",
+                    "type": "invalid_request_error",
+                    "param": "model",
+                    "code": "model_not_found",
+                ]
+            ],
+            status: "404 Not Found"
+        )
+    }
+
+    private func openAIModelListResponse() -> OpenAIModelListResponse {
+        OpenAIModelListResponse(models: cachedOpenAIModels())
+    }
+
+    private func cachedOpenAIModels() -> [OpenAIModelResponse] {
+        var models = HuggingFaceCacheResolver().cachedMLXModels().map {
+            OpenAIModelResponse(id: $0.id, created: $0.created, ownedBy: "huggingface-cache")
+        }
+        if !models.contains(where: { $0.id == descriptor.id }) {
+            models.insert(OpenAIModelResponse(id: descriptor.id), at: 0)
+        }
+        return models
     }
 
     private func parseOllamaShowRequest(from request: String) -> Data {
@@ -1644,6 +1905,11 @@ final class CompatibilityServer: @unchecked Sendable {
             let normalized = try decoded.generationRequest(
                 defaultModel: descriptor.id,
                 defaultParameters: defaultParameters
+            ).applyingServerDefaults(
+                adapterPath: defaultAdapterPath,
+                thinkingStartToken: defaultThinkingStartToken,
+                topLogprobsK: topLogprobsK,
+                tenantID: tenantID(from: request)
             )
             residency.markLoaded()
             return generationResponse(for: normalized, api: .ollamaGenerate)
@@ -1662,6 +1928,26 @@ final class CompatibilityServer: @unchecked Sendable {
         return OllamaGenerateResponse(
             result: CompletedGeneration(model: action.model, text: ""),
             doneReason: action.action.rawValue
+        )
+    }
+
+    private func pythonUnloadResponse() -> PythonServerUnloadResponse {
+        guard residency.isLoaded else {
+            return PythonServerUnloadResponse(
+                status: "no_model_loaded",
+                message: "No model is currently loaded"
+            )
+        }
+
+        let info = PythonServerUnloadInfo(
+            modelName: descriptor.path,
+            adapterName: defaultAdapterPath
+        )
+        _ = residency.unload(model: descriptor.id)
+        return PythonServerUnloadResponse(
+            status: "success",
+            message: "Model unloaded successfully",
+            unloaded: info
         )
     }
 
@@ -1774,7 +2060,12 @@ final class CompatibilityServer: @unchecked Sendable {
 
         do {
             let decoded = try JSONDecoder().decode(type, from: Data(body.utf8))
-            let normalized = try normalize(decoded)
+            let normalized = try normalize(decoded).applyingServerDefaults(
+                adapterPath: defaultAdapterPath,
+                thinkingStartToken: defaultThinkingStartToken,
+                topLogprobsK: topLogprobsK,
+                tenantID: tenantID(from: request)
+            )
             residency.markLoaded()
             return generationResponse(for: normalized, api: api)
         } catch {
@@ -1784,6 +2075,37 @@ final class CompatibilityServer: @unchecked Sendable {
 
     private var currentBackendStatus: BackendStatus {
         generationBackend?.status ?? .compatibilityShell
+    }
+
+    private var loadedToolParser: String? {
+        ToolCallPlanner()
+            .plan(metadata: GenerationRequestMetadata(tools: []), descriptor: descriptor)
+            .parserHint
+    }
+
+    private var loadedContextSize: Int? {
+        guard let config = try? ModelStore().loadConfig(pathOrIdentifier: descriptor.path) else {
+            return nil
+        }
+        return Self.contextSize(from: config)
+    }
+
+    private static func contextSize(from value: JSONValue) -> Int? {
+        guard let object = value.objectValue else {
+            return nil
+        }
+        if let size = object["max_position_embeddings"]?.intValue
+            ?? object["context_length"]?.intValue
+            ?? object["max_sequence_length"]?.intValue
+        {
+            return size
+        }
+        for key in ["text_config", "llm_config"] {
+            if let nested = object[key], let size = contextSize(from: nested) {
+                return size
+            }
+        }
+        return nil
     }
 
     private func generationResponse(for request: GenerationRequest, api: GenerationResponseAPI) -> Data {
@@ -1853,7 +2175,10 @@ final class CompatibilityServer: @unchecked Sendable {
             let report = CompatibilityGenerationEngine(
                 descriptor: descriptor,
                 backend: currentBackendStatus
-            ).unavailableEmbeddingReport(for: request)
+            ).unavailableEmbeddingReport(
+                for: request,
+                unavailableReason: embeddingBackendUnavailableReason
+            )
             return encodedResponse(report, status: "501 Not Implemented")
         }
 
@@ -1917,13 +2242,73 @@ final class CompatibilityServer: @unchecked Sendable {
             "Content-Type: \(contentType)\r\n" +
             "Access-Control-Allow-Origin: *\r\n" +
             "Access-Control-Allow-Methods: GET, POST, HEAD, OPTIONS\r\n" +
-            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" +
+            "Access-Control-Allow-Headers: Content-Type, Authorization, X-APC-Tenant, X-Tenant-Id\r\n" +
             "Content-Length: \(body.count)\r\n" +
             "Connection: close\r\n" +
             "\r\n"
         response.append(Data(header.utf8))
         response.append(body)
         return response
+    }
+}
+
+private extension GenerationRequest {
+    func applyingServerDefaults(
+        adapterPath: String?,
+        thinkingStartToken: String?,
+        topLogprobsK: Int? = nil,
+        tenantID: String? = nil
+    ) -> GenerationRequest {
+        let effectiveAdapterPath = metadata.adapterPath ?? adapterPath
+        let effectiveThinkingStartToken = metadata.thinkingStartToken ?? thinkingStartToken
+        let effectiveTopLogprobs = metadata.topLogprobs.map { requested in
+            guard let topLogprobsK else {
+                return requested
+            }
+            return min(requested, topLogprobsK)
+        }
+        let effectiveTenantID = metadata.tenantID ?? tenantID
+        guard effectiveAdapterPath != metadata.adapterPath ||
+            effectiveThinkingStartToken != metadata.thinkingStartToken ||
+            effectiveTopLogprobs != metadata.topLogprobs ||
+            effectiveTenantID != metadata.tenantID
+        else {
+            return self
+        }
+
+        return GenerationRequest(
+            model: model,
+            messages: messages,
+            parameters: parameters,
+            metadata: GenerationRequestMetadata(
+                responseFormat: metadata.responseFormat,
+                rawPrompt: metadata.rawPrompt,
+                template: metadata.template,
+                suffix: metadata.suffix,
+                legacyContext: metadata.legacyContext,
+                tools: metadata.tools,
+                toolChoice: metadata.toolChoice,
+                rawOptions: metadata.rawOptions,
+                adapterPath: effectiveAdapterPath,
+                logitBias: metadata.logitBias,
+                logprobs: metadata.logprobs,
+                topLogprobs: effectiveTopLogprobs,
+                resizeShape: metadata.resizeShape,
+                thinkingStartToken: effectiveThinkingStartToken,
+                user: metadata.user,
+                responseInstructions: metadata.responseInstructions,
+                responseTruncation: metadata.responseTruncation,
+                responseMetadata: metadata.responseMetadata,
+                previousResponseID: metadata.previousResponseID,
+                include: metadata.include,
+                parallelToolCalls: metadata.parallelToolCalls,
+                store: metadata.store,
+                serviceTier: metadata.serviceTier,
+                responseReasoning: metadata.responseReasoning,
+                tenantID: effectiveTenantID
+            ),
+            stream: stream
+        )
     }
 }
 
@@ -2041,6 +2426,69 @@ enum SelfTest {
         )
         precondition(mistralPreflight.promptStyle == .mistralInstruct)
         precondition(mistralPreflight.prompt == "[INST] sys\n\nhello [/INST] ok</s>")
+        let gemma4TemplateModel = root.appendingPathComponent("gemma4-template")
+        try FileManager.default.createDirectory(at: gemma4TemplateModel, withIntermediateDirectories: true)
+        try Data("""
+        {"model_type":"gemma4","vocab_size":262144,"image_token_id":258880,"audio_token_id":258881,"boi_token_id":255999,"eoi_token_id":258882,"eot_token_id":106}
+        """.utf8).write(to: gemma4TemplateModel.appendingPathComponent("config.json"))
+        try Data("""
+        {"image_token":"<|image|>","audio_token":"<|audio|>","chat_template":"{{ bos_token }}{% for message in messages %}<|turn>{{ message['role'] }}\\n{{ message['content'] }}<turn|>{% endfor %}{% if add_generation_prompt %}<|turn>model\\n{% endif %}"}
+        """.utf8).write(to: gemma4TemplateModel.appendingPathComponent("tokenizer_config.json"))
+        let gemma4TemplateDescriptor = try ModelStore().loadDescriptor(pathOrIdentifier: gemma4TemplateModel.path)
+        let gemma4TemplatePlan = ChatTemplatePlanner().plan(descriptor: gemma4TemplateDescriptor)
+        precondition(gemma4TemplatePlan.requiredRenderer == "gemma4-chat-builtin")
+        precondition(gemma4TemplatePlan.canRenderNatively)
+        precondition(gemma4TemplateDescriptor.tokenizerMetadata.audioTokenID == 258881)
+        precondition(gemma4TemplateDescriptor.tokenizerMetadata.endTurnTokenID == 106)
+        let gemma4Tools: [JSONValue] = [
+            .object([
+                "type": .string("function"),
+                "function": .object([
+                    "name": .string("lookup"),
+                    "description": .string("Lookup docs"),
+                    "parameters": .object(["type": .string("object")]),
+                ]),
+            ]),
+        ]
+        let gemma4Preflight = GenerationPreflightPlanner(descriptor: gemma4TemplateDescriptor).plan(
+            request: GenerationRequest(
+                model: "gemma4-template",
+                messages: [
+                    ChatMessage(role: .system, content: [.text("sys")]),
+                    ChatMessage(role: .user, content: [.text("hi"), .imagePlaceholder]),
+                ],
+                parameters: GenerationParameters(enableThinking: true),
+                metadata: GenerationRequestMetadata(tools: gemma4Tools)
+            )
+        )
+        precondition(gemma4Preflight.promptStyle == .gemma4Chat)
+        precondition(gemma4Preflight.prompt.contains("<bos><|turn>system\n<|think|>\nsys<|tool>declaration:lookup"))
+        precondition(gemma4Preflight.prompt.contains("<|turn>user\nhi<|image|><turn|>\n<|turn>model\n"))
+        let gemma4ToolPrompt = QwenVLPromptBuilder(imageToken: "<|image|>", audioToken: "<|audio|>").gemma4ChatPrompt(
+            messages: [
+                ChatMessage(
+                    role: .assistant,
+                    content: [],
+                    reasoning: "checking",
+                    toolCalls: [
+                        .object([
+                            "id": .string("call_1"),
+                            "type": .string("function"),
+                            "function": .object([
+                                "name": .string("lookup"),
+                                "arguments": .object(["query": .string("swift")]),
+                            ]),
+                        ]),
+                    ]
+                ),
+                ChatMessage(role: .tool, content: [.text("result")], name: "lookup", toolCallID: "call_1"),
+            ],
+            addGenerationPrompt: true
+        )
+        precondition(gemma4ToolPrompt.contains("<|channel>thought\nchecking\n<channel|>"))
+        precondition(gemma4ToolPrompt.contains("<|tool_call>call:lookup{query:<|\"|>swift<|\"|>}<tool_call|>"))
+        precondition(gemma4ToolPrompt.contains("<|tool_response>response:lookup{value:<|\"|>result<|\"|>}<tool_response|>"))
+        precondition(!gemma4ToolPrompt.hasSuffix("<|turn>model\n"))
         precondition(descriptor.configVocabSize == 151936)
         precondition(descriptor.tokenizerMetadata.tokenizerJSONMetadata?.isReadable == true)
         precondition(descriptor.tokenizerMetadata.tokenizerJSONMetadata?.modelType == "BPE")
@@ -2445,12 +2893,17 @@ enum SelfTest {
             promptTokenCount: 2,
             maxCompletionTokens: 3,
             samplingPlan: GenerationSamplingPlanner().plan(parameters: GenerationParameters()),
-            tokenizer: byteTokenizer
+            tokenizer: byteTokenizer,
+            topLogprobs: 2
         ).run(logitsRows: [logitsForHello, logitsForWorld, logitsForBang])
         precondition(logitsDecodeReport.completed.text == "hello world!")
         precondition(logitsDecodeReport.completed.finishReason == "length")
         precondition(logitsDecodeReport.steps.map(\.sampledToken.tokenID) == [10, 11, 12])
         precondition(logitsDecodeReport.processedLogitRows == 3)
+        precondition(logitsDecodeReport.completed.logprobs.count == 3)
+        precondition(logitsDecodeReport.completed.logprobs[0].token == "hello")
+        precondition(logitsDecodeReport.completed.logprobs[0].topLogprobs.count == 2)
+        precondition(logitsDecodeReport.steps[0].decodeStep.emittedChunks.first?.logprob?.token == "hello")
         let bytePreflight = GenerationPreflightPlanner(descriptor: byteBPEDescriptor).plan(
             request: GenerationRequest(
                 model: "bytelevel",
@@ -2812,7 +3265,9 @@ enum SelfTest {
             kvBits: 8,
             kvQuantizationScheme: "uniform",
             kvGroupSize: 64,
+            quantizedKVStart: 32,
             maxKVSize: 16_384,
+            prefillStepSize: 1_024,
             visionCacheSize: 20,
             quantizeActivations: true,
             repeatLastN: 128,
@@ -2832,7 +3287,9 @@ enum SelfTest {
         precondition(defaultedGenerate.parameters.kvBits == 8)
         precondition(defaultedGenerate.parameters.kvQuantizationScheme == "uniform")
         precondition(defaultedGenerate.parameters.kvGroupSize == 64)
+        precondition(defaultedGenerate.parameters.quantizedKVStart == 32)
         precondition(defaultedGenerate.parameters.maxKVSize == 16_384)
+        precondition(defaultedGenerate.parameters.prefillStepSize == 1_024)
         precondition(defaultedGenerate.parameters.visionCacheSize == 20)
         precondition(defaultedGenerate.parameters.quantizeActivations == true)
         precondition(defaultedGenerate.parameters.repeatLastN == 128)
@@ -2841,7 +3298,7 @@ enum SelfTest {
         let numericKeepAlive = try JSONDecoder().decode(
             OllamaChatRequest.self,
             from: Data("""
-            {"model":"qwen","messages":[{"role":"user","content":"hi"}],"keep_alive":30,"tools":[{"type":"function","function":{"name":"lookup"}}],"options":{"context_length":2048,"kv_bits":3.5,"kv_quant_scheme":"turboquant","kv_group_size":128,"max_kv_size":4096,"vision_cache_size":8,"quantize_activations":true}}
+            {"model":"qwen","messages":[{"role":"user","content":"hi"}],"keep_alive":30,"tools":[{"type":"function","function":{"name":"lookup"}}],"options":{"context_length":2048,"kv_bits":3.5,"kv_quant_scheme":"turboquant","kv_group_size":128,"quantized_kv_start":64,"max_kv_size":4096,"prefill_step_size":256,"vision_cache_size":8,"quantize_activations":true}}
             """.utf8)
         ).generationRequest(defaultModel: "default")
         precondition(numericKeepAlive.parameters.contextLength == 2048)
@@ -2849,7 +3306,9 @@ enum SelfTest {
         precondition(numericKeepAlive.parameters.kvBits == 3.5)
         precondition(numericKeepAlive.parameters.kvQuantizationScheme == "turboquant")
         precondition(numericKeepAlive.parameters.kvGroupSize == 128)
+        precondition(numericKeepAlive.parameters.quantizedKVStart == 64)
         precondition(numericKeepAlive.parameters.maxKVSize == 4096)
+        precondition(numericKeepAlive.parameters.prefillStepSize == 256)
         precondition(numericKeepAlive.parameters.visionCacheSize == 8)
         precondition(numericKeepAlive.parameters.quantizeActivations == true)
         precondition(numericKeepAlive.metadata.tools?.count == 1)
@@ -2895,15 +3354,38 @@ enum SelfTest {
         precondition(blobOperation.accepted == false)
         precondition(blobOperation.exists == false)
         precondition(blobOperation.backend.activeBackend == "compatibility-shell")
+        let apcStats = APCCacheStatusResponse()
+        precondition(apcStats.enabled == false)
+        precondition(apcStats.status == nil)
+        let apcReset = APCCacheStatusResponse(status: "disabled")
+        precondition(apcReset.status == "disabled")
+        precondition(apcReset.backend.activeBackend == "compatibility-shell")
+        let pythonUnload = PythonServerUnloadResponse(
+            status: "success",
+            message: "Model unloaded successfully",
+            unloaded: PythonServerUnloadInfo(modelName: "/tmp/model", adapterName: "/tmp/adapter")
+        )
+        precondition(pythonUnload.unloaded?.adapterName == "/tmp/adapter")
 
         let openAIChat = try JSONDecoder().decode(
             OpenAIChatCompletionRequest.self,
             from: Data("""
-            {"model":"qwen","messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"file:///tmp/a.png"}}]}],"max_completion_tokens":8,"temperature":0.5,"top_p":0.8,"top_k":11,"min_p":0.02,"seed":9,"repetition_penalty":1.2,"presence_penalty":0.1,"frequency_penalty":0.4,"stop":"END","logit_bias":{"1":-2},"enable_thinking":true,"thinking_budget":64,"thinking_start_token":"<think>","logprobs":true,"top_logprobs":3,"resize_shape":[224,336],"adapter_path":"/tmp/adapter","user":"user-1","response_format":{"type":"json_object"},"tools":[{"type":"function","function":{"name":"describe"}}],"tool_choice":{"type":"function","function":{"name":"describe"}}}
+            {"model":"qwen","messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"file:///tmp/a.png"}},{"type":"video","video":"file:///tmp/a.mp4","min_pixels":200704,"max_pixels":1003520,"nframes":8,"min_frames":4,"max_frames":16}]}],"max_completion_tokens":8,"temperature":0.5,"top_p":0.8,"top_k":11,"min_p":0.02,"seed":9,"repetition_penalty":1.2,"presence_penalty":0.1,"frequency_penalty":0.4,"stop":"END","logit_bias":{"1":-2},"enable_thinking":true,"thinking_budget":64,"thinking_start_token":"<think>","logprobs":true,"top_logprobs":3,"resize_shape":[224,336],"adapter_path":"/tmp/adapter","user":"user-1","response_format":{"type":"json_object"},"tools":[{"type":"function","function":{"name":"describe"}}],"tool_choice":{"type":"function","function":{"name":"describe"}}}
             """.utf8)
         )
         let normalizedChat = try openAIChat.generationRequest(defaultModel: "default")
-        precondition(normalizedChat.messages[0].content.count == 2)
+        precondition(normalizedChat.messages[0].content.count == 3)
+        if case .videoURL(let videoReference) = normalizedChat.messages[0].content[2] {
+            precondition(videoReference.url == "file:///tmp/a.mp4")
+            precondition(videoReference.minPixels == 200_704)
+            precondition(videoReference.maxPixels == 1_003_520)
+            precondition(videoReference.fps == nil)
+            precondition(videoReference.nframes == 8)
+            precondition(videoReference.minFrames == 4)
+            precondition(videoReference.maxFrames == 16)
+        } else {
+            preconditionFailure("Expected Python mlx-vlm video content part")
+        }
         precondition(normalizedChat.parameters.maxTokens == 8)
         precondition(normalizedChat.parameters.temperature == 0.5)
         precondition(normalizedChat.parameters.topP == 0.8)
@@ -2926,6 +3408,16 @@ enum SelfTest {
         precondition(normalizedChat.metadata.resizeShape == [224, 336])
         precondition(normalizedChat.metadata.adapterPath == "/tmp/adapter")
         precondition(normalizedChat.metadata.user == "user-1")
+        let serverDefaultedChat = normalizedChat.applyingServerDefaults(
+            adapterPath: "/tmp/default-adapter",
+            thinkingStartToken: "<server-think>",
+            topLogprobsK: 2,
+            tenantID: "tenant-a"
+        )
+        precondition(serverDefaultedChat.metadata.adapterPath == "/tmp/adapter")
+        precondition(serverDefaultedChat.metadata.thinkingStartToken == "<think>")
+        precondition(serverDefaultedChat.metadata.topLogprobs == 2)
+        precondition(serverDefaultedChat.metadata.tenantID == "tenant-a")
         let chatResponseFormatPlan = ResponseFormatPlanner().plan(
             metadata: normalizedChat.metadata,
             stream: normalizedChat.stream
@@ -2946,9 +3438,9 @@ enum SelfTest {
         precondition(chatToolCallPlan.requiresToolParser)
         precondition(chatToolCallPlan.backendMinimumFeatures.contains("forced-tool-choice"))
         let flattenedPrompt = QwenVLPromptBuilder().plainPrompt(messages: normalizedChat.messages)
-        precondition(flattenedPrompt == "hi<|image_pad|>")
+        precondition(flattenedPrompt == "hi<|image_pad|><|video_pad|>")
         let qwenChatPrompt = QwenVLPromptBuilder().qwenChatPrompt(messages: normalizedChat.messages)
-        precondition(qwenChatPrompt == "<|im_start|>user\nhi<|image_pad|><|im_end|>\n<|im_start|>assistant")
+        precondition(qwenChatPrompt == "<|im_start|>user\nhi<|image_pad|><|video_pad|><|im_end|>\n<|im_start|>assistant")
 
         let messageMetadataChat = try JSONDecoder().decode(
             OpenAIChatCompletionRequest.self,
@@ -2959,35 +3451,151 @@ enum SelfTest {
         precondition(messageMetadataChat.messages[0].content == [.text("need tool")])
         precondition(messageMetadataChat.messages[0].reasoning == "checking")
         precondition(messageMetadataChat.messages[0].toolCalls?.first?["id"]?.stringValue == "call_1")
+        precondition(messageMetadataChat.messages[0].toolCalls?.first?["function"]?["arguments"]?.objectValue == [:])
         precondition(messageMetadataChat.messages[1].role == .tool)
         precondition(messageMetadataChat.messages[1].toolCallID == "call_1")
         precondition(messageMetadataChat.messages[1].name == "lookup")
-        precondition(messageMetadataChat.messages[2].content == [.audioURL("AAECAw==")])
+        precondition(messageMetadataChat.messages[2].content == [.audioURL(AudioReference(data: "AAECAw==", format: "wav"))])
+        precondition(MLXVLMUserInputBridgePolicy.shouldUseRawMessages(messageMetadataChat.messages))
+        let gemma4ToolParse = ToolCallOutputParser().parseGemma4ToolCalls(
+            in: #"prefix <|tool_call>call:lookup{query:<|"|>swift mlx<|"|>,limit:2,nested:{ok:true}}<tool_call|> suffix"#
+        )
+        precondition(gemma4ToolParse.text == "prefix  suffix")
+        precondition(gemma4ToolParse.toolCalls.count == 1)
+        precondition(gemma4ToolParse.toolCalls[0].function.name == "lookup")
+        precondition(gemma4ToolParse.toolCalls[0].function.arguments["query"]?.stringValue == "swift mlx")
+        precondition(gemma4ToolParse.toolCalls[0].function.arguments["limit"]?.intValue == 2)
+        precondition(gemma4ToolParse.toolCalls[0].function.arguments["nested"]?["ok"]?.boolValue == true)
+        let gemma4HyphenatedToolParse = ToolCallOutputParser().parseGemma4ToolCalls(
+            in: #"prefix <|tool_call>call:edit-file{path:<|"|>test.txt<|"|>,edits:[{newText:<|"|>orange<|"|>,oldText:<|"|>apple<|"|>}]}<tool_call|> suffix"#
+        )
+        precondition(gemma4HyphenatedToolParse.text == "prefix  suffix")
+        precondition(gemma4HyphenatedToolParse.toolCalls.count == 1)
+        precondition(gemma4HyphenatedToolParse.toolCalls[0].function.name == "edit-file")
+        precondition(gemma4HyphenatedToolParse.toolCalls[0].function.arguments["path"]?.stringValue == "test.txt")
+        precondition(gemma4HyphenatedToolParse.toolCalls[0].function.arguments["edits"]?.arrayValue?.first?["oldText"]?.stringValue == "apple")
+        precondition(gemma4HyphenatedToolParse.toolCalls[0].function.arguments["edits"]?.arrayValue?.first?["newText"]?.stringValue == "orange")
+        let pythonPlaceholderChat = try JSONDecoder().decode(
+            OpenAIChatCompletionRequest.self,
+            from: Data("""
+            {"model":"qwen","messages":[{"role":"user","content":[{"type":"image"},{"type":"audio"},{"type":"text","text":"describe"}]}]}
+            """.utf8)
+        ).generationRequest(defaultModel: "default")
+        precondition(pythonPlaceholderChat.messages[0].content == [.imagePlaceholder, .audioPlaceholder, .text("describe")])
+        precondition(QwenVLPromptBuilder().plainPrompt(messages: pythonPlaceholderChat.messages) == "<|image_pad|><audio> describe")
+        let pythonImageContentChat = try JSONDecoder().decode(
+            OpenAIChatCompletionRequest.self,
+            from: Data("""
+            {"model":"qwen","messages":[{"role":"user","content":[{"type":"image","image":"file:///tmp/python-image.png"},{"type":"image_url"},{"type":"text","text":"describe"}]}]}
+            """.utf8)
+        ).generationRequest(defaultModel: "default")
+        precondition(pythonImageContentChat.messages[0].content == [
+            .imageURL(ImageReference(url: "file:///tmp/python-image.png")),
+            .imagePlaceholder,
+            .text("describe"),
+        ])
+        precondition(QwenVLPromptBuilder().plainPrompt(messages: pythonImageContentChat.messages) == "<|image_pad|><|image_pad|> describe")
+        let pythonContentTextChat = try JSONDecoder().decode(
+            OpenAIChatCompletionRequest.self,
+            from: Data("""
+            {"model":"qwen","messages":[{"role":"user","content":[{"type":"text","content":"content fallback"}]}]}
+            """.utf8)
+        ).generationRequest(defaultModel: "default")
+        precondition(pythonContentTextChat.messages[0].content == [.text("content fallback")])
+        let pythonVideoContentChat = try JSONDecoder().decode(
+            OpenAIChatCompletionRequest.self,
+            from: Data("""
+            {"model":"qwen","messages":[{"role":"user","content":[{"type":"video","video":"tiny.mp4","max_pixels":50176,"fps":1},{"type":"video_url","video_url":{"url":"file://\(model.appendingPathComponent("tiny.mov").path)"},"nframes":4},{"type":"input_video","input_video":"data:video/mp4;base64,AAAA","min_frames":2,"max_frames":8},{"type":"text","text":"describe"}]}]}
+            """.utf8)
+        ).generationRequest(defaultModel: "default")
+        precondition(pythonVideoContentChat.messages[0].content.count == 4)
+        if case .videoURL(let firstVideo) = pythonVideoContentChat.messages[0].content[0] {
+            precondition(firstVideo.url == "tiny.mp4")
+            precondition(firstVideo.maxPixels == 50_176)
+            precondition(firstVideo.fps == 1)
+        } else {
+            preconditionFailure("Expected Python mlx-vlm video content part")
+        }
+        if case .videoURL(let secondVideo) = pythonVideoContentChat.messages[0].content[1] {
+            precondition(secondVideo.url == "file://\(model.appendingPathComponent("tiny.mov").path)")
+            precondition(secondVideo.nframes == 4)
+        } else {
+            preconditionFailure("Expected nested video_url content part")
+        }
+        if case .videoURL(let thirdVideo) = pythonVideoContentChat.messages[0].content[2] {
+            precondition(thirdVideo.url == "data:video/mp4;base64,AAAA")
+            precondition(thirdVideo.minFrames == 2)
+            precondition(thirdVideo.maxFrames == 8)
+        } else {
+            preconditionFailure("Expected input_video content part")
+        }
+        precondition(QwenVLPromptBuilder().plainPrompt(messages: pythonVideoContentChat.messages) == "<|video_pad|><|video_pad|><|video_pad|> describe")
+        precondition(MLXVLMUserInputBridgePolicy.shouldUseRawMessages(pythonVideoContentChat.messages))
+        precondition(MLXVLMUserInputBridgePolicy.shouldUseRawMessages([
+            ChatMessage(
+                role: .user,
+                content: [
+                    .imageURL(ImageReference(url: "file:///tmp/detail.png", detail: "high")),
+                    .text("describe"),
+                ]
+            ),
+        ]))
+        precondition(!MLXVLMUserInputBridgePolicy.shouldUseRawMessages([
+            ChatMessage(
+                role: .user,
+                content: [
+                    .imageURL(ImageReference(url: "file:///tmp/plain.png")),
+                    .text("describe"),
+                ]
+            ),
+        ]))
 
         let responsesRequest = try JSONDecoder().decode(
             OpenAIResponsesRequest.self,
             from: Data("""
-            {"model":"qwen","instructions":"be concise","input":[{"role":"user","content":[{"type":"input_text","text":"hi"},{"type":"input_image","image_url":"data:image/png;base64,AAECAw=="}]}],"max_output_tokens":6,"temperature":0.4,"top_p":0.7,"top_k":12,"min_p":0.03,"seed":11,"repetition_penalty":1.15,"stop":["DONE"],"logit_bias":{"2":-1},"enable_thinking":false,"thinking_budget":32,"thinking_start_token":"<reason>","user":"resp-user","text":{"format":{"type":"json_schema","name":"answer"}},"tools":[{"type":"function","name":"search"}],"tool_choice":"auto"}
+            {"model":"qwen","instructions":"be concise","input":[{"role":"user","content":[{"type":"input_text","text":"hi"},{"type":"input_image","image_url":"data:image/png;base64,AAECAw=="}]}],"max_output_tokens":6,"temperature":0.4,"top_p":0.7,"top_k":12,"min_p":0.03,"seed":11,"repetition_penalty":1.15,"presence_penalty":0.21,"frequency_penalty":0.31,"stop":["DONE"],"logit_bias":{"2":-1},"enable_thinking":false,"thinking_budget":32,"thinking_start_token":"<reason>","logprobs":true,"top_logprobs":2,"resize_shape":[320],"adapter_path":"/tmp/resp-adapter","user":"resp-user","metadata":{"trace":"abc"},"previous_response_id":"resp-prev","include":["reasoning.encrypted_content"],"parallel_tool_calls":false,"truncation":"auto","store":false,"reasoning":{"effort":"low"},"service_tier":"default","text":{"format":{"type":"json_schema","name":"answer"}},"tools":[{"type":"function","name":"search"}],"tool_choice":"auto"}
             """.utf8)
         )
         let normalizedResponses = try responsesRequest.generationRequest(defaultModel: "default")
         precondition(normalizedResponses.messages.count == 2)
         precondition(normalizedResponses.parameters.maxTokens == 6)
+        let responsesMaxTokensAlias = try JSONDecoder().decode(
+            OpenAIResponsesRequest.self,
+            from: Data("""
+            {"model":"qwen","input":"hi","max_tokens":5,"max_output_tokens":6}
+            """.utf8)
+        ).generationRequest(defaultModel: "default")
+        precondition(responsesMaxTokensAlias.parameters.maxTokens == 5)
         precondition(normalizedResponses.parameters.temperature == 0.4)
         precondition(normalizedResponses.parameters.topP == 0.7)
         precondition(normalizedResponses.parameters.topK == 12)
         precondition(normalizedResponses.parameters.minP == 0.03)
         precondition(normalizedResponses.parameters.seed == 11)
         precondition(normalizedResponses.parameters.repetitionPenalty == 1.15)
+        precondition(normalizedResponses.parameters.presencePenalty == 0.21)
+        precondition(normalizedResponses.parameters.frequencyPenalty == 0.31)
         precondition(normalizedResponses.parameters.stopSequences == ["DONE"])
         precondition(normalizedResponses.parameters.enableThinking == false)
         precondition(normalizedResponses.parameters.thinkingBudget == 32)
         precondition(normalizedResponses.metadata.responseFormat?["type"]?.stringValue == "json_schema")
         precondition(normalizedResponses.metadata.tools?.first?["name"]?.stringValue == "search")
         precondition(normalizedResponses.metadata.toolChoice == .string("auto"))
+        precondition(normalizedResponses.metadata.adapterPath == "/tmp/resp-adapter")
         precondition(normalizedResponses.metadata.logitBias?["2"]?.intValue == -1)
+        precondition(normalizedResponses.metadata.logprobs == true)
+        precondition(normalizedResponses.metadata.topLogprobs == 2)
+        precondition(normalizedResponses.metadata.resizeShape == [320, 320])
         precondition(normalizedResponses.metadata.thinkingStartToken == "<reason>")
         precondition(normalizedResponses.metadata.user == "resp-user")
+        precondition(normalizedResponses.metadata.responseInstructions == "be concise")
+        precondition(normalizedResponses.metadata.responseTruncation == "auto")
+        precondition(normalizedResponses.metadata.responseMetadata?["trace"]?.stringValue == "abc")
+        precondition(normalizedResponses.metadata.previousResponseID == "resp-prev")
+        precondition(normalizedResponses.metadata.include == [.string("reasoning.encrypted_content")])
+        precondition(normalizedResponses.metadata.parallelToolCalls == false)
+        precondition(normalizedResponses.metadata.store == false)
+        precondition(normalizedResponses.metadata.serviceTier == "default")
+        precondition(normalizedResponses.metadata.responseReasoning?["effort"]?.stringValue == "low")
         let responsesResponseFormatPlan = ResponseFormatPlanner().plan(
             metadata: normalizedResponses.metadata,
             stream: true
@@ -3023,6 +3631,10 @@ enum SelfTest {
 
         try Data(base64Encoded: Self.onePixelPNGBase64)!
             .write(to: model.appendingPathComponent("tiny.png"))
+        try Data([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70, 0x6D, 0x70, 0x34, 0x32])
+            .write(to: model.appendingPathComponent("tiny.mp4"))
+        try Data([0, 0, 0, 20, 0x66, 0x74, 0x79, 0x70, 0x71, 0x74, 0x20, 0x20])
+            .write(to: model.appendingPathComponent("tiny.mov"))
         let mediaRequest = try OllamaGenerateRequest(
             model: "qwen",
             prompt: "media",
@@ -3038,6 +3650,16 @@ enum SelfTest {
         precondition(mediaReport.loadableCount == 3)
         precondition(mediaReport.errorCount == 1)
         precondition(mediaReport.references.map(\.source) == [.rawBase64, .dataURI, .filePath, .remoteURL])
+        let videoMediaReport = MediaReferenceResolver(baseDirectory: model).report(for: pythonVideoContentChat)
+        precondition(videoMediaReport.videoCount == 3)
+        precondition(videoMediaReport.loadableCount == 3)
+        precondition(videoMediaReport.errorCount == 0)
+        precondition(videoMediaReport.references.map(\.source) == [.filePath, .fileURL, .dataURI])
+        precondition(videoMediaReport.references[0].mimeType == "video/mp4")
+        precondition(videoMediaReport.references[0].videoMaxPixels == 50_176)
+        precondition(videoMediaReport.references[1].videoNFrames == 4)
+        precondition(videoMediaReport.references[2].videoMinFrames == 2)
+        precondition(videoMediaReport.references[2].videoMaxFrames == 8)
         let imagePlanReport = QwenVLImageInputPlanner(
             resolver: MediaReferenceResolver(baseDirectory: model)
         ).plan(request: mediaRequest)
@@ -3177,6 +3799,22 @@ enum SelfTest {
             .sample(logits: [0.1, 0.9, 0.2])
         precondition(temperatureSampleA == temperatureSampleB)
         precondition([1, 2].contains(temperatureSampleA.tokenID))
+        let typicalTailFreePlan = GenerationSamplingPlanner().plan(
+            parameters: GenerationParameters(
+                temperature: 0.8,
+                topP: 0.95,
+                typicalP: 0.7,
+                tfsZ: 0.8,
+                seed: 11
+            )
+        )
+        precondition(!typicalTailFreePlan.requiresAdvancedSampler)
+        let typicalTailFreeSample = try GenerationLogitsSampler(plan: typicalTailFreePlan)
+            .sample(logits: [3.0, 2.0, 1.5, 0.4, 0.1])
+        precondition(typicalTailFreeSample.sampler == "temperature")
+        let biasedSample = try GenerationLogitsSampler(plan: preflight.runtime.sampling)
+            .sample(logits: [0.1, 0.2, 0.3], logitBias: [0: 5.0])
+        precondition(biasedSample.tokenID == 0)
         let penaltyPlan = GenerationSamplingPlanner().plan(
             parameters: GenerationParameters(
                 temperature: 0,
@@ -3203,7 +3841,9 @@ enum SelfTest {
                     kvBits: 3.5,
                     kvQuantizationScheme: "turboquant",
                     kvGroupSize: 128,
+                    quantizedKVStart: 96,
                     maxKVSize: 4096,
+                    prefillStepSize: 768,
                     visionCacheSize: 8,
                     quantizeActivations: true
                 )
@@ -3212,7 +3852,9 @@ enum SelfTest {
         precondition(cacheRuntime.kvBits == 3.5)
         precondition(cacheRuntime.kvQuantizationScheme == "turboquant")
         precondition(cacheRuntime.kvGroupSize == 128)
+        precondition(cacheRuntime.quantizedKVStart == 96)
         precondition(cacheRuntime.maxKVSize == 4096)
+        precondition(cacheRuntime.prefillStepSize == 768)
         precondition(cacheRuntime.visionCacheSize == 8)
         precondition(cacheRuntime.quantizeActivations == true)
         let engine = CompatibilityGenerationEngine(
@@ -3223,6 +3865,15 @@ enum SelfTest {
         precondition(embeddingReport.model == descriptor.id)
         precondition(embeddingReport.request.texts == ["alpha", "beta"])
         precondition(embeddingReport.inputCount == 2)
+        precondition(embeddingReport.fallbackPolicy == "diagnostic-501-no-generated-embedding")
+        precondition(embeddingReport.error == "Swift embedding backend is unavailable.")
+        precondition(embeddingReport.unavailableReason == "The Swift embedding backend is not available in this build.")
+        let realVLMEmbeddingReport = CompatibilityGenerationEngine(
+            descriptor: descriptor,
+            backend: .mlxSwiftVLM
+        ).unavailableEmbeddingReport(for: ollamaEmbed, unavailableReason: "not an embedding model")
+        precondition(realVLMEmbeddingReport.backend.activeBackend == "mlx-swift-vlm")
+        precondition(realVLMEmbeddingReport.unavailableReason == "not an embedding model")
         let processed = try engine.processedInput(for: mediaRequest)
         precondition(processed.pixelShape == [3, 56, 56, 3])
         precondition(processed.runtime == preflight.runtime)
@@ -3309,6 +3960,48 @@ enum SelfTest {
         let openAIResponseJSON = String(decoding: openAIResponseData, as: UTF8.self)
         precondition(openAIResponseJSON.contains("\"object\":\"chat.completion\""))
         precondition(openAIResponseJSON.contains("\"completion_tokens\":1"))
+        let logprob = GenerationTokenLogprob(
+            token: "o",
+            logprob: -0.25,
+            bytes: [111],
+            topLogprobs: [
+                GenerationTopLogprob(token: "o", logprob: -0.25, bytes: [111]),
+                GenerationTopLogprob(token: "a", logprob: -1.5, bytes: [97]),
+            ]
+        )
+        let logprobResult = CompletedGeneration(
+            model: "qwen",
+            text: "o",
+            usage: GenerationUsage(promptTokens: 3, completionTokens: 1),
+            logprobs: [logprob]
+        )
+        let logprobOpenAIJSON = String(
+            decoding: try JSONEncoder().encode(
+                OpenAIChatCompletionResponse(result: logprobResult, id: "chatcmpl-logprob", created: 0)
+            ),
+            as: UTF8.self
+        )
+        precondition(logprobOpenAIJSON.contains("\"logprobs\""))
+        precondition(logprobOpenAIJSON.contains("\"token\":\"o\""))
+        precondition(logprobOpenAIJSON.contains("\"logprob\":-0.25"))
+        precondition(logprobOpenAIJSON.contains("\"bytes\":[111]"))
+        precondition(logprobOpenAIJSON.contains("\"top_logprobs\""))
+        let thinkingResult = CompletedGeneration(
+            model: "qwen",
+            text: "<think>check tools</think>final answer",
+            usage: GenerationUsage(promptTokens: 3, completionTokens: 5)
+        )
+        let thinkingOpenAIJSON = String(
+            decoding: try JSONEncoder().encode(
+                OpenAIChatCompletionResponse(result: thinkingResult, id: "chatcmpl-thinking", created: 0)
+            ),
+            as: UTF8.self
+        )
+        precondition(thinkingOpenAIJSON.contains("\"reasoning\":\"check tools\""))
+        precondition(thinkingOpenAIJSON.contains("\"content\":\"final answer\""))
+        let gemmaThinkingSplit = ThinkingOutputSplitter().split("<|channel>thought\ninspect<channel|>done")
+        precondition(gemmaThinkingSplit.reasoning == "inspect")
+        precondition(gemmaThinkingSplit.content == "done")
         let toolCall = GenerationToolCall(
             id: "call_test",
             function: GenerationToolCallFunction(
@@ -3371,6 +4064,20 @@ enum SelfTest {
         precondition(openAIStreamJSON.contains("\"object\":\"chat.completion.chunk\""))
         precondition(openAIStreamJSON.contains("\"finish_reason\":\"stop\""))
         precondition(openAIStreamJSON.contains("\"completion_tokens\":1"))
+        let logprobChunk = GenerationChunk(text: "o", tokenID: 1, logprob: logprob)
+        let logprobStreamJSON = String(
+            decoding: try JSONEncoder().encode(
+                OpenAIChatCompletionStreamResponse(
+                    model: "qwen",
+                    chunk: logprobChunk,
+                    id: "chatcmpl-logprob-stream",
+                    created: 0
+                )
+            ),
+            as: UTF8.self
+        )
+        precondition(logprobStreamJSON.contains("\"logprobs\""))
+        precondition(logprobStreamJSON.contains("\"top_logprobs\""))
         let toolChunk = GenerationChunk(text: "", finishReason: nil, toolCalls: [toolCall])
         let toolStreamJSON = String(
             decoding: try JSONEncoder().encode(
@@ -3432,6 +4139,30 @@ enum SelfTest {
         precondition(renderedOpenAIStream.contentType == "text/event-stream")
         precondition(renderedOpenAIStream.body.contains("data: [DONE]"))
         precondition(renderedOpenAIStream.frameCount == 3)
+        let renderedLogprobStream = GenerationAPIResponseRenderer.renderCompleted(
+            logprobResult,
+            api: .openAIChat,
+            stream: true,
+            chunks: [logprobChunk, finalChunk]
+        )
+        precondition(renderedLogprobStream.body.contains("\"logprobs\""))
+        precondition(renderedLogprobStream.body.contains("\"token\":\"o\""))
+        let thinkingStream = GenerationAPIResponseRenderer.renderCompleted(
+            thinkingResult,
+            api: .openAIChat,
+            stream: true,
+            chunks: [
+                GenerationChunk(text: "<thi"),
+                GenerationChunk(text: "nk>check"),
+                GenerationChunk(text: " tools</think>final"),
+                GenerationChunk(text: " answer"),
+                GenerationChunk(text: "", isFinished: true, finishReason: "stop"),
+            ]
+        )
+        precondition(thinkingStream.body.contains("\"reasoning\":\"check\""))
+        precondition(thinkingStream.body.contains("\"reasoning\":\" tools\""))
+        precondition(thinkingStream.body.contains("\"content\":\"final\""))
+        precondition(thinkingStream.body.contains("\"content\":\" answer\""))
         let chunkCollection = GenerationChunkCollector.collect(
             model: "qwen",
             promptTokenCount: 2,
@@ -3459,17 +4190,86 @@ enum SelfTest {
         precondition(endpointRender.response.body.contains("data: [DONE]"))
 
         let responsesResponseData = try JSONEncoder().encode(
-            OpenAIResponsesResponse(
-                result: result,
-                id: "resp-test",
-                createdAt: 0
-            )
+                OpenAIResponsesResponse(
+                    result: result,
+                    request: normalizedResponses,
+                    id: "resp-test",
+                    createdAt: 0
+                )
         )
         let responsesResponseJSON = String(decoding: responsesResponseData, as: UTF8.self)
         precondition(responsesResponseJSON.contains("\"object\":\"response\""))
         precondition(responsesResponseJSON.contains("\"output_text\":\"ok\""))
         precondition(responsesResponseJSON.contains("\"type\":\"output_text\""))
         precondition(responsesResponseJSON.contains("\"completion_tokens\":1"))
+        precondition(responsesResponseJSON.contains("\"instructions\":\"be concise\""))
+        precondition(responsesResponseJSON.contains("\"max_output_tokens\":6"))
+        precondition(responsesResponseJSON.contains("\"temperature\":0.4"))
+        precondition(responsesResponseJSON.contains("\"top_p\":0.7"))
+        precondition(responsesResponseJSON.contains("\"truncation\":\"auto\""))
+        precondition(responsesResponseJSON.contains("\"user\":\"resp-user\""))
+        precondition(responsesResponseJSON.contains("\"metadata\":{\"trace\":\"abc\"}"))
+        let toolResponsesJSON = String(
+            decoding: try JSONEncoder().encode(
+                OpenAIResponsesResponse(
+                    result: toolResult,
+                    id: "resp-tool",
+                    createdAt: 0
+                )
+            ),
+            as: UTF8.self
+        )
+        precondition(toolResponsesJSON.contains("\"type\":\"function_call\""))
+        precondition(toolResponsesJSON.contains("\"call_id\":\"call_test\""))
+        precondition(toolResponsesJSON.contains("\"name\":\"lookup\""))
+        precondition(toolResponsesJSON.contains(#""arguments":"{\"query\":\"swift\"}""#))
+        let thinkingResponsesJSON = String(
+            decoding: try JSONEncoder().encode(
+                OpenAIResponsesResponse(
+                    result: thinkingResult,
+                    id: "resp-thinking",
+                    createdAt: 0
+                )
+            ),
+            as: UTF8.self
+        )
+        precondition(thinkingResponsesJSON.contains("\"reasoning\":\"check tools\""))
+        precondition(thinkingResponsesJSON.contains("\"output_text\":\"final answer\""))
+        let streamedResponses = GenerationAPIResponseRenderer.renderCompleted(
+            thinkingResult,
+            api: .openAIResponses,
+            stream: true,
+            chunks: [
+                GenerationChunk(text: "<think>check"),
+                GenerationChunk(text: " tools</think>final"),
+                GenerationChunk(text: " answer"),
+                GenerationChunk(text: "", isFinished: true, finishReason: "stop"),
+            ],
+            request: normalizedResponses
+        )
+        precondition(streamedResponses.contentType == "text/event-stream")
+        precondition(streamedResponses.body.contains("event: response.created"))
+        precondition(streamedResponses.body.contains("event: response.output_text.delta"))
+        precondition(streamedResponses.body.contains("\"delta\":\"<think>check\""))
+        precondition(streamedResponses.body.contains("event: response.output_text.done"))
+        precondition(streamedResponses.body.contains("\"text\":\"final answer\""))
+        precondition(streamedResponses.body.contains("event: response.completed"))
+        precondition(streamedResponses.body.contains("\"instructions\":\"be concise\""))
+        precondition(streamedResponses.body.contains("\"truncation\":\"auto\""))
+        precondition(streamedResponses.body.contains("\"metadata\":{\"trace\":\"abc\"}"))
+        precondition(streamedResponses.body.contains("data: [DONE]"))
+        let streamedToolResponses = GenerationAPIResponseRenderer.renderCompleted(
+            toolResult,
+            api: .openAIResponses,
+            stream: true,
+            chunks: [
+                GenerationChunk(text: "", toolCalls: [toolCall]),
+                GenerationChunk(text: "", isFinished: true, finishReason: "tool_calls"),
+            ]
+        )
+        precondition(streamedToolResponses.body.contains("event: response.function_call_arguments.done"))
+        precondition(streamedToolResponses.body.contains("\"type\":\"function_call\""))
+        precondition(streamedToolResponses.body.contains("\"call_id\":\"call_test\""))
 
         let running = OllamaRunningModelsResponse(
             models: [
@@ -3523,6 +4323,10 @@ enum SelfTest {
         precondition(backendAvailability.canCreateBackend == MLXRuntimeProbe.detectRealMLXAPIImplementationCompiled())
         precondition(backendAvailability.runtimeProbe.backendImplementationReady == MLXRuntimeProbe.detectBackendImplementationReady())
         precondition(backendAvailability.runtimeProbe.realMLXAPIImplementationCompiled == MLXRuntimeProbe.detectRealMLXAPIImplementationCompiled())
+        let runtimePackage = MLXMetalLibrarySupport.runtimePackageReport(rootPath: FileManager.default.currentDirectoryPath)
+        precondition(runtimePackage.requiredEnvironment.contains("MLXVLM_ENABLE_REAL_MLX_API=1"))
+        precondition(runtimePackage.requiredRuntimeFiles == ["default.metallib"])
+        precondition(runtimePackage.runtimePackageReady == (runtimePackage.availability.canCreateBackend && runtimePackage.metalLibrary.ready))
         precondition(
             backendPlan.requirements
                 .first { $0.packageName == "mlx-swift" }?
@@ -3638,6 +4442,12 @@ enum SelfTest {
         precondition(cachedDescriptor.id == cachedModelID)
         precondition(cachedDescriptor.path.hasSuffix("/snapshots/abc123"))
         precondition(cachedDescriptor.safetensorsMetadata.first?.isReadable == true)
+        let cachedModels = HuggingFaceCacheResolver(environment: ["HUGGINGFACE_HUB_CACHE": hubRoot.path]).cachedMLXModels()
+        precondition(cachedModels.contains {
+            $0.id == cachedModelID &&
+                $0.path.hasSuffix("/snapshots/abc123") &&
+                $0.created >= 0
+        })
 
         print("self-test passed")
     }
@@ -3803,20 +4613,36 @@ private func waitForAsync<T: Sendable>(
     let semaphore = DispatchSemaphore(value: 0)
     let box = AsyncResultBox<T>()
 
-    Task {
+    Task.detached {
         do {
-            box.result = Result<T, Error>.success(try await operation())
+            box.set(Result<T, Error>.success(try await operation()))
         } catch {
-            box.result = Result<T, Error>.failure(error)
+            box.set(Result<T, Error>.failure(error))
         }
         semaphore.signal()
     }
     semaphore.wait()
-    return try box.result!.get()
+    return try box.result().get()
 }
 
 private final class AsyncResultBox<T: Sendable>: @unchecked Sendable {
-    var result: Result<T, Error>?
+    private let lock = NSLock()
+    private var storedResult: Result<T, Error>?
+
+    func set(_ result: Result<T, Error>) {
+        lock.lock()
+        storedResult = result
+        lock.unlock()
+    }
+
+    func result() throws -> Result<T, Error> {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let storedResult else {
+            throw CLIError.asyncResultMissing
+        }
+        return storedResult
+    }
 }
 
 fileprivate func normalizedRoutePath(_ target: String) -> String {

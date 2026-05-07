@@ -123,7 +123,7 @@ public enum MLXBackendFactory {
 
         _ = MLXMetalLibrarySupport.ensureDefaultLibraryAvailable()
 
-        #if MLXVLM_REAL_MLX_API && canImport(MLXLMCommon) && canImport(MLXVLM) && canImport(MLXLMTokenizers)
+        #if MLXVLM_REAL_MLX_API && canImport(MLX) && canImport(MLXLMCommon) && canImport(MLXVLM) && canImport(MLXLMTokenizers)
         return try await MLXVLMUpstreamBackend.load(descriptor: descriptor)
         #else
         throw MLXBackendFactoryError.dependenciesUnavailable(availability)

@@ -91,6 +91,26 @@ public enum JSONValue: Codable, Equatable, Sendable {
         }
         return nil
     }
+
+    public func normalizingToolCallFunctionArguments() -> JSONValue {
+        guard case .object(var object) = self,
+              case .object(var function)? = object["function"],
+              case .string(let arguments)? = function["arguments"]
+        else {
+            return self
+        }
+
+        let data = Data(arguments.utf8)
+        if let decoded = try? JSONDecoder().decode(JSONValue.self, from: data),
+           decoded.objectValue != nil
+        {
+            function["arguments"] = decoded
+        } else {
+            function["arguments"] = .object([:])
+        }
+        object["function"] = .object(function)
+        return .object(object)
+    }
 }
 
 public extension Dictionary where Key == String, Value == JSONValue {

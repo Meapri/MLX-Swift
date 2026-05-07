@@ -118,6 +118,7 @@ public struct BackendDependencyPlanner {
             packageText.contains("MLXVLMBackend")
         let supportsBackendToggle = packageText.contains("MLXVLM_ENABLE_MLX_BACKEND")
         let supportsTokenizerToggle = packageText.contains("MLXVLM_ENABLE_TOKENIZER_INTEGRATIONS")
+        let supportsHuggingFaceDownloaderToggle = packageText.contains("MLXVLM_ENABLE_HUGGINGFACE_DOWNLOADER")
         let supportsLocalDependencies = packageText.contains("MLXVLM_USE_LOCAL_MLX")
         let supportsExplicitPaths = packageText.contains("MLXVLM_MLX_SWIFT_PATH") &&
             packageText.contains("MLXVLM_MLX_SWIFT_LM_PATH")
@@ -136,6 +137,9 @@ public struct BackendDependencyPlanner {
         }
         if supportsTokenizerToggle {
             nextSteps.append("Set MLXVLM_ENABLE_TOKENIZER_INTEGRATIONS=1 when a local swift-tokenizers-mlx checkout is available.")
+        }
+        if supportsHuggingFaceDownloaderToggle {
+            nextSteps.append("Set MLXVLM_ENABLE_HUGGINGFACE_DOWNLOADER=1 only when remote Hugging Face model ID downloads should use upstream MLXHuggingFace/Downloader support.")
         }
         if supportsLocalDependencies || supportsExplicitPaths {
             nextSteps.append("For network-restricted builds, set MLXVLM_USE_LOCAL_MLX=1 or explicit MLXVLM_MLX_SWIFT_PATH/MLXVLM_MLX_SWIFT_LM_PATH/MLXVLM_SWIFT_TOKENIZERS_MLX_PATH values.")

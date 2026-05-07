@@ -12,7 +12,9 @@ public struct GenerationRuntimePlan: Codable, Equatable, Sendable {
     public let kvBits: Double?
     public let kvQuantizationScheme: String?
     public let kvGroupSize: Int?
+    public let quantizedKVStart: Int?
     public let maxKVSize: Int?
+    public let prefillStepSize: Int?
     public let visionCacheSize: Int?
     public let quantizeActivations: Bool?
     public let keepAlive: String?
@@ -32,7 +34,9 @@ public struct GenerationRuntimePlan: Codable, Equatable, Sendable {
         kvBits: Double?,
         kvQuantizationScheme: String?,
         kvGroupSize: Int?,
+        quantizedKVStart: Int?,
         maxKVSize: Int?,
+        prefillStepSize: Int?,
         visionCacheSize: Int?,
         quantizeActivations: Bool?,
         keepAlive: String?,
@@ -51,7 +55,9 @@ public struct GenerationRuntimePlan: Codable, Equatable, Sendable {
         self.kvBits = kvBits
         self.kvQuantizationScheme = kvQuantizationScheme
         self.kvGroupSize = kvGroupSize
+        self.quantizedKVStart = quantizedKVStart
         self.maxKVSize = maxKVSize
+        self.prefillStepSize = prefillStepSize
         self.visionCacheSize = visionCacheSize
         self.quantizeActivations = quantizeActivations
         self.keepAlive = keepAlive
@@ -95,7 +101,9 @@ public struct GenerationRuntimePlan: Codable, Equatable, Sendable {
             kvBits: request.parameters.kvBits,
             kvQuantizationScheme: request.parameters.kvQuantizationScheme,
             kvGroupSize: request.parameters.kvGroupSize,
+            quantizedKVStart: request.parameters.quantizedKVStart,
             maxKVSize: request.parameters.maxKVSize,
+            prefillStepSize: request.parameters.prefillStepSize,
             visionCacheSize: request.parameters.visionCacheSize,
             quantizeActivations: request.parameters.quantizeActivations,
             keepAlive: request.parameters.keepAlive,

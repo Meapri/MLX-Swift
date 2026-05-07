@@ -123,9 +123,7 @@ public struct GenerationSamplingPlanner {
             sampler = "temperature"
         }
 
-        let requiresAdvancedSampler = parameters.mirostat.map { $0 > 0 } == true ||
-            parameters.typicalP != nil ||
-            parameters.tfsZ != nil
+        let requiresAdvancedSampler = parameters.mirostat.map { $0 > 0 } == true
 
         if deterministic, !filters.isEmpty {
             warnings.append("Sampling filters are preserved but have no effect for greedy decoding unless the backend overrides temperature semantics.")
@@ -133,11 +131,11 @@ public struct GenerationSamplingPlanner {
         if parameters.mirostat.map({ $0 > 0 }) == true {
             warnings.append("Mirostat requires a sampler implementation beyond basic greedy/temperature sampling.")
         }
-        if parameters.typicalP != nil {
-            warnings.append("typical_p requires an advanced probability filter.")
+        if parameters.typicalP != nil, sampler == "mirostat" {
+            warnings.append("typical_p is preserved for the backend, but Mirostat controls sampler ownership.")
         }
-        if parameters.tfsZ != nil {
-            warnings.append("tfs_z requires a tail-free probability filter.")
+        if parameters.tfsZ != nil, sampler == "mirostat" {
+            warnings.append("tfs_z is preserved for the backend, but Mirostat controls sampler ownership.")
         }
 
         var minimumFeatures = deterministic ? ["argmax-logits"] : ["random-categorical", "temperature"]

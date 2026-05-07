@@ -113,6 +113,105 @@ public struct QwenVLPromptBuilder: Sendable {
         return output.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    public func gemma4ChatPrompt(
+        messages: [ChatMessage],
+        tools: [JSONValue]? = nil,
+        enableThinking: Bool = false,
+        addGenerationPrompt: Bool = true
+    ) -> String {
+        guard !messages.isEmpty else {
+            return "<bos>"
+        }
+
+        var output = "<bos>"
+        var startIndex = 0
+        var previousMessageType: String?
+        let first = messages[0]
+        let hasSystemLead = first.role == .system || first.role == .developer
+
+        if enableThinking || tools?.isEmpty == false || hasSystemLead {
+            output += "<|turn>system\n"
+            if enableThinking {
+                output += "<|think|>\n"
+                previousMessageType = "think"
+            }
+            if hasSystemLead {
+                output += flatten(content: first.content).trimmingCharacters(in: .whitespacesAndNewlines)
+                startIndex = 1
+            }
+            if let tools, !tools.isEmpty {
+                for tool in tools {
+                    output += gemma4ToolDeclaration(tool)
+                }
+                previousMessageType = "tool"
+            }
+            output += "<turn|>\n"
+        }
+
+        let lastUserIndex = messages.lastIndex { message in
+            message.role == .user
+        } ?? -1
+
+        for index in startIndex..<messages.count {
+            let message = messages[index]
+            guard message.role != .tool else {
+                continue
+            }
+            previousMessageType = nil
+            let role = gemma4RoleName(message.role)
+            let previousNonToolRole = previousNonToolRole(before: index, in: messages)
+            let continueSameModelTurn = role == "model" && previousNonToolRole == .assistant
+            if !continueSameModelTurn {
+                output += "<|turn>\(role)\n"
+            }
+
+            if let reasoning = message.reasoning,
+               !reasoning.isEmpty,
+               index > lastUserIndex,
+               message.toolCalls?.isEmpty == false
+            {
+                output += "<|channel>thought\n\(reasoning)\n<channel|>"
+            }
+
+            if let toolCalls = message.toolCalls, !toolCalls.isEmpty {
+                for toolCall in toolCalls {
+                    output += gemma4ToolCall(toolCall)
+                }
+                previousMessageType = "tool_call"
+            }
+
+            var renderedToolResponse = false
+            if let toolCalls = message.toolCalls, !toolCalls.isEmpty {
+                for follow in followingToolMessages(after: index, in: messages) {
+                    let toolName = toolName(for: follow, resolvingAgainst: toolCalls)
+                    output += gemma4ToolResponse(toolName: toolName, content: flatten(content: follow.content))
+                    renderedToolResponse = true
+                    previousMessageType = "tool_response"
+                }
+            }
+
+            let content = flatten(content: message.content).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !content.isEmpty {
+                output += role == "model" ? stripGemma4Thinking(from: content) : content
+            }
+
+            if previousMessageType == "tool_call", !renderedToolResponse {
+                output += "<|tool_response>"
+            } else if !(renderedToolResponse && content.isEmpty) {
+                output += "<turn|>\n"
+            }
+        }
+
+        if addGenerationPrompt,
+           previousMessageType != "tool_response",
+           previousMessageType != "tool_call"
+        {
+            output += "<|turn>model\n"
+        }
+
+        return output
+    }
+
     public func flatten(content: [ContentPart]) -> String {
         var parts: [String] = []
         for part in content {
@@ -121,9 +220,9 @@ public struct QwenVLPromptBuilder: Sendable {
                 if !text.isEmpty {
                     parts.append(text)
                 }
-            case .imageURL:
+            case .imagePlaceholder, .imageURL:
                 parts.append(imageToken)
-            case .audioURL:
+            case .audioPlaceholder, .audioURL:
                 parts.append(audioToken)
             case .videoURL:
                 parts.append(videoToken)
@@ -186,5 +285,132 @@ public struct QwenVLPromptBuilder: Sendable {
         default:
             return role.rawValue
         }
+    }
+
+    private func gemma4RoleName(_ role: MessageRole) -> String {
+        switch role {
+        case .assistant:
+            return "model"
+        case .developer:
+            return "system"
+        default:
+            return role.rawValue
+        }
+    }
+
+    private func previousNonToolRole(before index: Int, in messages: [ChatMessage]) -> MessageRole? {
+        guard index > 0 else {
+            return nil
+        }
+        for candidate in stride(from: index - 1, through: 0, by: -1) {
+            if messages[candidate].role != .tool {
+                return messages[candidate].role
+            }
+        }
+        return nil
+    }
+
+    private func followingToolMessages(after index: Int, in messages: [ChatMessage]) -> [ChatMessage] {
+        guard index + 1 < messages.count else {
+            return []
+        }
+        var result: [ChatMessage] = []
+        for candidate in messages[(index + 1)...] {
+            guard candidate.role == .tool else {
+                break
+            }
+            result.append(candidate)
+        }
+        return result
+    }
+
+    private func toolName(for message: ChatMessage, resolvingAgainst toolCalls: [JSONValue]) -> String {
+        if let name = message.name, !name.isEmpty {
+            return name
+        }
+        guard let toolCallID = message.toolCallID else {
+            return "unknown"
+        }
+        for toolCall in toolCalls {
+            guard let object = toolCall.objectValue,
+                  object["id"]?.stringValue == toolCallID,
+                  let name = object["function"]?.objectValue?["name"]?.stringValue,
+                  !name.isEmpty
+            else {
+                continue
+            }
+            return name
+        }
+        return "unknown"
+    }
+
+    private func gemma4ToolCall(_ value: JSONValue) -> String {
+        guard let object = value.objectValue,
+              let function = object["function"]?.objectValue,
+              let name = function["name"]?.stringValue
+        else {
+            return ""
+        }
+        let arguments = function["arguments"] ?? .object([:])
+        return "<|tool_call>call:\(name)\(gemma4Argument(arguments, escapeKeys: false))<tool_call|>"
+    }
+
+    private func gemma4ToolResponse(toolName: String, content: String) -> String {
+        "<|tool_response>response:\(toolName){value:\(gemma4Argument(.string(content), escapeKeys: false))}<tool_response|>"
+    }
+
+    private func gemma4ToolDeclaration(_ value: JSONValue) -> String {
+        guard let object = value.objectValue else {
+            return ""
+        }
+        let function = object["function"]?.objectValue ?? object
+        guard let name = function["name"]?.stringValue else {
+            return ""
+        }
+        var fields: [String] = []
+        if let description = function["description"]?.stringValue, !description.isEmpty {
+            fields.append("description:\(gemma4Argument(.string(description)))")
+        }
+        if let parameters = function["parameters"] {
+            fields.append("parameters:\(gemma4Argument(parameters, escapeKeys: false))")
+        }
+        if fields.isEmpty {
+            fields.append("type:<|\"|>FUNCTION<|\"|>")
+        }
+        return "<|tool>declaration:\(name){\(fields.joined(separator: ","))}<tool|>"
+    }
+
+    private func gemma4Argument(_ value: JSONValue, escapeKeys: Bool = true) -> String {
+        switch value {
+        case .string(let string):
+            return "<|\"|>\(string)<|\"|>"
+        case .number(let number):
+            if number.rounded() == number {
+                return String(Int(number))
+            }
+            return String(number)
+        case .bool(let bool):
+            return bool ? "true" : "false"
+        case .null:
+            return "null"
+        case .array(let values):
+            return "[" + values.map { gemma4Argument($0, escapeKeys: escapeKeys) }.joined(separator: ",") + "]"
+        case .object(let object):
+            let fields = object.keys.sorted().map { key in
+                let renderedKey = escapeKeys ? "<|\"|>\(key)<|\"|>" : key
+                return "\(renderedKey):\(gemma4Argument(object[key] ?? .null, escapeKeys: escapeKeys))"
+            }
+            return "{\(fields.joined(separator: ","))}"
+        }
+    }
+
+    private func stripGemma4Thinking(from text: String) -> String {
+        var result = text
+        while let start = result.range(of: "<|channel>"),
+              let end = result.range(of: "<channel|>", range: start.upperBound..<result.endIndex)
+        {
+            result.removeSubrange(start.lowerBound..<end.upperBound)
+        }
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

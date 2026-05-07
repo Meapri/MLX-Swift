@@ -67,6 +67,8 @@ public struct ChatTemplatePlanner {
             template.contains("<|eot_id|>")
         let containsMistralMarkers = template.contains("[INST]") &&
             template.contains("[/INST]")
+        let containsGemma4Markers = template.contains("<|turn>") &&
+            template.contains("<turn|>")
         let containsGenerationPromptVariable = template.contains("add_generation_prompt")
         let qwen = isQwenVL(descriptor)
         let requiredRenderer: String
@@ -90,6 +92,12 @@ public struct ChatTemplatePlanner {
             canRenderNatively = true
             if containsJinjaSyntax {
                 warnings.append("Swift can render the Mistral [INST] marker format, but does not execute every Jinja branch in the source template.")
+            }
+        } else if descriptor.canonicalModelType == "gemma4" || containsGemma4Markers {
+            requiredRenderer = "gemma4-chat-builtin"
+            canRenderNatively = true
+            if containsJinjaSyntax {
+                warnings.append("Swift can render the Gemma4 turn/channel/tool-call marker format, but does not execute every Jinja branch in the source template.")
             }
         } else if containsJinjaSyntax {
             requiredRenderer = "jinja-template"
@@ -116,6 +124,17 @@ public struct ChatTemplatePlanner {
     }
 
     private func isQwenVL(_ descriptor: ModelDescriptor) -> Bool {
-        descriptor.canonicalModelType == "qwen2_vl" || descriptor.canonicalModelType == "qwen2_5_vl"
+        switch descriptor.canonicalModelType {
+        case "qwen2_vl",
+             "qwen2_5_vl",
+             "qwen3_vl",
+             "qwen3_vl_moe",
+             "qwen3_5",
+             "qwen3_5_moe",
+             "qwen3_omni_moe":
+            return true
+        default:
+            return false
+        }
     }
 }

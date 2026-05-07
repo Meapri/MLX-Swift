@@ -69,13 +69,15 @@ public struct GenerationLogitsSampler: Sendable {
     public func sample(
         logits: [Double],
         recentTokenIDs: [Int] = [],
-        newlineTokenID: Int? = nil
+        newlineTokenID: Int? = nil,
+        logitBias: [Int: Double] = [:]
     ) throws -> SampledToken {
         var generator = SeededLogitsRandomNumberGenerator(seed: plan.seed)
         return try sample(
             logits: logits,
             recentTokenIDs: recentTokenIDs,
             newlineTokenID: newlineTokenID,
+            logitBias: logitBias,
             generator: &generator
         )
     }
@@ -84,6 +86,7 @@ public struct GenerationLogitsSampler: Sendable {
         logits: [Double],
         recentTokenIDs: [Int] = [],
         newlineTokenID: Int? = nil,
+        logitBias: [Int: Double] = [:],
         generator: inout R
     ) throws -> SampledToken {
         guard !logits.isEmpty else {
@@ -96,8 +99,9 @@ public struct GenerationLogitsSampler: Sendable {
             throw GenerationLogitsSamplerError.unsupportedAdvancedSampler(plan.sampler)
         }
 
+        let biased = applyLogitBias(logits: logits, logitBias: logitBias)
         let adjusted = applyPenalties(
-            logits: logits,
+            logits: biased,
             recentTokenIDs: recentTokenIDs,
             newlineTokenID: newlineTokenID
         )
@@ -136,6 +140,60 @@ public struct GenerationLogitsSampler: Sendable {
             }
         }
         throw GenerationLogitsSamplerError.noCandidateTokens
+    }
+
+    public func rankedTokenProbabilities(
+        logits: [Double],
+        recentTokenIDs: [Int] = [],
+        newlineTokenID: Int? = nil,
+        logitBias: [Int: Double] = [:],
+        applySamplingFilters: Bool = false
+    ) throws -> [SampledToken] {
+        guard !logits.isEmpty else {
+            throw GenerationLogitsSamplerError.emptyLogits
+        }
+        for (index, value) in logits.enumerated() where !value.isFinite {
+            throw GenerationLogitsSamplerError.nonFiniteLogit(index, value)
+        }
+        guard !plan.requiresAdvancedSampler else {
+            throw GenerationLogitsSamplerError.unsupportedAdvancedSampler(plan.sampler)
+        }
+
+        let biased = applyLogitBias(logits: logits, logitBias: logitBias)
+        let adjusted = applyPenalties(
+            logits: biased,
+            recentTokenIDs: recentTokenIDs,
+            newlineTokenID: newlineTokenID
+        )
+        let temperature = plan.deterministic || plan.temperature <= 0
+            ? 1.0
+            : max(plan.temperature, Double.leastNonzeroMagnitude)
+        let ranked = applySamplingFilters
+            ? normalize(applyFilters(to: rankedProbabilities(logits: adjusted, temperature: temperature)))
+            : rankedProbabilities(logits: adjusted, temperature: temperature)
+        return ranked.enumerated().map { index, candidate in
+            SampledToken(
+                tokenID: candidate.tokenID,
+                probability: candidate.probability,
+                logProbability: log(max(candidate.probability, Double.leastNonzeroMagnitude)),
+                rank: index + 1,
+                sampler: plan.sampler
+            )
+        }
+    }
+
+    private func applyLogitBias(
+        logits: [Double],
+        logitBias: [Int: Double]
+    ) -> [Double] {
+        guard !logitBias.isEmpty else {
+            return logits
+        }
+        var result = logits
+        for (tokenID, bias) in logitBias where bias.isFinite && result.indices.contains(tokenID) {
+            result[tokenID] += bias
+        }
+        return result
     }
 
     private func applyPenalties(
@@ -221,7 +279,73 @@ public struct GenerationLogitsSampler: Sendable {
             }
             result = nucleus
         }
+        result = applyTypicalP(to: result)
+        result = applyTailFree(to: result)
         return result
+    }
+
+    private func applyTypicalP(to ranked: [CandidateToken]) -> [CandidateToken] {
+        guard let typicalP = plan.typicalP,
+              typicalP > 0,
+              typicalP < 1,
+              ranked.count > 1
+        else {
+            return ranked
+        }
+        let entropy = ranked.reduce(0.0) { total, candidate in
+            let probability = max(candidate.probability, Double.leastNonzeroMagnitude)
+            return total - probability * log(probability)
+        }
+        let typicalOrder = ranked.sorted {
+            let left = abs(-log(max($0.probability, Double.leastNonzeroMagnitude)) - entropy)
+            let right = abs(-log(max($1.probability, Double.leastNonzeroMagnitude)) - entropy)
+            if left == right {
+                return $0.tokenID < $1.tokenID
+            }
+            return left < right
+        }
+        var kept: Set<Int> = []
+        var cumulative = 0.0
+        for candidate in typicalOrder {
+            kept.insert(candidate.tokenID)
+            cumulative += candidate.probability
+            if cumulative >= typicalP {
+                break
+            }
+        }
+        return ranked.filter { kept.contains($0.tokenID) }
+    }
+
+    private func applyTailFree(to ranked: [CandidateToken]) -> [CandidateToken] {
+        guard let tfsZ = plan.tfsZ,
+              tfsZ > 0,
+              tfsZ < 1,
+              ranked.count > 2
+        else {
+            return ranked
+        }
+        let probabilities = ranked.map(\.probability)
+        let firstDerivatives = zip(probabilities, probabilities.dropFirst()).map { left, right in
+            max(left - right, 0)
+        }
+        let secondDerivatives = zip(firstDerivatives, firstDerivatives.dropFirst()).map { left, right in
+            abs(left - right)
+        }
+        let total = secondDerivatives.reduce(0, +)
+        guard total > 0 else {
+            return [ranked[0]]
+        }
+
+        var keepCount = 1
+        var cumulative = 0.0
+        for value in secondDerivatives {
+            cumulative += value / total
+            keepCount += 1
+            if cumulative >= tfsZ {
+                break
+            }
+        }
+        return Array(ranked.prefix(max(1, min(keepCount, ranked.count))))
     }
 
     private func normalize(_ candidates: [CandidateToken]) -> [CandidateToken] {

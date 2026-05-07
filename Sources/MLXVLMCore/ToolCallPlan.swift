@@ -44,7 +44,7 @@ public struct ToolCallPlanner {
         let tools = metadata.tools ?? []
         let names = tools.compactMap(toolName).sorted()
         let choice = toolChoice(metadata.toolChoice)
-        let parserHint = parserHint(chatTemplate: descriptor.tokenizerMetadata.chatTemplate)
+        let parserHint = parserHint(descriptor: descriptor)
         let hasTools = !tools.isEmpty
         let requiresToolParser = hasTools || choice.mode != "auto"
         var features: [String] = []
@@ -108,12 +108,29 @@ public struct ToolCallPlanner {
         return ("unknown", nil)
     }
 
-    private func parserHint(chatTemplate: String?) -> String? {
+    private func parserHint(descriptor: ModelDescriptor) -> String? {
+        if ToolCallOutputParser.usesGemma4ToolCalls(descriptor: descriptor) {
+            return "gemma4"
+        }
+        let modelTypes = [
+            descriptor.rawModelType.lowercased(),
+            descriptor.canonicalModelType.lowercased(),
+        ]
+        if modelTypes.contains(where: { $0.hasPrefix("qwen3_5") || $0.hasPrefix("qwen3_next") || $0.hasPrefix("nemotron") }) {
+            return "xml_function"
+        }
+        if modelTypes.contains(where: { $0.hasPrefix("glm4") }) {
+            return "glm4"
+        }
+        if modelTypes.contains(where: { $0.hasPrefix("lfm2") }) {
+            return "lfm2"
+        }
+        if modelTypes.contains(where: { $0.hasPrefix("mistral3") }) {
+            return "mistral"
+        }
+        let chatTemplate = descriptor.tokenizerMetadata.chatTemplate
         guard let chatTemplate else {
             return nil
-        }
-        if chatTemplate.contains("<|tool_call>") {
-            return "gemma4"
         }
         if chatTemplate.contains("tool_call") {
             return "template-tool-call"

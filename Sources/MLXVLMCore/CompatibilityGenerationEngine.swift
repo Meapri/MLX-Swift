@@ -45,12 +45,16 @@ public struct CompatibilityGenerationEngine {
         backend.unavailableReport(for: request)
     }
 
-    public func unavailableEmbeddingReport(for request: EmbeddingRequest) -> EmbeddingUnavailableReport {
+    public func unavailableEmbeddingReport(
+        for request: EmbeddingRequest,
+        unavailableReason: String? = nil
+    ) -> EmbeddingUnavailableReport {
         EmbeddingUnavailableReport(
-            error: "Swift embedding backend is not wired yet.",
+            error: "Swift embedding backend is unavailable.",
             model: descriptor.id,
             canonicalModelType: descriptor.canonicalModelType,
             backend: backend.status,
+            unavailableReason: unavailableReason,
             request: request
         )
     }

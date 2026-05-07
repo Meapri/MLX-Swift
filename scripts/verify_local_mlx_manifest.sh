@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
+SWIFT_BUILD_JOBS="${SWIFT_BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)}"
 
 TMP_ROOT="${TMPDIR:-/tmp}/mlx-vlm-swift-local-mock-deps"
 MLX_SWIFT_DIR="$TMP_ROOT/MLXSwift"
@@ -168,8 +169,8 @@ export MLXVLM_MLX_SWIFT_LM_PATH="$MLX_SWIFT_LM_DIR"
 export MLXVLM_SWIFT_TOKENIZERS_MLX_PATH="$SWIFT_TOKENIZERS_MLX_DIR"
 export CLANG_MODULE_CACHE_PATH="$ROOT_DIR/.build/clang-module-cache"
 
-swift build --disable-sandbox --scratch-path "$SCRATCH_DIR" --target MLXVLMMLXBackend
-swift build --disable-sandbox --scratch-path "$SCRATCH_DIR" --product mlx-vlm-swift
+swift build --disable-sandbox --jobs "$SWIFT_BUILD_JOBS" --scratch-path "$SCRATCH_DIR" --target MLXVLMMLXBackend
+swift build --disable-sandbox --jobs "$SWIFT_BUILD_JOBS" --scratch-path "$SCRATCH_DIR" --product mlx-vlm-swift
 AVAILABILITY_JSON="$(
   "$SCRATCH_DIR/arm64-apple-macosx/debug/mlx-vlm-swift" backend-availability
 )"

@@ -114,7 +114,8 @@ public enum GenerationEndpointRenderer {
         promptTokenCount: Int,
         api: GenerationResponseAPI,
         stream: Bool,
-        chunks: [GenerationChunk]
+        chunks: [GenerationChunk],
+        request: GenerationRequest? = nil
     ) -> GenerationEndpointRenderReport {
         let collection = GenerationChunkCollector.collect(
             model: model,
@@ -125,7 +126,8 @@ public enum GenerationEndpointRenderer {
             collection.completedGeneration,
             api: api,
             stream: stream,
-            chunks: chunks
+            chunks: chunks,
+            request: request
         )
         return GenerationEndpointRenderReport(collection: collection, response: response)
     }

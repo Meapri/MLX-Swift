@@ -115,9 +115,6 @@ public struct MLXGenerateParametersBridgeReport: Codable, Equatable, Sendable {
             let unsupportedOptions = plan.unsupportedRuntimeOptions.joined(separator: ",")
             responsibilities.append("unsupported runtime options: \(unsupportedOptions)")
         }
-        if plan.warnings.contains(where: { $0.contains("Seed handling") }) {
-            responsibilities.append("seed application through MLX random state")
-        }
         return responsibilities
     }
 }

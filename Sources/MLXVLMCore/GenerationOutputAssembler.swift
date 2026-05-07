@@ -34,6 +34,7 @@ public struct GenerationOutputAssembler: Sendable {
     private var promptTokenCountOverride: Int?
     private var completionTokenCountOverride: Int?
     private var toolCalls: [GenerationToolCall] = []
+    private var logprobs: [GenerationTokenLogprob] = []
     private var isFinished = false
     private var finishReason: String?
 
@@ -110,7 +111,8 @@ public struct GenerationOutputAssembler: Sendable {
                 promptTokens: promptTokenCountOverride ?? promptTokenCount,
                 completionTokens: completionTokenCountOverride ?? completionTokenCount
             ),
-            toolCalls: toolCalls
+            toolCalls: toolCalls,
+            logprobs: logprobs
         )
     }
 
@@ -129,6 +131,9 @@ public struct GenerationOutputAssembler: Sendable {
                 completionTokenCountOverride = completionTokenCount
             }
             toolCalls.append(contentsOf: chunk.toolCalls)
+            if let logprob = chunk.logprob {
+                logprobs.append(logprob)
+            }
             if chunk.isFinished {
                 isFinished = true
                 finishReason = chunk.finishReason ?? sourceFinishReason ?? (sourceFinished ? "stop" : "stop")

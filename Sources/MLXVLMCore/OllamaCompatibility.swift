@@ -132,6 +132,13 @@ public struct OllamaShowResponse: Codable, Equatable, Sendable {
             "mlx_vlm.chat_template_source": descriptor.tokenizerMetadata.chatTemplateSource.map(JSONValue.string) ?? .null,
             "mlx_vlm.image_token_id": descriptor.tokenizerMetadata.imageTokenID.map { .number(Double($0)) } ?? .null,
             "mlx_vlm.video_token_id": descriptor.tokenizerMetadata.videoTokenID.map { .number(Double($0)) } ?? .null,
+            "mlx_vlm.audio_token_id": descriptor.tokenizerMetadata.audioTokenID.map { .number(Double($0)) } ?? .null,
+            "mlx_vlm.begin_image_token_id": descriptor.tokenizerMetadata.beginImageTokenID.map { .number(Double($0)) } ?? .null,
+            "mlx_vlm.end_image_token_id": descriptor.tokenizerMetadata.endImageTokenID.map { .number(Double($0)) } ?? .null,
+            "mlx_vlm.begin_audio_token_id": descriptor.tokenizerMetadata.beginAudioTokenID.map { .number(Double($0)) } ?? .null,
+            "mlx_vlm.end_audio_token_id": descriptor.tokenizerMetadata.endAudioTokenID.map { .number(Double($0)) } ?? .null,
+            "mlx_vlm.start_turn_token_id": descriptor.tokenizerMetadata.startTurnTokenID.map { .number(Double($0)) } ?? .null,
+            "mlx_vlm.end_turn_token_id": descriptor.tokenizerMetadata.endTurnTokenID.map { .number(Double($0)) } ?? .null,
         ]
     }
 }
@@ -197,6 +204,33 @@ public struct UnloadResponse: Codable, Equatable, Sendable {
     public init(status: String, model: String, unloaded: Bool = true) {
         self.status = status
         self.model = model
+        self.unloaded = unloaded
+    }
+}
+
+public struct PythonServerUnloadInfo: Codable, Equatable, Sendable {
+    public let modelName: String?
+    public let adapterName: String?
+
+    enum CodingKeys: String, CodingKey {
+        case modelName = "model_name"
+        case adapterName = "adapter_name"
+    }
+
+    public init(modelName: String?, adapterName: String?) {
+        self.modelName = modelName
+        self.adapterName = adapterName
+    }
+}
+
+public struct PythonServerUnloadResponse: Codable, Equatable, Sendable {
+    public let status: String
+    public let message: String
+    public let unloaded: PythonServerUnloadInfo?
+
+    public init(status: String, message: String, unloaded: PythonServerUnloadInfo? = nil) {
+        self.status = status
+        self.message = message
         self.unloaded = unloaded
     }
 }
@@ -318,6 +352,25 @@ public struct OllamaBlobOperationReport: Codable, Equatable, Sendable {
         self.exists = exists
         self.error = "Ollama blob operation '\(operation)' is not available in the dependency-free Swift compatibility shell."
         self.backend = backend
+    }
+}
+
+public struct APCCacheStatusResponse: Codable, Equatable, Sendable {
+    public let enabled: Bool
+    public let backend: BackendStatus
+    public let status: String?
+    public let note: String?
+
+    public init(
+        enabled: Bool = false,
+        backend: BackendStatus = .compatibilityShell,
+        status: String? = nil,
+        note: String? = "Automatic Prefix Cache is not enabled in the Swift compatibility server."
+    ) {
+        self.enabled = enabled
+        self.backend = backend
+        self.status = status
+        self.note = note
     }
 }
 

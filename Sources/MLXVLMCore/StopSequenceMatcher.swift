@@ -102,6 +102,7 @@ public struct StopSequenceStreamFilter: Sendable {
                 GenerationChunk(
                     text: text,
                     tokenID: chunk.tokenID,
+                    logprob: chunk.logprob,
                     isFinished: true,
                     finishReason: chunk.finishReason,
                     promptTokenCount: chunk.promptTokenCount,
@@ -120,7 +121,7 @@ public struct StopSequenceStreamFilter: Sendable {
         let split = pendingText.index(pendingText.startIndex, offsetBy: emitCount)
         let emitted = String(pendingText[..<split])
         pendingText = String(pendingText[split...])
-        return [GenerationChunk(text: emitted, tokenID: chunk.tokenID, isFinished: false)]
+        return [GenerationChunk(text: emitted, tokenID: chunk.tokenID, logprob: chunk.logprob, isFinished: false)]
     }
 
     public mutating func finish() -> GenerationChunk? {
@@ -143,7 +144,8 @@ public extension CompletedGeneration {
             text: result.text,
             finishReason: result.finishReason,
             usage: usage,
-            toolCalls: toolCalls
+            toolCalls: toolCalls,
+            logprobs: logprobs
         )
     }
 }

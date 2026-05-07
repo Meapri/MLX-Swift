@@ -23,6 +23,18 @@ public struct MediaReferenceSummary: Codable, Equatable, Sendable {
     public let location: String?
     public let isLoadable: Bool
     public let error: String?
+    public let imageDetail: String?
+    public let imageResizedHeight: Int?
+    public let imageResizedWidth: Int?
+    public let imageMinPixels: Int?
+    public let imageMaxPixels: Int?
+    public let audioFormat: String?
+    public let videoMinPixels: Int?
+    public let videoMaxPixels: Int?
+    public let videoFPS: Double?
+    public let videoNFrames: Int?
+    public let videoMinFrames: Int?
+    public let videoMaxFrames: Int?
 
     public init(
         kind: MediaKind,
@@ -31,7 +43,19 @@ public struct MediaReferenceSummary: Codable, Equatable, Sendable {
         byteCount: Int?,
         location: String?,
         isLoadable: Bool,
-        error: String?
+        error: String?,
+        imageDetail: String? = nil,
+        imageResizedHeight: Int? = nil,
+        imageResizedWidth: Int? = nil,
+        imageMinPixels: Int? = nil,
+        imageMaxPixels: Int? = nil,
+        audioFormat: String? = nil,
+        videoMinPixels: Int? = nil,
+        videoMaxPixels: Int? = nil,
+        videoFPS: Double? = nil,
+        videoNFrames: Int? = nil,
+        videoMinFrames: Int? = nil,
+        videoMaxFrames: Int? = nil
     ) {
         self.kind = kind
         self.source = source
@@ -40,6 +64,18 @@ public struct MediaReferenceSummary: Codable, Equatable, Sendable {
         self.location = location
         self.isLoadable = isLoadable
         self.error = error
+        self.imageDetail = imageDetail
+        self.imageResizedHeight = imageResizedHeight
+        self.imageResizedWidth = imageResizedWidth
+        self.imageMinPixels = imageMinPixels
+        self.imageMaxPixels = imageMaxPixels
+        self.audioFormat = audioFormat
+        self.videoMinPixels = videoMinPixels
+        self.videoMaxPixels = videoMaxPixels
+        self.videoFPS = videoFPS
+        self.videoNFrames = videoNFrames
+        self.videoMinFrames = videoMinFrames
+        self.videoMaxFrames = videoMaxFrames
     }
 }
 
@@ -93,14 +129,24 @@ public struct MediaReferenceResolver: @unchecked Sendable {
 
     public func resolve(_ part: ContentPart) -> MediaReferenceSummary? {
         switch part {
-        case .text:
+        case .text, .imagePlaceholder, .audioPlaceholder:
             return nil
         case .imageURL(let reference):
-            return resolve(reference: reference, kind: .image)
+            return resolve(reference: reference.url, kind: .image)
+                .withImageOptions(reference)
         case .audioURL(let reference):
-            return resolve(reference: reference, kind: .audio)
+            return resolve(reference: reference.data, kind: .audio)
+                .withAudioFormat(reference.format)
         case .videoURL(let reference):
-            return resolve(reference: reference, kind: .video)
+            return resolve(reference: reference.url, kind: .video)
+                .withVideoOptions(
+                    minPixels: reference.minPixels,
+                    maxPixels: reference.maxPixels,
+                    fps: reference.fps,
+                    nframes: reference.nframes,
+                    minFrames: reference.minFrames,
+                    maxFrames: reference.maxFrames
+                )
         }
     }
 
@@ -235,8 +281,95 @@ public struct MediaReferenceResolver: @unchecked Sendable {
             return "video/mp4"
         case "mov":
             return "video/quicktime"
+        case "avi":
+            return "video/x-msvideo"
+        case "webm":
+            return "video/webm"
+        case "mkv":
+            return "video/x-matroska"
         default:
             return nil
         }
+    }
+}
+
+extension MediaReferenceSummary {
+    func withImageOptions(_ reference: ImageReference) -> MediaReferenceSummary {
+        MediaReferenceSummary(
+            kind: kind,
+            source: source,
+            mimeType: mimeType,
+            byteCount: byteCount,
+            location: location,
+            isLoadable: isLoadable,
+            error: error,
+            imageDetail: reference.detail,
+            imageResizedHeight: reference.resizedHeight,
+            imageResizedWidth: reference.resizedWidth,
+            imageMinPixels: reference.minPixels,
+            imageMaxPixels: reference.maxPixels,
+            audioFormat: audioFormat,
+            videoMinPixels: videoMinPixels,
+            videoMaxPixels: videoMaxPixels,
+            videoFPS: videoFPS,
+            videoNFrames: videoNFrames,
+            videoMinFrames: videoMinFrames,
+            videoMaxFrames: videoMaxFrames
+        )
+    }
+
+    func withAudioFormat(_ format: String?) -> MediaReferenceSummary {
+        MediaReferenceSummary(
+            kind: kind,
+            source: source,
+            mimeType: mimeType,
+            byteCount: byteCount,
+            location: location,
+            isLoadable: isLoadable,
+            error: error,
+            imageDetail: imageDetail,
+            imageResizedHeight: imageResizedHeight,
+            imageResizedWidth: imageResizedWidth,
+            imageMinPixels: imageMinPixels,
+            imageMaxPixels: imageMaxPixels,
+            audioFormat: format,
+            videoMinPixels: videoMinPixels,
+            videoMaxPixels: videoMaxPixels,
+            videoFPS: videoFPS,
+            videoNFrames: videoNFrames,
+            videoMinFrames: videoMinFrames,
+            videoMaxFrames: videoMaxFrames
+        )
+    }
+
+    func withVideoOptions(
+        minPixels: Int?,
+        maxPixels: Int?,
+        fps: Double?,
+        nframes: Int?,
+        minFrames: Int?,
+        maxFrames: Int?
+    ) -> MediaReferenceSummary {
+        MediaReferenceSummary(
+            kind: kind,
+            source: source,
+            mimeType: mimeType,
+            byteCount: byteCount,
+            location: location,
+            isLoadable: isLoadable,
+            error: error,
+            imageDetail: imageDetail,
+            imageResizedHeight: imageResizedHeight,
+            imageResizedWidth: imageResizedWidth,
+            imageMinPixels: imageMinPixels,
+            imageMaxPixels: imageMaxPixels,
+            audioFormat: audioFormat,
+            videoMinPixels: minPixels,
+            videoMaxPixels: maxPixels,
+            videoFPS: fps,
+            videoNFrames: nframes,
+            videoMinFrames: minFrames,
+            videoMaxFrames: maxFrames
+        )
     }
 }

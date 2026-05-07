@@ -53,6 +53,8 @@ public struct GenerationLogitsDecodeExecutor: Sendable {
     public let tokenizer: SimpleTokenizer
     public let skipSpecialTokens: Bool
     public let newlineTokenID: Int?
+    public let logitBias: [Int: Double]
+    public let topLogprobs: Int
 
     public init(
         model: String,
@@ -63,7 +65,9 @@ public struct GenerationLogitsDecodeExecutor: Sendable {
         samplingPlan: GenerationSamplingPlan,
         tokenizer: SimpleTokenizer,
         skipSpecialTokens: Bool = true,
-        newlineTokenID: Int? = nil
+        newlineTokenID: Int? = nil,
+        logitBias: [Int: Double] = [:],
+        topLogprobs: Int = 0
     ) {
         self.model = model
         self.promptTokenCount = promptTokenCount
@@ -74,6 +78,8 @@ public struct GenerationLogitsDecodeExecutor: Sendable {
         self.tokenizer = tokenizer
         self.skipSpecialTokens = skipSpecialTokens
         self.newlineTokenID = newlineTokenID
+        self.logitBias = logitBias
+        self.topLogprobs = max(0, topLogprobs)
     }
 
     public func run(
@@ -101,17 +107,26 @@ public struct GenerationLogitsDecodeExecutor: Sendable {
                 logits: logits,
                 recentTokenIDs: recent,
                 newlineTokenID: newlineTokenID,
+                logitBias: logitBias,
                 generator: &samplerGenerator
             )
             recent.append(sampled.tokenID)
             let textStep = textDecoder.append(sampled.tokenID)
+            let logprob = try logprobPayload(
+                logits: logits,
+                sampled: sampled,
+                emittedText: textStep.textDelta,
+                recentTokenIDs: Array(recent.dropLast()),
+                logitBias: logitBias
+            )
             let decodeStep = decodeLoop.append(
                 GenerationDecodeToken(
                     tokenID: sampled.tokenID,
                     text: textStep.textDelta,
                     probability: sampled.probability,
                     logProbability: sampled.logProbability,
-                    rank: sampled.rank
+                    rank: sampled.rank,
+                    logprob: logprob
                 )
             )
             steps.append(
@@ -137,5 +152,42 @@ public struct GenerationLogitsDecodeExecutor: Sendable {
             steps: steps,
             decodeLoop: decodeLoop.report
         )
+    }
+
+    private func logprobPayload(
+        logits: [Double],
+        sampled: SampledToken,
+        emittedText: String,
+        recentTokenIDs: [Int],
+        logitBias: [Int: Double]
+    ) throws -> GenerationTokenLogprob {
+        let ranked = try GenerationLogitsSampler(plan: samplingPlan).rankedTokenProbabilities(
+            logits: logits,
+            recentTokenIDs: recentTokenIDs,
+            newlineTokenID: newlineTokenID,
+            logitBias: logitBias
+        )
+        let sampledFromFullDistribution = ranked.first { $0.tokenID == sampled.tokenID } ?? sampled
+        let top = ranked.prefix(topLogprobs).map { candidate in
+            GenerationTopLogprob(
+                token: tokenText(for: candidate.tokenID),
+                logprob: candidate.logProbability,
+                bytes: bytes(for: candidate.tokenID)
+            )
+        }
+        return GenerationTokenLogprob(
+            token: emittedText,
+            logprob: sampledFromFullDistribution.logProbability,
+            bytes: Array(emittedText.utf8).map(Int.init),
+            topLogprobs: top
+        )
+    }
+
+    private func tokenText(for tokenID: Int) -> String {
+        tokenizer.detokenize([tokenID], skipSpecialTokens: skipSpecialTokens).text
+    }
+
+    private func bytes(for tokenID: Int) -> [Int]? {
+        Array(tokenText(for: tokenID).utf8).map(Int.init)
     }
 }

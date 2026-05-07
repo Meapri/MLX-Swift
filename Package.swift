@@ -7,6 +7,7 @@ let environment = ProcessInfo.processInfo.environment
 let enableMLXBackendDependencies = environment["MLXVLM_ENABLE_MLX_BACKEND"] == "1"
 let enableRealMLXAPIImplementation = environment["MLXVLM_ENABLE_REAL_MLX_API"] == "1"
 let enableTokenizerIntegrationDependencies = environment["MLXVLM_ENABLE_TOKENIZER_INTEGRATIONS"] == "1"
+let enableHuggingFaceDownloaderDependencies = environment["MLXVLM_ENABLE_HUGGINGFACE_DOWNLOADER"] == "1"
 let useLocalMLXDependencies = environment["MLXVLM_USE_LOCAL_MLX"] == "1"
 let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
 
@@ -16,6 +17,10 @@ var mlxBackendSwiftSettings: [SwiftSetting] = []
 
 if enableRealMLXAPIImplementation {
     mlxBackendSwiftSettings.append(.define("MLXVLM_REAL_MLX_API"))
+}
+
+if enableHuggingFaceDownloaderDependencies {
+    mlxBackendSwiftSettings.append(.define("MLXVLM_HUGGINGFACE_DOWNLOADER"))
 }
 
 if enableMLXBackendDependencies {
@@ -42,6 +47,12 @@ if enableMLXBackendDependencies {
     mlxBackendDependencies.append(.product(name: "MLXLLM", package: mlxSwiftLMPackageRef))
     mlxBackendDependencies.append(.product(name: "MLXVLM", package: mlxSwiftLMPackageRef))
     mlxBackendDependencies.append(.product(name: "MLXEmbedders", package: mlxSwiftLMPackageRef))
+
+    if enableHuggingFaceDownloaderDependencies {
+        dependencies.append(.package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0"))
+        mlxBackendDependencies.append(.product(name: "MLXHuggingFace", package: mlxSwiftLMPackageRef))
+        mlxBackendDependencies.append(.product(name: "HuggingFace", package: "swift-huggingface"))
+    }
 }
 
 if enableTokenizerIntegrationDependencies {

@@ -87,7 +87,7 @@ public struct OllamaGenerateRequest: Codable, Equatable, Sendable {
         }
         var content: [ContentPart] = [.text(prompt)]
         for image in images ?? [] {
-            content.append(.imageURL(image))
+            content.append(.imageURL(ImageReference(url: image)))
         }
         messages.append(ChatMessage(role: .user, content: content))
         return GenerationRequest(
@@ -253,7 +253,9 @@ public struct OpenAIChatCompletionRequest: Codable, Equatable, Sendable {
                 kvBits: defaultParameters.kvBits,
                 kvQuantizationScheme: defaultParameters.kvQuantizationScheme,
                 kvGroupSize: defaultParameters.kvGroupSize,
+                quantizedKVStart: defaultParameters.quantizedKVStart,
                 maxKVSize: defaultParameters.maxKVSize,
+                prefillStepSize: defaultParameters.prefillStepSize,
                 visionCacheSize: defaultParameters.visionCacheSize,
                 quantizeActivations: defaultParameters.quantizeActivations,
                 repetitionPenalty: repetitionPenalty ?? defaultParameters.repetitionPenalty,
@@ -290,7 +292,9 @@ public struct OpenAIResponsesRequest: Codable, Equatable, Sendable {
     public let model: String
     public let input: CompatibleResponsesInput
     public let instructions: String?
+    public let maxTokens: Int?
     public let maxOutputTokens: Int?
+    public let maxCompletionTokens: Int?
     public let temperature: Double?
     public let topP: Double?
     public let topK: Int?
@@ -298,22 +302,38 @@ public struct OpenAIResponsesRequest: Codable, Equatable, Sendable {
     public let stop: CompatibleStop?
     public let seed: Int?
     public let repetitionPenalty: Double?
+    public let presencePenalty: Double?
+    public let frequencyPenalty: Double?
     public let logitBias: JSONValue?
     public let enableThinking: Bool?
     public let thinkingBudget: Int?
     public let thinkingStartToken: String?
+    public let logprobs: Bool?
+    public let topLogprobs: Int?
+    public let resizeShape: CompatibleResizeShape?
     public let responseFormat: JSONValue?
     public let text: JSONValue?
     public let tools: [JSONValue]?
     public let toolChoice: JSONValue?
+    public let adapterPath: String?
     public let user: String?
+    public let metadata: JSONValue?
+    public let previousResponseID: String?
+    public let include: [JSONValue]?
+    public let parallelToolCalls: Bool?
+    public let truncation: String?
+    public let store: Bool?
+    public let reasoning: JSONValue?
+    public let serviceTier: String?
     public let stream: Bool?
 
     enum CodingKeys: String, CodingKey {
         case model
         case input
         case instructions
+        case maxTokens = "max_tokens"
         case maxOutputTokens = "max_output_tokens"
+        case maxCompletionTokens = "max_completion_tokens"
         case temperature
         case topP = "top_p"
         case topK = "top_k"
@@ -321,15 +341,29 @@ public struct OpenAIResponsesRequest: Codable, Equatable, Sendable {
         case stop
         case seed
         case repetitionPenalty = "repetition_penalty"
+        case presencePenalty = "presence_penalty"
+        case frequencyPenalty = "frequency_penalty"
         case logitBias = "logit_bias"
         case enableThinking = "enable_thinking"
         case thinkingBudget = "thinking_budget"
         case thinkingStartToken = "thinking_start_token"
+        case logprobs
+        case topLogprobs = "top_logprobs"
+        case resizeShape = "resize_shape"
         case responseFormat = "response_format"
         case text
         case tools
         case toolChoice = "tool_choice"
+        case adapterPath = "adapter_path"
         case user
+        case metadata
+        case previousResponseID = "previous_response_id"
+        case include
+        case parallelToolCalls = "parallel_tool_calls"
+        case truncation
+        case store
+        case reasoning
+        case serviceTier = "service_tier"
         case stream
     }
 
@@ -349,7 +383,7 @@ public struct OpenAIResponsesRequest: Codable, Equatable, Sendable {
             model: model.isEmpty ? defaultModel : model,
             messages: messages,
             parameters: GenerationParameters(
-                maxTokens: maxOutputTokens ?? defaultParameters.maxTokens,
+                maxTokens: maxTokens ?? maxOutputTokens ?? maxCompletionTokens ?? defaultParameters.maxTokens,
                 temperature: temperature ?? defaultParameters.temperature,
                 topP: topP ?? defaultParameters.topP,
                 topK: topK ?? defaultParameters.topK,
@@ -362,13 +396,15 @@ public struct OpenAIResponsesRequest: Codable, Equatable, Sendable {
                 kvBits: defaultParameters.kvBits,
                 kvQuantizationScheme: defaultParameters.kvQuantizationScheme,
                 kvGroupSize: defaultParameters.kvGroupSize,
+                quantizedKVStart: defaultParameters.quantizedKVStart,
                 maxKVSize: defaultParameters.maxKVSize,
+                prefillStepSize: defaultParameters.prefillStepSize,
                 visionCacheSize: defaultParameters.visionCacheSize,
                 quantizeActivations: defaultParameters.quantizeActivations,
                 repetitionPenalty: repetitionPenalty ?? defaultParameters.repetitionPenalty,
                 repeatLastN: defaultParameters.repeatLastN,
-                presencePenalty: defaultParameters.presencePenalty,
-                frequencyPenalty: defaultParameters.frequencyPenalty,
+                presencePenalty: presencePenalty ?? defaultParameters.presencePenalty,
+                frequencyPenalty: frequencyPenalty ?? defaultParameters.frequencyPenalty,
                 penalizeNewline: defaultParameters.penalizeNewline,
                 mirostat: defaultParameters.mirostat,
                 mirostatTau: defaultParameters.mirostatTau,
@@ -382,9 +418,22 @@ public struct OpenAIResponsesRequest: Codable, Equatable, Sendable {
                 responseFormat: text?["format"] ?? responseFormat ?? text,
                 tools: tools,
                 toolChoice: toolChoice,
+                adapterPath: adapterPath,
                 logitBias: logitBias,
+                logprobs: logprobs,
+                topLogprobs: topLogprobs,
+                resizeShape: resizeShape?.values,
                 thinkingStartToken: thinkingStartToken,
-                user: user
+                user: user,
+                responseInstructions: instructions,
+                responseTruncation: truncation,
+                responseMetadata: metadata,
+                previousResponseID: previousResponseID,
+                include: include,
+                parallelToolCalls: parallelToolCalls,
+                store: store,
+                serviceTier: serviceTier,
+                responseReasoning: reasoning
             ),
             stream: stream ?? false
         )
@@ -721,14 +770,14 @@ public struct CompatibleChatMessage: Codable, Equatable, Sendable {
             let parsedRole = MessageRole(rawValue: role) ?? .user
             var parts = content?.contentParts ?? []
             for image in images ?? [] {
-                parts.append(.imageURL(image))
+                parts.append(.imageURL(ImageReference(url: image)))
             }
             return ChatMessage(
                 role: parsedRole,
                 content: parts,
                 name: name,
                 reasoning: reasoning,
-                toolCalls: toolCalls,
+                toolCalls: toolCalls?.map { $0.normalizingToolCallFunctionArguments() },
                 toolCallID: toolCallID
             )
         }
@@ -801,7 +850,9 @@ public extension GenerationParameters {
             kvBits: options?["kv_bits"]?.doubleValue ?? options?["kv-bits"]?.doubleValue ?? defaults.kvBits,
             kvQuantizationScheme: options?["kv_quant_scheme"]?.stringValue ?? options?["kv-quant-scheme"]?.stringValue ?? defaults.kvQuantizationScheme,
             kvGroupSize: options?["kv_group_size"]?.intValue ?? options?["kv-group-size"]?.intValue ?? defaults.kvGroupSize,
+            quantizedKVStart: options?["quantized_kv_start"]?.intValue ?? options?["quantized-kv-start"]?.intValue ?? defaults.quantizedKVStart,
             maxKVSize: options?["max_kv_size"]?.intValue ?? options?["max-kv-size"]?.intValue ?? defaults.maxKVSize,
+            prefillStepSize: options?["prefill_step_size"]?.intValue ?? options?["prefill-step-size"]?.intValue ?? defaults.prefillStepSize,
             visionCacheSize: options?["vision_cache_size"]?.intValue ?? options?["vision-cache-size"]?.intValue ?? defaults.visionCacheSize,
             quantizeActivations: options?["quantize_activations"]?.boolValue ?? options?["quantize-activations"]?.boolValue ?? defaults.quantizeActivations,
             repetitionPenalty: options?["repeat_penalty"]?.doubleValue ?? defaults.repetitionPenalty,
