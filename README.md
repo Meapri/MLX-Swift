@@ -57,6 +57,13 @@ With a local Gemma4 MLX model:
 SWIFT_BUILD_JOBS=18 scripts/verify_real_gemma4_smoke.sh
 ```
 
+With a local Qwen2.5-VL MLX model for video input:
+
+```bash
+MLXVLM_REAL_QWEN25VL_MODEL=/path/to/qwen2.5-vl \
+SWIFT_BUILD_JOBS=18 scripts/verify_real_qwen25vl_video_smoke.sh
+```
+
 ## Port Notes
 
 See [docs/swift_port.md](docs/swift_port.md) for the running compatibility map, implemented parity areas, and known remaining gaps.
