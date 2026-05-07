@@ -41,6 +41,7 @@ public struct JSONSchemaConstraintPlan: Codable, Equatable, Sendable {
     public let rootTypes: [String]
     public let requiredProperties: [String]
     public let properties: [JSONSchemaPropertyConstraint]
+    public let grammarPlan: JSONSchemaGrammarPlan?
     public let enumPaths: [String]
     public let arrayPaths: [String]
     public let maxDepth: Int
@@ -55,6 +56,7 @@ public struct JSONSchemaConstraintPlan: Codable, Equatable, Sendable {
         rootTypes: [String],
         requiredProperties: [String],
         properties: [JSONSchemaPropertyConstraint],
+        grammarPlan: JSONSchemaGrammarPlan? = nil,
         enumPaths: [String],
         arrayPaths: [String],
         maxDepth: Int,
@@ -68,6 +70,7 @@ public struct JSONSchemaConstraintPlan: Codable, Equatable, Sendable {
         self.rootTypes = rootTypes
         self.requiredProperties = requiredProperties
         self.properties = properties
+        self.grammarPlan = grammarPlan
         self.enumPaths = enumPaths
         self.arrayPaths = arrayPaths
         self.maxDepth = maxDepth
@@ -77,6 +80,58 @@ public struct JSONSchemaConstraintPlan: Codable, Equatable, Sendable {
         self.canConstrainRequiredPropertyPrefix = canConstrainRequiredPropertyPrefix
         self.canUseDeterministicKeyOrder = canUseDeterministicKeyOrder
         self.requiresFullGrammarDFA = requiresFullGrammarDFA
+    }
+}
+
+public struct JSONSchemaGrammarPlan: Codable, Equatable, Sendable {
+    public let rootSymbol: String
+    public let deterministicPropertyOrder: [String]
+    public let structuralStateCount: Int
+    public let maxContainerDepth: Int
+    public let constrainedStringPaths: [String]
+    public let constrainedNumberPaths: [String]
+    public let constrainedBooleanPaths: [String]
+    public let constrainedNullPaths: [String]
+    public let constrainedArrayPaths: [String]
+    public let constrainedObjectPaths: [String]
+    public let enumLiteralPaths: [String]
+    public let additionalPropertiesFalsePaths: [String]
+    public let unsupportedReasons: [String]
+    public let canCompileStructuralGrammar: Bool
+    public let requiresBackendTokenDFA: Bool
+
+    public init(
+        rootSymbol: String,
+        deterministicPropertyOrder: [String],
+        structuralStateCount: Int,
+        maxContainerDepth: Int,
+        constrainedStringPaths: [String],
+        constrainedNumberPaths: [String],
+        constrainedBooleanPaths: [String],
+        constrainedNullPaths: [String],
+        constrainedArrayPaths: [String],
+        constrainedObjectPaths: [String],
+        enumLiteralPaths: [String],
+        additionalPropertiesFalsePaths: [String],
+        unsupportedReasons: [String],
+        canCompileStructuralGrammar: Bool,
+        requiresBackendTokenDFA: Bool
+    ) {
+        self.rootSymbol = rootSymbol
+        self.deterministicPropertyOrder = deterministicPropertyOrder
+        self.structuralStateCount = structuralStateCount
+        self.maxContainerDepth = maxContainerDepth
+        self.constrainedStringPaths = constrainedStringPaths
+        self.constrainedNumberPaths = constrainedNumberPaths
+        self.constrainedBooleanPaths = constrainedBooleanPaths
+        self.constrainedNullPaths = constrainedNullPaths
+        self.constrainedArrayPaths = constrainedArrayPaths
+        self.constrainedObjectPaths = constrainedObjectPaths
+        self.enumLiteralPaths = enumLiteralPaths
+        self.additionalPropertiesFalsePaths = additionalPropertiesFalsePaths
+        self.unsupportedReasons = unsupportedReasons
+        self.canCompileStructuralGrammar = canCompileStructuralGrammar
+        self.requiresBackendTokenDFA = requiresBackendTokenDFA
     }
 }
 
@@ -428,6 +483,7 @@ public struct JSONSchemaConstraintPlanner {
             rootTypes: rootTypes,
             requiredProperties: required,
             properties: properties.sorted { $0.path < $1.path },
+            grammarPlan: JSONSchemaGrammarPlanner().plan(schema: .object(object)),
             enumPaths: Array(enumPaths).sorted(),
             arrayPaths: Array(arrayPaths).sorted(),
             maxDepth: maxDepth,
@@ -538,5 +594,139 @@ public struct JSONSchemaConstraintPlanner {
         case .object, .array:
             return nil
         }
+    }
+}
+
+public struct JSONSchemaGrammarPlanner {
+    private struct Accumulator {
+        var structuralStateCount = 0
+        var maxContainerDepth = 0
+        var constrainedStringPaths: Set<String> = []
+        var constrainedNumberPaths: Set<String> = []
+        var constrainedBooleanPaths: Set<String> = []
+        var constrainedNullPaths: Set<String> = []
+        var constrainedArrayPaths: Set<String> = []
+        var constrainedObjectPaths: Set<String> = []
+        var enumLiteralPaths: Set<String> = []
+        var additionalPropertiesFalsePaths: Set<String> = []
+        var unsupportedReasons: Set<String> = []
+    }
+
+    public init() {}
+
+    public func plan(schema: JSONValue) -> JSONSchemaGrammarPlan? {
+        guard let object = schema.objectValue else {
+            return nil
+        }
+        var accumulator = Accumulator()
+        walk(object, path: "$", depth: 0, accumulator: &accumulator)
+        let rootTypes = types(from: object)
+        let rootSymbol: String
+        if rootTypes.contains("object") || object["properties"] != nil {
+            rootSymbol = "object"
+        } else if rootTypes.contains("array") {
+            rootSymbol = "array"
+        } else if let first = rootTypes.first {
+            rootSymbol = first
+        } else {
+            rootSymbol = "json-value"
+        }
+        let deterministicPropertyOrder = Self.propertyOrder(from: object)
+        return JSONSchemaGrammarPlan(
+            rootSymbol: rootSymbol,
+            deterministicPropertyOrder: deterministicPropertyOrder,
+            structuralStateCount: accumulator.structuralStateCount,
+            maxContainerDepth: accumulator.maxContainerDepth,
+            constrainedStringPaths: Array(accumulator.constrainedStringPaths).sorted(),
+            constrainedNumberPaths: Array(accumulator.constrainedNumberPaths).sorted(),
+            constrainedBooleanPaths: Array(accumulator.constrainedBooleanPaths).sorted(),
+            constrainedNullPaths: Array(accumulator.constrainedNullPaths).sorted(),
+            constrainedArrayPaths: Array(accumulator.constrainedArrayPaths).sorted(),
+            constrainedObjectPaths: Array(accumulator.constrainedObjectPaths).sorted(),
+            enumLiteralPaths: Array(accumulator.enumLiteralPaths).sorted(),
+            additionalPropertiesFalsePaths: Array(accumulator.additionalPropertiesFalsePaths).sorted(),
+            unsupportedReasons: Array(accumulator.unsupportedReasons).sorted(),
+            canCompileStructuralGrammar: accumulator.unsupportedReasons.isEmpty,
+            requiresBackendTokenDFA: true
+        )
+    }
+
+    private func walk(
+        _ object: [String: JSONValue],
+        path: String,
+        depth: Int,
+        accumulator: inout Accumulator
+    ) {
+        accumulator.structuralStateCount += 1
+        accumulator.maxContainerDepth = max(accumulator.maxContainerDepth, depth)
+        let currentTypes = types(from: object)
+        if object["enum"]?.arrayValue?.isEmpty == false {
+            accumulator.enumLiteralPaths.insert(path)
+        }
+        if object["additionalProperties"]?.boolValue == false {
+            accumulator.additionalPropertiesFalsePaths.insert(path)
+        }
+        if currentTypes.isEmpty, object["properties"] == nil, object["items"] == nil, object["enum"] == nil {
+            accumulator.unsupportedReasons.insert("\(path) has no explicit type, enum, properties, or items.")
+        }
+        for type in currentTypes {
+            switch type {
+            case "object":
+                accumulator.constrainedObjectPaths.insert(path)
+            case "array":
+                accumulator.constrainedArrayPaths.insert(path)
+            case "string":
+                accumulator.constrainedStringPaths.insert(path)
+            case "integer", "number":
+                accumulator.constrainedNumberPaths.insert(path)
+            case "boolean":
+                accumulator.constrainedBooleanPaths.insert(path)
+            case "null":
+                accumulator.constrainedNullPaths.insert(path)
+            default:
+                accumulator.unsupportedReasons.insert("\(path) uses unsupported JSON Schema type \(type).")
+            }
+        }
+
+        if let properties = object["properties"]?.objectValue {
+            accumulator.constrainedObjectPaths.insert(path)
+            for key in Self.propertyOrder(from: object) {
+                guard let child = properties[key]?.objectValue else {
+                    accumulator.unsupportedReasons.insert("\(path).\(key) property schema must be an object.")
+                    continue
+                }
+                walk(child, path: "\(path).\(key)", depth: depth + 1, accumulator: &accumulator)
+            }
+        }
+
+        if let items = object["items"]?.objectValue {
+            accumulator.constrainedArrayPaths.insert(path)
+            walk(items, path: "\(path)[]", depth: depth + 1, accumulator: &accumulator)
+        } else if currentTypes.contains("array") {
+            accumulator.unsupportedReasons.insert("\(path) array schema is missing an object items schema.")
+        }
+    }
+
+    private func types(from object: [String: JSONValue]) -> [String] {
+        if let type = object["type"]?.stringValue {
+            return [type]
+        }
+        if let types = object["type"]?.arrayValue?.compactMap(\.stringValue), !types.isEmpty {
+            return types
+        }
+        if object["properties"] != nil {
+            return ["object"]
+        }
+        if object["items"] != nil {
+            return ["array"]
+        }
+        return []
+    }
+
+    private static func propertyOrder(from object: [String: JSONValue]) -> [String] {
+        let required = object["required"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        let properties = object["properties"]?.objectValue ?? [:]
+        let optional = properties.keys.filter { !required.contains($0) }.sorted()
+        return required + optional
     }
 }
