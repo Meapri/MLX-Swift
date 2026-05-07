@@ -2281,9 +2281,44 @@ class GenerationBatch:
             mx.eval(inputs)
             return inputs.tolist(), None, None, None
 
+    def _eval_pending_state(self):
+        """Materialize lazy decode outputs before mutating batch-owned state."""
+        targets = []
+
+        def append_arrays(value):
+            if isinstance(value, mx.array):
+                targets.append(value)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    append_arrays(item)
+
+        append_arrays(
+            (
+                self._current_tokens,
+                self._current_lps,
+                self._next_tokens,
+                self._next_lps,
+                self._next_top_idx,
+                self._next_top_lp,
+                self._rope_deltas,
+            )
+        )
+        for c in self.prompt_cache:
+            try:
+                append_arrays(c.state)
+            except (AttributeError, TypeError):
+                pass
+
+        if targets:
+            mx.eval(*targets)
+
     def extend(self, other: "GenerationBatch"):
         """Extend this batch with another generation batch."""
         self_was_empty = len(self.uids) == 0
+        if not self_was_empty and len(other.uids) > 0:
+            self._eval_pending_state()
+            other._eval_pending_state()
+
         self_has_processors = self.logits_processors and any(self.logits_processors)
         other_has_processors = other.logits_processors and any(other.logits_processors)
         if self_has_processors or other_has_processors:
@@ -2347,6 +2382,9 @@ class GenerationBatch:
 
     def filter(self, keep: List[int]):
         """Filter the batch to keep only the specified indices."""
+        if len(keep) < len(self.uids):
+            self._eval_pending_state()
+
         self.uids = [self.uids[idx] for idx in keep]
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
         self._num_tokens = [self._num_tokens[idx] for idx in keep]

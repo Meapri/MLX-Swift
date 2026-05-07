@@ -349,6 +349,55 @@ class TestGenerationBatch:
         empty.extend(self._mrope_batch([0, 1], [[5], [7]]))
         assert empty._rope_deltas.tolist() == [[5], [7]]
 
+    def test_extend_materializes_pending_decode_before_cache_merge(self, monkeypatch):
+        calls = []
+
+        class RecordingCache:
+            @property
+            def state(self):
+                return ()
+
+            def extend(self, other):
+                calls.append(("extend-cache",))
+
+        def record_eval(batch):
+            calls.append(("eval", tuple(batch.uids)))
+
+        monkeypatch.setattr(GenerationBatch, "_eval_pending_state", record_eval)
+
+        a = self._mrope_batch([0], [[0]])
+        b = self._mrope_batch([1], [[5]])
+        a.prompt_cache = [RecordingCache()]
+        b.prompt_cache = [RecordingCache()]
+
+        a.extend(b)
+
+        assert calls == [("eval", (0,)), ("eval", (1,)), ("extend-cache",)]
+
+    def test_filter_materializes_pending_decode_before_cache_filter(self, monkeypatch):
+        calls = []
+
+        class RecordingCache:
+            @property
+            def state(self):
+                return ()
+
+            def filter(self, keep):
+                calls.append(("filter-cache", keep.tolist()))
+
+        def record_eval(batch):
+            calls.append(("eval", tuple(batch.uids)))
+
+        monkeypatch.setattr(GenerationBatch, "_eval_pending_state", record_eval)
+
+        batch = self._mrope_batch([0, 1], [[0], [5]])
+        batch.prompt_cache = [RecordingCache()]
+        batch._next_tokens = mx.array([10, 20], dtype=mx.int32)
+
+        batch.filter([0])
+
+        assert calls == [("eval", (0, 1)), ("filter-cache", [0])]
+
     @staticmethod
     def _capture(value, B):
         from mlx_vlm.generate import PromptProcessingBatch
