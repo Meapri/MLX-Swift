@@ -1,4 +1,8 @@
 # Report Issues
 
-Please open an issue on [GitHub](https://github.com/Blaizzy/mlx-vlm/issues) with clear steps to reproduce the problem.
+Please include:
 
+- the Swift command you ran
+- the model path or Hugging Face identifier
+- whether the real MLX backend flags were enabled
+- the relevant build or server output

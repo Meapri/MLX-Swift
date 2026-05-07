@@ -1,4 +1,3 @@
 # Community Projects
 
-If you have a project built on top of MLX-VLM let us know! We plan to showcase community examples and links here.
-
+Community project links can be added here after the Swift port has a stable public API.

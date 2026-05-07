@@ -1,11 +1,11 @@
-site_name: MLX-VLM
-site_description: MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VLMs) on your Mac using MLX.
-site_author: Prince Canuma
-repo_name: Blaizzy/mlx-vlm
-site_url: https://Blaizzy.github.io/mlx-vlm
-repo_url: https://github.com/Blaizzy/mlx-vlm
+site_name: MLX-VLM Swift Port
+site_description: Swift compatibility runtime for MLX VLM models.
+site_author: MLX-VLM Swift contributors
+repo_name: Meapri/MLX-Swift
+site_url: https://Meapri.github.io/MLX-Swift
+repo_url: https://github.com/Meapri/MLX-Swift
 
-copyright: "Copyright \u00a9 2024 - 2024 Prince Canuma"
+copyright: "Copyright \u00a9 2026 MLX-VLM Swift contributors"
 
 theme:
     palette:
@@ -38,14 +38,6 @@ theme:
 
 plugins:
     - search
-    - mkdocstrings
-    - mkdocs-jupyter:
-          include_source: True
-          ignore_h1_titles: True
-          execute: True
-          allow_errors: false
-          ignore: ["conf.py"]
-          execute_ignore: ["*ignore.ipynb"]
 
 markdown_extensions:
     - admonition
@@ -62,13 +54,6 @@ markdown_extensions:
           permalink: true
 
 extra:
-    social:
-        - icon: fontawesome/brands/github
-          link: https://github.com/Blaizzy
-        - icon: fontawesome/brands/twitter
-          link: https://twitter.com/Prince_Canuma
-    version:
-        provider: mike
     consent:
         title: Cookie consent
         description: >-

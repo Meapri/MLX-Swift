@@ -1,13 +1,14 @@
 # CLI Reference
 
-MLX-VLM provides several command line entry points:
+The Swift executable is `mlx-vlm-swift`.
 
-- `mlx_vlm.convert` – convert Hugging Face models to MLX format.
-- `mlx_vlm.generate` – run inference on images.
-- `mlx_vlm.video_generate` – generate from a video file.
-- `mlx_vlm.smolvlm_video_generate` – lightweight video generation.
-- `mlx_vlm.chat_ui` – start an interactive Gradio UI.
-- `mlx_vlm.server` – run the FastAPI server.
+Common commands:
 
-Each command accepts `--help` for full usage information.
+- `inspect --model /path/to/model`
+- `validate-model --model /path/to/model`
+- `plan-model-load --model /path/to/model`
+- `inspect-mlx-generate-parameters --model /path/to/model --api openai-chat --json '{...}'`
+- `self-test`
+- `serve --model /path/to/model-or-hf-id --host 127.0.0.1 --port 11434`
 
+Run the executable without arguments to print the full command list.

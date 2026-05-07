@@ -1,18 +1,16 @@
 # Contributing
 
-To work on MLX-VLM in editable mode run:
+This repository is now Swift-first.
+
+Before sending changes, run:
 
 ```bash
-pip install -e .
+swift build --disable-sandbox --jobs 18
+SWIFT_BUILD_JOBS=18 scripts/verify_swift_port.sh
 ```
 
-Check that the model weights are available in the `safetensors` format, convert if necessary and add the model file to `mlx_vlm/models`.
-
-Tests can be run from the `mlx_vlm/` directory:
+For changes that touch the real MLX bridge, also run the real backend smoke when the local model is available:
 
 ```bash
-python -m unittest discover tests/
+SWIFT_BUILD_JOBS=18 scripts/verify_real_gemma4_smoke.sh
 ```
-
-Please format code using `pre-commit` before submitting a pull request.
-
