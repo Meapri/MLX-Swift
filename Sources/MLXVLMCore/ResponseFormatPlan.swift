@@ -50,6 +50,7 @@ public struct JSONSchemaConstraintPlan: Codable, Equatable, Sendable {
     public let canConstrainRootToken: Bool
     public let canConstrainRequiredPropertyPrefix: Bool
     public let canUseDeterministicKeyOrder: Bool
+    public let deterministicLiteral: String?
     public let requiresFullGrammarDFA: Bool
 
     public init(
@@ -65,6 +66,7 @@ public struct JSONSchemaConstraintPlan: Codable, Equatable, Sendable {
         canConstrainRootToken: Bool,
         canConstrainRequiredPropertyPrefix: Bool,
         canUseDeterministicKeyOrder: Bool,
+        deterministicLiteral: String? = nil,
         requiresFullGrammarDFA: Bool
     ) {
         self.rootTypes = rootTypes
@@ -79,6 +81,7 @@ public struct JSONSchemaConstraintPlan: Codable, Equatable, Sendable {
         self.canConstrainRootToken = canConstrainRootToken
         self.canConstrainRequiredPropertyPrefix = canConstrainRequiredPropertyPrefix
         self.canUseDeterministicKeyOrder = canUseDeterministicKeyOrder
+        self.deterministicLiteral = deterministicLiteral
         self.requiresFullGrammarDFA = requiresFullGrammarDFA
     }
 }
@@ -468,6 +471,7 @@ public struct JSONSchemaConstraintPlanner {
         var unsupportedKeywords: Set<String> = []
         let rootTypes = types(from: object)
         let required = object["required"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        let deterministicLiteral = JSONSchemaDeterministicValueBuilder().literal(schema: .object(object))
         let maxDepth = walk(
             object,
             path: "$",
@@ -492,6 +496,7 @@ public struct JSONSchemaConstraintPlanner {
             canConstrainRootToken: canConstrainRootToken,
             canConstrainRequiredPropertyPrefix: rootTypes.contains("object") && !required.isEmpty,
             canUseDeterministicKeyOrder: rootTypes.contains("object") && !required.isEmpty,
+            deterministicLiteral: deterministicLiteral,
             requiresFullGrammarDFA: true
         )
     }
@@ -728,5 +733,194 @@ public struct JSONSchemaGrammarPlanner {
         let properties = object["properties"]?.objectValue ?? [:]
         let optional = properties.keys.filter { !required.contains($0) }.sorted()
         return required + optional
+    }
+}
+
+public struct JSONSchemaDeterministicValueBuilder: Sendable {
+    public init() {}
+
+    public func value(schema: JSONValue) -> JSONValue? {
+        guard let object = schema.objectValue else {
+            return nil
+        }
+        return value(object)
+    }
+
+    public func literal(schema: JSONValue) -> String? {
+        value(schema: schema).map(Self.literal)
+    }
+
+    private func value(_ schema: [String: JSONValue]) -> JSONValue? {
+        if let value = schema["const"] {
+            return value
+        }
+        if let enumValues = schema["enum"]?.arrayValue, let first = enumValues.first {
+            return first
+        }
+        if let value = schema["default"] {
+            return value
+        }
+
+        let currentTypes = types(from: schema)
+        if currentTypes.contains("object") {
+            return objectValue(schema)
+        }
+        if currentTypes.contains("array") {
+            return arrayValue(schema)
+        }
+        if currentTypes.contains("string") {
+            return stringValue(schema)
+        }
+        if currentTypes.contains("integer") {
+            return numberValue(schema, integer: true)
+        }
+        if currentTypes.contains("number") {
+            return numberValue(schema, integer: false)
+        }
+        if currentTypes.contains("boolean") {
+            return .bool(false)
+        }
+        if currentTypes.contains("null") {
+            return .null
+        }
+        if schema["properties"] != nil {
+            return objectValue(schema)
+        }
+        if schema["items"] != nil {
+            return arrayValue(schema)
+        }
+        return nil
+    }
+
+    private func objectValue(_ schema: [String: JSONValue]) -> JSONValue? {
+        let required = schema["required"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        let properties = schema["properties"]?.objectValue ?? [:]
+        var object: [String: JSONValue] = [:]
+        for key in required {
+            guard let propertySchema = properties[key]?.objectValue,
+                  let propertyValue = value(propertySchema)
+            else {
+                return nil
+            }
+            object[key] = propertyValue
+        }
+        let optionalDefaults = properties.keys
+            .filter { !required.contains($0) }
+            .sorted()
+        for key in optionalDefaults {
+            guard let propertySchema = properties[key]?.objectValue,
+                  propertySchema["default"] != nil,
+                  let propertyValue = value(propertySchema)
+            else {
+                continue
+            }
+            object[key] = propertyValue
+        }
+        return .object(object)
+    }
+
+    private func arrayValue(_ schema: [String: JSONValue]) -> JSONValue? {
+        let minItems = max(0, schema["minItems"]?.intValue ?? 0)
+        if let maxItems = schema["maxItems"]?.intValue, maxItems < minItems {
+            return nil
+        }
+        guard minItems > 0 else {
+            return .array([])
+        }
+        guard let itemSchema = schema["items"]?.objectValue,
+              let itemValue = value(itemSchema)
+        else {
+            return nil
+        }
+        return .array(Array(repeating: itemValue, count: minItems))
+    }
+
+    private func stringValue(_ schema: [String: JSONValue]) -> JSONValue? {
+        let minLength = max(0, schema["minLength"]?.intValue ?? 0)
+        if let maxLength = schema["maxLength"]?.intValue, maxLength < minLength {
+            return nil
+        }
+        return .string(String(repeating: "x", count: minLength))
+    }
+
+    private func numberValue(_ schema: [String: JSONValue], integer: Bool) -> JSONValue? {
+        var value = schema["minimum"]?.doubleValue ?? 0
+        if integer {
+            value = ceil(value)
+        }
+        if let maximum = schema["maximum"]?.doubleValue, value > maximum {
+            return nil
+        }
+        return .number(value)
+    }
+
+    private func types(from object: [String: JSONValue]) -> [String] {
+        if let type = object["type"]?.stringValue?.lowercased() {
+            return [type]
+        }
+        if let types = object["type"]?.arrayValue?.compactMap({ $0.stringValue?.lowercased() }), !types.isEmpty {
+            return types
+        }
+        if object["properties"] != nil {
+            return ["object"]
+        }
+        if object["items"] != nil {
+            return ["array"]
+        }
+        return []
+    }
+
+    public static func literal(_ value: JSONValue) -> String {
+        switch value {
+        case .object(let object):
+            let keys = object.keys.sorted()
+            return "{\(keys.map { "\"\(escapedJSONString($0))\":\(literal(object[$0] ?? .null))" }.joined(separator: ","))}"
+        case .array(let values):
+            return "[\(values.map(literal).joined(separator: ","))]"
+        case .string(let string):
+            return "\"\(escapedJSONString(string))\""
+        case .number(let number):
+            if number.isFinite,
+               number.rounded(.towardZero) == number,
+               number >= Double(Int64.min),
+               number <= Double(Int64.max)
+            {
+                return String(Int64(number))
+            }
+            return String(number)
+        case .bool(let bool):
+            return bool ? "true" : "false"
+        case .null:
+            return "null"
+        }
+    }
+
+    public static func escapedJSONString(_ string: String) -> String {
+        var result = ""
+        for scalar in string.unicodeScalars {
+            switch scalar {
+            case "\"":
+                result += "\\\""
+            case "\\":
+                result += "\\\\"
+            case "\u{08}":
+                result += "\\b"
+            case "\u{0C}":
+                result += "\\f"
+            case "\n":
+                result += "\\n"
+            case "\r":
+                result += "\\r"
+            case "\t":
+                result += "\\t"
+            default:
+                if scalar.value < 0x20 {
+                    result += String(format: "\\u%04X", scalar.value)
+                } else {
+                    result.unicodeScalars.append(scalar)
+                }
+            }
+        }
+        return result
     }
 }

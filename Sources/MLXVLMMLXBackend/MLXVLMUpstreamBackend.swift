@@ -646,11 +646,9 @@ struct JSONSchemaGuidance {
 
     func forcedJSONLiteral() -> String? {
         guard let schema,
-              let value = Self.forcedValue(schema: schema)
-        else {
-            return nil
-        }
-        return Self.literal(value)
+              let literal = JSONSchemaDeterministicValueBuilder().literal(schema: .object(schema))
+        else { return nil }
+        return literal
     }
 
     func forcedLiteralTokenIDs(tokenizer: Tokenizer, literal: String) -> [Int]? {
@@ -674,87 +672,6 @@ struct JSONSchemaGuidance {
             return schema
         }
         return nil
-    }
-
-    private static func forcedValue(schema: [String: MLXVLMCore.JSONValue]) -> MLXVLMCore.JSONValue? {
-        if let value = schema["const"] {
-            return value
-        }
-        if let enumValues = schema["enum"]?.arrayValue, enumValues.count == 1 {
-            return enumValues[0]
-        }
-        if let value = schema["default"] {
-            return value
-        }
-
-        let types = schemaTypes(schema)
-        if types.contains("object") || schema["properties"] != nil {
-            let required = schema["required"]?.arrayValue?.compactMap(\.stringValue) ?? []
-            guard !required.isEmpty,
-                  let properties = schema["properties"]?.objectValue
-            else {
-                return nil
-            }
-            var object: [String: MLXVLMCore.JSONValue] = [:]
-            for key in required {
-                guard let propertySchema = properties[key]?.objectValue,
-                      let propertyValue = forcedValue(schema: propertySchema)
-                else {
-                    return nil
-                }
-                object[key] = propertyValue
-            }
-            return .object(object)
-        }
-
-        if types.contains("array") {
-            if schema["maxItems"]?.intValue == 0 {
-                return .array([])
-            }
-            guard let minItems = schema["minItems"]?.intValue,
-                  minItems > 0,
-                  schema["maxItems"]?.intValue == minItems,
-                  let itemSchema = schema["items"]?.objectValue,
-                  let itemValue = forcedValue(schema: itemSchema)
-            else {
-                return nil
-            }
-            return .array(Array(repeating: itemValue, count: minItems))
-        }
-
-        return nil
-    }
-
-    private static func schemaTypes(_ schema: [String: MLXVLMCore.JSONValue]) -> [String] {
-        if let type = schema["type"]?.stringValue?.lowercased() {
-            return [type]
-        }
-        return schema["type"]?.arrayValue?.compactMap { $0.stringValue?.lowercased() } ?? []
-    }
-
-    private static func literal(_ value: MLXVLMCore.JSONValue) -> String {
-        switch value {
-        case .object(let object):
-            let keys = object.keys.sorted()
-            return "{\(keys.map { "\"\(escapedJSONString($0))\":\(literal(object[$0] ?? .null))" }.joined(separator: ","))}"
-        case .array(let values):
-            return "[\(values.map(literal).joined(separator: ","))]"
-        case .string(let string):
-            return "\"\(escapedJSONString(string))\""
-        case .number(let number):
-            if number.isFinite,
-               number.rounded(.towardZero) == number,
-               number >= Double(Int64.min),
-               number <= Double(Int64.max)
-            {
-                return String(Int64(number))
-            }
-            return String(number)
-        case .bool(let bool):
-            return bool ? "true" : "false"
-        case .null:
-            return "null"
-        }
     }
 
     private static func escapedJSONString(_ string: String) -> String {

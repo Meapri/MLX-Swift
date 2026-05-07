@@ -116,6 +116,14 @@ JSON_MODE_RESPONSE="$(
 )"
 echo "$JSON_MODE_RESPONSE" | grep -q '"content":"{' || echo "$JSON_MODE_RESPONSE" | grep -q '"content":"\['
 
+JSON_SCHEMA_RESPONSE="$(
+  curl -fsS -m 90 "http://127.0.0.1:$PORT/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"gemma4","messages":[{"role":"user","content":"Return valid schema JSON."}],"response_format":{"type":"json_schema","schema":{"type":"object","required":["answer","confidence"],"properties":{"answer":{"type":"string"},"confidence":{"type":"string","enum":["low","high"]}},"additionalProperties":false}},"max_tokens":32,"temperature":0}'
+)"
+echo "$JSON_SCHEMA_RESPONSE" | grep -q '"content":"{\\"answer\\":\\"\\",\\"confidence\\":\\"low\\"}"'
+echo "$JSON_SCHEMA_RESPONSE" | grep -q '"completion_tokens"'
+
 TOOL_RESPONSE="$(
   curl -fsS -m 60 "http://127.0.0.1:$PORT/v1/chat/completions" \
     -H 'Content-Type: application/json' \
