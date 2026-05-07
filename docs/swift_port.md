@@ -185,17 +185,23 @@ Implemented now:
 
 Generation endpoints now have two honest modes: dependency-free builds return typed `501 Not Implemented` compatibility reports, while real MLX builds route generation through upstream `mlx-swift-lm` instead of returning fake text.
 
-## Phase 1: MLX Swift Backend Boundary
+## Phase 1: Official Swift Engine Adapter
 
-The protocol boundary now exists in `BackendContracts`, and the first real implementation path exists in `MLXVLMUpstreamBackend`. This path intentionally reuses upstream `mlx-swift-lm` model factories for compatibility with existing MLX model directories. The remaining lower-level native-port work is to replace or extend that upstream-backed path with Swift-owned model modules where this fork needs Python `mlx-vlm` behavior that upstream does not provide:
+The protocol boundary now exists in `BackendContracts`, and the primary real implementation path is `MLXVLMUpstreamBackend`. This path intentionally adopts upstream `mlx-swift-lm` as the Swift inference engine instead of reimplementing common LLM/VLM architectures in this repository. The fork-owned work is the Python `mlx-vlm` compatibility layer around that engine: model-directory inspection, Python-style metadata normalization, Ollama/OpenAI request adaptation, response rendering, settings UI, and diagnostics. Swift-owned model modules should be added only when Python `mlx-vlm` behavior or model coverage is missing upstream.
 
-- `ModelContainer`: the upstream-backed path now holds an `MLXLMCommon.ModelContainer`; future architecture-specific ports can extend this with loaded arrays, tokenizer state, and KV-cache state owned directly by this package.
-- `VLMModel`: common multimodal forward interface for text, images, audio, and video.
-- `VLMProcessor`: currently builds prompt/token/media/pixel preflight; the MLX backend should convert this into MLX arrays.
-- `VLMGenerator`: the upstream-backed generator now emits real text chunks; future native generators should add token-ID accounting, seeded MLX random state handling, KV-cache ownership, and architecture-specific streaming details.
+- `ModelContainer`: the upstream-backed path holds an `MLXLMCommon.ModelContainer` loaded by `MLXVLM.VLMModelFactory`, preserving compatibility with existing local MLX model directories.
+- `VLMModel`: common multimodal forward is delegated to upstream `mlx-swift-lm` for covered architectures.
+- `VLMProcessor`: this package still owns Python `mlx-vlm` request/media/preflight compatibility before handing normalized input to upstream `UserInput`.
+- `VLMGenerator`: the upstream-backed generator emits real text/tool/info chunks; local native generation code remains a future fallback for uncovered Python `mlx-vlm` behavior.
 - `MLXWeightPreparer`: dependency-free source for exact safetensors payload bytes; the backend should consume these summaries/payloads when creating typed `MLXArray` weights.
 
 Use `mlx-swift`, `mlx-swift-lm`, and the tokenizer integration package `swift-tokenizers-mlx` as primary dependencies when the first real architecture is wired. Current upstream docs list MLX Swift `0.31.3`, MLX Swift LM `3.31.3`, and swift-tokenizers-mlx `0.3.0` as current release anchors for this port.
+
+Official reference adoption notes:
+
+- `mlx-swift-lm` exposes remote model loading through the provider-agnostic `Downloader` protocol and `MLXHuggingFace` macros such as `#hubDownloader()` plus tokenizer-loader adapters. This project should adopt that path for remote Hugging Face model IDs instead of building a separate Python-style downloader.
+- `ChatSession` is useful for a future stateful chat UX, but the current Ollama/OpenAI server path should remain stateless and continue using `ModelContainer.prepare`/`generate` directly so each API request maps cleanly to one normalized `GenerationRequest`.
+- `UserInput.Image.url`, `UserInput.Video.url`, `ToolSpec`, `GenerateParameters`, and `Generation` are the upstream contracts this package should keep adapting to, rather than duplicating engine internals.
 
 The current workspace does not vendor those packages. With network-restricted builds, the default package remains dependency-free. After local/vendor checkouts or network fetches are available, build with `MLXVLM_ENABLE_MLX_BACKEND=1 MLXVLM_ENABLE_TOKENIZER_INTEGRATIONS=1 swift build`. If network fetch is unavailable, prefer `vendor/MLXSwift`, `vendor/MLXSwiftLM`, and `vendor/SwiftTokenizersMLX` with `MLXVLM_USE_LOCAL_MLX=1`, or set explicit `MLXVLM_MLX_SWIFT_PATH` / `MLXVLM_MLX_SWIFT_LM_PATH` / `MLXVLM_SWIFT_TOKENIZERS_MLX_PATH` values.
 
@@ -221,8 +227,8 @@ Observed Swift response content: `Hello.` The same prompt through `/api/generate
 
 Inline multimodal smoke tests against the same local Gemma4 E4B model also pass through the real backend:
 
-- Ollama `/api/generate` with `images:["<raw base64 png>"]` returned `Black`.
-- OpenAI `/v1/chat/completions` with `image_url.url:"data:image/png;base64,..."` returned `Black`.
+- Ollama `/api/generate` with `images:["<raw base64 png>"]` returned the expected one-word color for the inline PNG.
+- OpenAI `/v1/chat/completions` with `image_url.url:"data:image/png;base64,..."` returned the expected one-word color for the same inline PNG.
 - OpenAI `stream:true` returned `Content-Type: text/event-stream` with per-chunk `data:` frames, final usage, and `data: [DONE]`, without a `Content-Length` header.
 - Ollama `stream:true` returned `Content-Type: application/x-ndjson` with per-chunk JSON lines and final `prompt_eval_count:16`, `eval_count:2`, without a `Content-Length` header.
 - The same checks are now codified in `scripts/verify_real_gemma4_smoke.sh`; set `MLXVLM_REAL_SMOKE_MODEL=/path/to/model` to run it against a different local Gemma4-compatible model directory.
@@ -236,9 +242,9 @@ Recommended backend dependency sketch:
 
 The upstream-backed backend already replaces `UnavailableVLMGenerator` when real MLX modules are linked, server startup prepares the MLX Metal library for direct SwiftPM debug executables, tool schemas pass through to upstream `mlx-swift-lm`, inline image requests work for both Ollama raw base64 and OpenAI data URI payloads, tool-call chunks are preserved in Ollama/OpenAI response envelopes, final usage comes from upstream `GenerateCompletionInfo`, real generation streams now flush as NDJSON/SSE frames, and embedding routes can use upstream `MLXEmbedders` when the selected local model directory is an embedding model. The next backend hardening work is broader video coverage, real-model tool-call generation smoke tests, VLM-to-embedding fallback policy, and release packaging for the real-backend runtime assets.
 
-## Phase 2: First Architecture Port
+## Phase 2: Compatibility Gaps Around The Official Engine
 
-Port one small, common VLM end to end before broad model coverage. Recommended first target:
+Keep upstream `mlx-swift-lm` as the default engine and close Python `mlx-vlm` compatibility gaps around it before porting architecture internals. Add Swift-owned architecture code only when a model or processor behavior exists in Python `mlx-vlm` but is not covered upstream. Recommended first fallback target if this becomes necessary:
 
 - `qwen2_vl` or `qwen2_5_vl` because the Python repo has mature model, processor, tests, and common MLX community model weights.
 

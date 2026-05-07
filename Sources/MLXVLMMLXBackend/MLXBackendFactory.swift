@@ -21,7 +21,7 @@ public struct MLXBackendAvailability: Codable, Equatable, Sendable {
             reasons.append("Build MLXVLMMLXBackend with importable MLX, MLXLMCommon, MLXLLM, MLXVLM, and MLXLMTokenizers modules.")
         }
         if !runtimeProbe.backendImplementationReady {
-            reasons.append("Implement the MLX-backed ModelContainer, VLMProcessor, VLMModel, and VLMGenerator before creating a real backend.")
+            reasons.append("Enable the upstream mlx-swift-lm adapter first; add Swift-owned model modules only for Python mlx-vlm compatibility gaps that upstream does not cover.")
         }
         self.blockingReasons = reasons
     }

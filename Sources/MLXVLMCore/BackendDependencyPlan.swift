@@ -146,7 +146,7 @@ public struct BackendDependencyPlanner {
         if !declaresBackendTarget {
             nextSteps.append("Add a separate MLXVLMMLXBackend target so MLXVLMCore remains dependency-free for compatibility inspection builds.")
         }
-        nextSteps.append("Wire MLXVLMMLXBackend to ModelContainer, VLMProcessor, VLMModel, and VLMGenerator after dependencies are available.")
+        nextSteps.append("Use upstream mlx-swift-lm ModelContainer/VLMModelFactory as the primary Swift engine; reserve Swift-owned model modules for Python mlx-vlm compatibility gaps.")
 
         return BackendDependencyPlan(
             packagePath: packageURL.path,

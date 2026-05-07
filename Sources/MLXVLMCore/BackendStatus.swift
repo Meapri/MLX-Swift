@@ -39,9 +39,9 @@ public struct BackendStatus: Codable, Equatable, Sendable {
         message: "MLX Swift inference backend is not linked in this target. Metadata, prompt, tokenizer, Ollama/OpenAI API compatibility, and Qwen VL planning are available; token generation is intentionally unavailable.",
         nextSteps: [
             "Vendor or fetch mlx-swift 0.31.3, mlx-swift-lm 3.31.3, and swift-tokenizers-mlx.",
-            "Add a backend target that depends on MLXVLMCore plus MLX, MLXLMCommon, MLXLLM, MLXVLM, and MLXLMTokenizers modules.",
-            "Replace UnavailableVLMGenerator with an MLX-backed VLMGenerator and route server generation endpoints through CompletedGeneration/APIResponses.",
-            "Run text-only and image Qwen2-VL smoke tests before replacing 501 responses.",
+            "Build with MLXVLM_ENABLE_MLX_BACKEND=1, MLXVLM_ENABLE_TOKENIZER_INTEGRATIONS=1, and MLXVLM_ENABLE_REAL_MLX_API=1 to route generation through the upstream mlx-swift-lm VLM engine.",
+            "Run scripts/verify_real_gemma4_smoke.sh, or an equivalent local model smoke test, before using the real backend path.",
+            "Keep native Swift model-module work scoped to Python mlx-vlm behaviors that upstream mlx-swift-lm does not cover.",
         ]
     )
 
