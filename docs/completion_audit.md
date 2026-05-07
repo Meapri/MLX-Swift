@@ -19,7 +19,7 @@ Status: not complete. The Swift server is usable for the main Gemma4/OpenAI/Olla
 | Audio/video/image metadata survives API normalization and upstream handoff | Self-test and `scripts/verify_swift_port.sh` cover metadata parsing/planning; mock upstream contracts include `UserInput.Video` | Partially verified |
 | Video-capable model generation works end-to-end | Local cache currently contains Gemma4 models only; no video-capable MLX model smoke has passed | Missing |
 | JSON mode / JSON Schema replacement is complete | Real backend has JSON root/start and first required-key prefix guidance | Partial |
-| Full JSON Schema grammar/DFA constrained decoding is available | No full schema grammar/DFA engine is implemented | Missing |
+| Full JSON Schema grammar/DFA constrained decoding is available | `ResponseFormatPlan` now extracts schema constraints for required properties, enum paths, array paths, nesting depth, and unsupported keywords; no full grammar/DFA token-state engine is implemented | Missing |
 | Python `mlx-vlm` model-family parity is complete | Gemma4 real smoke passes; Qwen VL planning/metadata is broad; non-generative families are classified | Partial |
 | RF-DETR/SAM3 and other non-generative model actual inference is Swift-backed | Capability planning prevents incorrect text generation, but actual predictor inference is not ported | Missing |
 | SentencePiece/Unigram fallback tokenizers are Swift-executable without upstream tokenizer | Unigram `tokenizer.json` greedy fallback is covered by `scripts/verify_swift_port.sh`; binary `tokenizer.model` SentencePiece execution is still not implemented | Partial |
@@ -38,7 +38,7 @@ These gates are necessary but not sufficient for 100% completion because the vid
 ## Next Required Work
 
 1. Add a real video-capable MLX model fixture or documented local model path and pass a video generation smoke through the Swift server.
-2. Implement full JSON Schema grammar/DFA constrained decoding or adopt an official upstream equivalent and verify schema properties, enums, arrays, required keys, nesting, and streaming behavior.
+2. Implement full JSON Schema grammar/DFA constrained decoding or adopt an official upstream equivalent using the extracted `JSONSchemaConstraintPlan`, then verify schema properties, enums, arrays, required keys, nesting, and streaming behavior.
 3. Implement or delegate dependency-free binary SentencePiece `tokenizer.model` fallback tokenization for server diagnostics where upstream tokenizer integrations are unavailable.
 4. Decide whether RF-DETR/SAM3 actual inference is in scope for this replacement; if yes, add Swift-backed predictor routes or explicit compatibility exclusions.
 5. Expand real-model smoke beyond Gemma4 to at least one Qwen/Qwen2.5-VL model once a local MLX model directory is available.
