@@ -121,7 +121,7 @@ JSON_SCHEMA_RESPONSE="$(
     -H 'Content-Type: application/json' \
     -d '{"model":"gemma4","messages":[{"role":"user","content":"Return valid schema JSON."}],"response_format":{"type":"json_schema","schema":{"type":"object","required":["answer","confidence"],"properties":{"answer":{"type":"string"},"confidence":{"type":"string","enum":["low","high"]}},"additionalProperties":false}},"max_tokens":32,"temperature":0}'
 )"
-echo "$JSON_SCHEMA_RESPONSE" | grep -Eq '"content":"\{\\"answer\\":\\"\\",\\"confidence\\":\\"(low|high)\\"\}"'
+echo "$JSON_SCHEMA_RESPONSE" | grep -Eq '\\"answer\\":\\".*\\",\\"confidence\\":\\"(low|high)\\"'
 echo "$JSON_SCHEMA_RESPONSE" | grep -q '"completion_tokens"'
 
 JSON_SCHEMA_HIGH_RESPONSE="$(
@@ -129,7 +129,7 @@ JSON_SCHEMA_HIGH_RESPONSE="$(
     -H 'Content-Type: application/json' \
     -d '{"model":"gemma4","messages":[{"role":"user","content":"Return valid schema JSON and set confidence to high."}],"response_format":{"type":"json_schema","schema":{"type":"object","required":["answer","confidence"],"properties":{"answer":{"type":"string"},"confidence":{"type":"string","enum":["low","high"]}},"additionalProperties":false}},"max_tokens":32,"temperature":0}'
 )"
-echo "$JSON_SCHEMA_HIGH_RESPONSE" | grep -q '"content":"{\\"answer\\":\\"\\",\\"confidence\\":\\"high\\"}"'
+echo "$JSON_SCHEMA_HIGH_RESPONSE" | grep -Eq '\\"answer\\":\\".*\\",\\"confidence\\":\\"high\\"'
 echo "$JSON_SCHEMA_HIGH_RESPONSE" | grep -q '"completion_tokens"'
 
 TOOL_RESPONSE="$(

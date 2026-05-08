@@ -556,6 +556,18 @@ struct MLXVLMStructuredLogitProcessorFactory {
         }
         let tokenizer = await container.tokenizer
         let guidance = JSONSchemaGuidance(responseFormat: request.metadata.responseFormat)
+        if let grammar = guidance.openScalarGrammar(
+            defaultMaxStringLength: max(8, min(256, request.parameters.maxTokens / 2))
+        ) {
+            return CompositeLogitProcessor(
+                first: parameters.processor(),
+                second: JSONOpenScalarGrammarProcessor(
+                    grammar: grammar,
+                    tokenizer: tokenizer,
+                    terminalTokenID: tokenizer.eosTokenId
+                )
+            )
+        }
         if let tokenSequences = guidance.finiteDFATokenSequences(tokenizer: tokenizer),
            tokenSequences.count > 1
         {
@@ -660,6 +672,17 @@ struct JSONSchemaGuidance {
               let literal = JSONSchemaDeterministicValueBuilder().literal(schema: .object(schema))
         else { return nil }
         return literal
+    }
+
+    func openScalarGrammar(defaultMaxStringLength: Int) -> JSONOpenScalarGrammar? {
+        guard let schema else {
+            return nil
+        }
+        let plan = JSONSchemaGrammarPlanner().plan(schema: .object(schema))
+        guard plan?.requiresTokenizerPrefixFiltering == true else {
+            return nil
+        }
+        return JSONOpenScalarGrammar(schema: schema, defaultMaxStringLength: defaultMaxStringLength)
     }
 
     func finiteDFATokenSequences(tokenizer: Tokenizer) -> [[Int]]? {
@@ -913,6 +936,424 @@ struct JSONTokenTrieProcessor: LogitProcessor {
         } else {
             self.current = nil
         }
+    }
+}
+
+private enum JSONGrammarElement {
+    case literal(String)
+    case choice([[JSONGrammarElement]])
+    case openString(maxLength: Int)
+    case openNumber
+}
+
+struct JSONOpenScalarGrammar {
+    private let elements: [JSONGrammarElement]
+    private let defaultMaxStringLength: Int
+
+    init?(schema: [String: MLXVLMCore.JSONValue], defaultMaxStringLength: Int) {
+        self.defaultMaxStringLength = max(1, defaultMaxStringLength)
+        guard let elements = Self.elements(
+            for: schema,
+            defaultMaxStringLength: self.defaultMaxStringLength
+        ) else {
+            return nil
+        }
+        self.elements = elements
+    }
+
+    func canComplete(prefix: String) -> Bool {
+        Self.match(elements, index: 0, text: prefix, position: prefix.startIndex, requireComplete: false)
+    }
+
+    func isComplete(_ text: String) -> Bool {
+        Self.match(elements, index: 0, text: text, position: text.startIndex, requireComplete: true)
+    }
+
+    private static func elements(
+        for schema: [String: MLXVLMCore.JSONValue],
+        defaultMaxStringLength: Int
+    ) -> [JSONGrammarElement]? {
+        if let value = schema["const"] {
+            return [.literal(MLXVLMCore.JSONSchemaDeterministicValueBuilder.literal(value))]
+        }
+        if let values = schema["enum"]?.arrayValue, !values.isEmpty {
+            return [.choice(values.map { [.literal(MLXVLMCore.JSONSchemaDeterministicValueBuilder.literal($0))] })]
+        }
+        if let value = schema["default"] {
+            return [.literal(MLXVLMCore.JSONSchemaDeterministicValueBuilder.literal(value))]
+        }
+
+        let currentTypes = types(from: schema)
+        if currentTypes.contains("object") || schema["properties"] != nil {
+            return objectElements(for: schema, defaultMaxStringLength: defaultMaxStringLength)
+        }
+        if currentTypes.contains("array") || schema["items"] != nil {
+            return arrayElements(for: schema, defaultMaxStringLength: defaultMaxStringLength)
+        }
+        if currentTypes.contains("string") {
+            return [.openString(maxLength: max(0, schema["maxLength"]?.intValue ?? defaultMaxStringLength))]
+        }
+        if currentTypes.contains("integer") || currentTypes.contains("number") {
+            return [.openNumber]
+        }
+        if currentTypes.contains("boolean") {
+            return [.choice([[.literal("false")], [.literal("true")]])]
+        }
+        if currentTypes.contains("null") {
+            return [.literal("null")]
+        }
+        return nil
+    }
+
+    private static func objectElements(
+        for schema: [String: MLXVLMCore.JSONValue],
+        defaultMaxStringLength: Int
+    ) -> [JSONGrammarElement]? {
+        let required = schema["required"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        let properties = schema["properties"]?.objectValue ?? [:]
+        let optionalDefaults = properties.keys
+            .filter { !required.contains($0) }
+            .filter { properties[$0]?.objectValue?["default"] != nil }
+            .sorted()
+        let keys = required + optionalDefaults
+
+        var result: [JSONGrammarElement] = [.literal("{")]
+        for (offset, key) in keys.enumerated() {
+            guard let propertySchema = properties[key]?.objectValue,
+                  let propertyElements = elements(
+                    for: propertySchema,
+                    defaultMaxStringLength: defaultMaxStringLength
+                  )
+            else {
+                return nil
+            }
+            if offset > 0 {
+                result.append(.literal(","))
+            }
+            result.append(.literal("\"\(escapedJSONString(key))\":"))
+            result.append(contentsOf: propertyElements)
+        }
+        result.append(.literal("}"))
+        return result
+    }
+
+    private static func arrayElements(
+        for schema: [String: MLXVLMCore.JSONValue],
+        defaultMaxStringLength: Int
+    ) -> [JSONGrammarElement]? {
+        let minItems = max(0, schema["minItems"]?.intValue ?? 0)
+        guard minItems > 0 else {
+            return [.literal("[]")]
+        }
+        guard let itemSchema = schema["items"]?.objectValue,
+              let itemElements = elements(for: itemSchema, defaultMaxStringLength: defaultMaxStringLength)
+        else {
+            return nil
+        }
+        var result: [JSONGrammarElement] = [.literal("[")]
+        for index in 0..<minItems {
+            if index > 0 {
+                result.append(.literal(","))
+            }
+            result.append(contentsOf: itemElements)
+        }
+        result.append(.literal("]"))
+        return result
+    }
+
+    private static func match(
+        _ elements: [JSONGrammarElement],
+        index: Int,
+        text: String,
+        position: String.Index,
+        requireComplete: Bool
+    ) -> Bool {
+        if index == elements.count {
+            return position == text.endIndex
+        }
+        if position == text.endIndex {
+            return !requireComplete
+        }
+
+        switch elements[index] {
+        case .literal(let literal):
+            return matchLiteral(
+                literal,
+                elements: elements,
+                index: index,
+                text: text,
+                position: position,
+                requireComplete: requireComplete
+            )
+        case .choice(let choices):
+            return choices.contains { choice in
+                var combined = choice
+                combined.append(contentsOf: elements[(index + 1)...])
+                return match(combined, index: 0, text: text, position: position, requireComplete: requireComplete)
+            }
+        case .openString(let maxLength):
+            return matchOpenString(
+                elements,
+                index: index,
+                text: text,
+                position: position,
+                maxLength: maxLength,
+                requireComplete: requireComplete
+            )
+        case .openNumber:
+            return matchOpenNumber(
+                elements,
+                index: index,
+                text: text,
+                position: position,
+                requireComplete: requireComplete
+            )
+        }
+    }
+
+    private static func matchLiteral(
+        _ literal: String,
+        elements: [JSONGrammarElement],
+        index: Int,
+        text: String,
+        position: String.Index,
+        requireComplete: Bool
+    ) -> Bool {
+        var literalIndex = literal.startIndex
+        var textIndex = position
+        while literalIndex < literal.endIndex && textIndex < text.endIndex {
+            guard literal[literalIndex] == text[textIndex] else {
+                return false
+            }
+            literal.formIndex(after: &literalIndex)
+            text.formIndex(after: &textIndex)
+        }
+        if literalIndex == literal.endIndex {
+            return match(elements, index: index + 1, text: text, position: textIndex, requireComplete: requireComplete)
+        }
+        return textIndex == text.endIndex && !requireComplete
+    }
+
+    private static func matchOpenString(
+        _ elements: [JSONGrammarElement],
+        index: Int,
+        text: String,
+        position: String.Index,
+        maxLength: Int,
+        requireComplete: Bool
+    ) -> Bool {
+        var cursor = position
+        guard cursor < text.endIndex else {
+            return !requireComplete
+        }
+        guard text[cursor] == "\"" else {
+            return false
+        }
+        text.formIndex(after: &cursor)
+        var escaping = false
+        var unicodeEscapeDigitsRemaining = 0
+        var contentLength = 0
+        while cursor < text.endIndex {
+            let character = text[cursor]
+            if unicodeEscapeDigitsRemaining > 0 {
+                guard character.isHexDigit else {
+                    return false
+                }
+                unicodeEscapeDigitsRemaining -= 1
+                text.formIndex(after: &cursor)
+                continue
+            }
+            if escaping {
+                if character == "u" {
+                    unicodeEscapeDigitsRemaining = 4
+                } else if !"\"\\/bfnrt".contains(character) {
+                    return false
+                }
+                escaping = false
+                text.formIndex(after: &cursor)
+                continue
+            }
+            if character == "\\" {
+                escaping = true
+                text.formIndex(after: &cursor)
+                continue
+            }
+            if character == "\"" {
+                text.formIndex(after: &cursor)
+                return match(elements, index: index + 1, text: text, position: cursor, requireComplete: requireComplete)
+            }
+            guard character.unicodeScalars.allSatisfy({ $0.value >= 0x20 }) else {
+                return false
+            }
+            contentLength += 1
+            if contentLength > maxLength {
+                return false
+            }
+            text.formIndex(after: &cursor)
+        }
+        return !requireComplete
+    }
+
+    private static func matchOpenNumber(
+        _ elements: [JSONGrammarElement],
+        index: Int,
+        text: String,
+        position: String.Index,
+        requireComplete: Bool
+    ) -> Bool {
+        var cursor = position
+        while cursor < text.endIndex {
+            let prefix = String(text[position..<cursor])
+            if isCompleteJSONNumber(prefix),
+               match(elements, index: index + 1, text: text, position: cursor, requireComplete: requireComplete)
+            {
+                return true
+            }
+            guard isJSONNumberCharacter(text[cursor]) else {
+                return false
+            }
+            text.formIndex(after: &cursor)
+        }
+        let number = String(text[position..<text.endIndex])
+        if requireComplete {
+            return isCompleteJSONNumber(number) &&
+                match(elements, index: index + 1, text: text, position: text.endIndex, requireComplete: true)
+        }
+        return isJSONNumberPrefix(number)
+    }
+
+    private static func isJSONNumberCharacter(_ character: Character) -> Bool {
+        character.isNumber || character == "-" || character == "+" || character == "." || character == "e" || character == "E"
+    }
+
+    private static func isJSONNumberPrefix(_ text: String) -> Bool {
+        guard !text.isEmpty else {
+            return true
+        }
+        let pattern = #"^-?(?:0|[1-9][0-9]*)?(?:\.[0-9]*)?(?:[eE][+-]?[0-9]*)?$"#
+        return text.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    private static func isCompleteJSONNumber(_ text: String) -> Bool {
+        guard !text.isEmpty else {
+            return false
+        }
+        let pattern = #"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$"#
+        return text.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    private static func types(from object: [String: MLXVLMCore.JSONValue]) -> [String] {
+        if let type = object["type"]?.stringValue?.lowercased() {
+            return [type]
+        }
+        if let types = object["type"]?.arrayValue?.compactMap({ $0.stringValue?.lowercased() }), !types.isEmpty {
+            return types
+        }
+        if object["properties"] != nil {
+            return ["object"]
+        }
+        if object["items"] != nil {
+            return ["array"]
+        }
+        return []
+    }
+
+    private static func escapedJSONString(_ string: String) -> String {
+        var result = ""
+        for scalar in string.unicodeScalars {
+            switch scalar {
+            case "\"":
+                result += "\\\""
+            case "\\":
+                result += "\\\\"
+            case "\u{08}":
+                result += "\\b"
+            case "\u{0C}":
+                result += "\\f"
+            case "\n":
+                result += "\\n"
+            case "\r":
+                result += "\\r"
+            case "\t":
+                result += "\\t"
+            default:
+                if scalar.value < 0x20 {
+                    result += String(format: "\\u%04X", scalar.value)
+                } else {
+                    result.unicodeScalars.append(scalar)
+                }
+            }
+        }
+        return result
+    }
+}
+
+private final class JSONTokenTextCache {
+    var values: [Int: String] = [:]
+}
+
+struct JSONOpenScalarGrammarProcessor: LogitProcessor {
+    private let grammar: JSONOpenScalarGrammar
+    private let tokenizer: Tokenizer
+    private let terminalTokenID: Int?
+    private let tokenTextCache = JSONTokenTextCache()
+    private var generatedText = ""
+
+    init(grammar: JSONOpenScalarGrammar, tokenizer: Tokenizer, terminalTokenID: Int?) {
+        self.grammar = grammar
+        self.tokenizer = tokenizer
+        self.terminalTokenID = terminalTokenID
+    }
+
+    mutating func prompt(_ prompt: MLXArray) {}
+
+    func process(logits: MLXArray) -> MLXArray {
+        let complete = grammar.isComplete(generatedText)
+        let vocabSize = logits.shape.last ?? 0
+        guard vocabSize > 0 else {
+            return logits
+        }
+        var allowedTokenIDs: [Int] = []
+        if complete, let terminalTokenID {
+            allowedTokenIDs.append(terminalTokenID)
+        }
+        if !complete {
+            for tokenID in 0..<vocabSize {
+                let text = decodedText(for: tokenID)
+                guard !text.isEmpty else {
+                    continue
+                }
+                if grammar.canComplete(prefix: generatedText + text) {
+                    allowedTokenIDs.append(tokenID)
+                }
+            }
+        }
+        guard !allowedTokenIDs.isEmpty else {
+            return logits
+        }
+        let masked = MLXArray.zeros(logits.shape, dtype: logits.dtype) + MLXArray(-Float.infinity)
+        let indices = MLXArray(allowedTokenIDs).asType(.uint32)
+        masked[0..., indices] = logits[0..., indices]
+        return masked
+    }
+
+    mutating func didSample(token: MLXArray) {
+        guard let tokenID = token.asArray(Int.self).last else {
+            return
+        }
+        if tokenID == terminalTokenID, grammar.isComplete(generatedText) {
+            return
+        }
+        generatedText += decodedText(for: tokenID)
+    }
+
+    private func decodedText(for tokenID: Int) -> String {
+        if let cached = tokenTextCache.values[tokenID] {
+            return cached
+        }
+        let text = tokenizer.decode(tokenIds: [tokenID], skipSpecialTokens: true)
+        tokenTextCache.values[tokenID] = text
+        return text
     }
 }
 
