@@ -184,6 +184,14 @@ echo "$OPENAI_VIDEO_RESPONSE" | grep -q '"content":"'
 echo "$OPENAI_VIDEO_RESPONSE" | grep -q '"prompt_tokens"'
 echo "$OPENAI_VIDEO_RESPONSE" | grep -q '"completion_tokens"'
 
+JSON_SCHEMA_RESPONSE="$(
+  curl -fsS -m 240 "http://127.0.0.1:$PORT/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$REQUEST_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Return valid schema JSON.\"}],\"response_format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\",\"required\":[\"answer\",\"confidence\"],\"properties\":{\"answer\":{\"type\":\"string\",\"maxLength\":8},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"high\"]}},\"additionalProperties\":false}},\"max_tokens\":40,\"temperature\":0}"
+)"
+echo "$JSON_SCHEMA_RESPONSE" | grep -Eq '\\\"answer\\\":\\\".*\\\",\\\"confidence\\\":\\\"(low|high)\\\"'
+echo "$JSON_SCHEMA_RESPONSE" | grep -q '"completion_tokens"'
+
 OPENAI_STREAM="$(mktemp)"
 curl -sS -m 180 -i "http://127.0.0.1:$PORT/v1/chat/completions" \
   -H 'Content-Type: application/json' \

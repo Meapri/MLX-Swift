@@ -534,13 +534,70 @@ struct MLXVLMResolvedDraftModel {
             do {
                 container = try await MLXLLM.LLMModelFactory.shared.loadContainer(from: directory, using: tokenizers)
             } catch {
-                throw MLXVLMUpstreamBackendError.invalidDraftModel("\(model) could not be loaded as VLM or LLM")
+                let diagnostic = Self.draftModelDiagnostic(
+                    requestedModel: model,
+                    directory: directory,
+                    draftKind: metadata.draftKind
+                )
+                throw MLXVLMUpstreamBackendError.invalidDraftModel(diagnostic)
             }
         }
         return MLXVLMResolvedDraftModel(
             container: container,
             numDraftTokens: max(1, metadata.draftBlockSize ?? 2)
         )
+    }
+
+    private static func draftModelDiagnostic(
+        requestedModel: String,
+        directory: URL,
+        draftKind: String?
+    ) -> String {
+        guard let config = readDraftConfig(from: directory) else {
+            return "\(requestedModel) could not be loaded as VLM or LLM"
+        }
+
+        let modelType = config.string("model_type")
+        let architectures = config.stringArray("architectures")
+        let textModelType = config.dictionary("text_config")?.string("model_type")
+
+        if modelType == "gemma4_assistant" || architectures.contains("Gemma4AssistantForCausalLM") {
+            let kind = draftKind.map { " --draft-kind \($0)" } ?? ""
+            return "\(requestedModel)\(kind) uses Gemma4 MTP assistant architecture (model_type gemma4_assistant, architecture Gemma4AssistantForCausalLM). The bundled official mlx-swift-lm registry currently exposes Gemma4 VLM/LLM loaders for gemma4 and gemma4_text, but not gemma4_assistant; native Swift Gemma4Assistant draft-model support is required before this Python mlx-vlm MTP path can be replaced."
+        }
+
+        let architectureSummary = architectures.isEmpty ? "unknown" : architectures.joined(separator: ",")
+        let typeSummary = [modelType, textModelType.map { "text_config.\($0)" }]
+            .compactMap { $0 }
+            .joined(separator: ", ")
+        if typeSummary.isEmpty {
+            return "\(requestedModel) could not be loaded as VLM or LLM; config architecture=\(architectureSummary)"
+        }
+        return "\(requestedModel) could not be loaded as VLM or LLM; config model_type=\(typeSummary), architecture=\(architectureSummary)"
+    }
+
+    private static func readDraftConfig(from directory: URL) -> [String: Any]? {
+        let configURL = directory.appendingPathComponent("config.json")
+        guard let data = try? Data(contentsOf: configURL),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            return nil
+        }
+        return object
+    }
+}
+
+private extension Dictionary where Key == String, Value == Any {
+    func string(_ key: String) -> String? {
+        self[key] as? String
+    }
+
+    func stringArray(_ key: String) -> [String] {
+        self[key] as? [String] ?? []
+    }
+
+    func dictionary(_ key: String) -> [String: Any]? {
+        self[key] as? [String: Any]
     }
 }
 
@@ -1160,6 +1217,12 @@ struct JSONOpenScalarGrammar {
                     return false
                 }
                 unicodeEscapeDigitsRemaining -= 1
+                if unicodeEscapeDigitsRemaining == 0 {
+                    contentLength += 1
+                    if contentLength > maxLength {
+                        return false
+                    }
+                }
                 text.formIndex(after: &cursor)
                 continue
             }
@@ -1168,6 +1231,11 @@ struct JSONOpenScalarGrammar {
                     unicodeEscapeDigitsRemaining = 4
                 } else if !"\"\\/bfnrt".contains(character) {
                     return false
+                } else {
+                    contentLength += 1
+                    if contentLength > maxLength {
+                        return false
+                    }
                 }
                 escaping = false
                 text.formIndex(after: &cursor)
