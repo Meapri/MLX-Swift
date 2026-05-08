@@ -526,6 +526,18 @@ struct MLXVLMResolvedDraftModel {
         }
         let descriptor = try await MLXRemoteModelResolver().resolveDescriptor(pathOrIdentifier: model)
         let directory = URL(fileURLWithPath: descriptor.path)
+        if descriptor.rawModelType == "gemma4_assistant" ||
+            Self.draftModelArchitectures(directory: directory).contains("Gemma4AssistantForCausalLM")
+        {
+            let report = Gemma4AssistantDraftLoading.loadReport(pathOrIdentifier: descriptor.path)
+            throw MLXVLMUpstreamBackendError.invalidDraftModel(
+                Self.gemma4AssistantDraftDiagnostic(
+                    requestedModel: model,
+                    draftKind: metadata.draftKind,
+                    report: report
+                )
+            )
+        }
         let tokenizers = MLXLMTokenizers.TokenizersLoader()
         let container: MLXLMCommon.ModelContainer
         do {
@@ -562,8 +574,11 @@ struct MLXVLMResolvedDraftModel {
         let textModelType = config.dictionary("text_config")?.string("model_type")
 
         if modelType == "gemma4_assistant" || architectures.contains("Gemma4AssistantForCausalLM") {
-            let kind = draftKind.map { " --draft-kind \($0)" } ?? ""
-            return "\(requestedModel)\(kind) uses Gemma4 MTP assistant architecture (model_type gemma4_assistant, architecture Gemma4AssistantForCausalLM). The bundled official mlx-swift-lm registry currently exposes Gemma4 VLM/LLM loaders for gemma4 and gemma4_text, but not gemma4_assistant; native Swift Gemma4Assistant draft-model support is required before this Python mlx-vlm MTP path can be replaced."
+            return gemma4AssistantDraftDiagnostic(
+                requestedModel: requestedModel,
+                draftKind: draftKind,
+                report: Gemma4AssistantDraftLoading.loadReport(pathOrIdentifier: directory.path)
+            )
         }
 
         let architectureSummary = architectures.isEmpty ? "unknown" : architectures.joined(separator: ",")
@@ -574,6 +589,28 @@ struct MLXVLMResolvedDraftModel {
             return "\(requestedModel) could not be loaded as VLM or LLM; config architecture=\(architectureSummary)"
         }
         return "\(requestedModel) could not be loaded as VLM or LLM; config model_type=\(typeSummary), architecture=\(architectureSummary)"
+    }
+
+    private static func draftModelArchitectures(directory: URL) -> [String] {
+        readDraftConfig(from: directory)?.stringArray("architectures") ?? []
+    }
+
+    private static func gemma4AssistantDraftDiagnostic(
+        requestedModel: String,
+        draftKind: String?,
+        report: Gemma4AssistantDraftLoadReport
+    ) -> String {
+        let kind = draftKind.map { " --draft-kind \($0)" } ?? ""
+        guard report.assistantRuntimeCompiled else {
+            return "\(requestedModel)\(kind) uses Gemma4 MTP assistant architecture, but native Swift Gemma4Assistant loading was not compiled. Build with MLXVLM_ENABLE_GEMMA4_ASSISTANT_RUNTIME=1 in addition to the real MLX backend flags."
+        }
+        guard report.error == nil else {
+            return "\(requestedModel)\(kind) uses Gemma4 MTP assistant architecture. Native Swift Gemma4Assistant loading was attempted but failed: \(report.error ?? "unknown error")"
+        }
+        let targetAdapter = Gemma4MTPTargetRuntime.adapterReport.targetAdapterCompiled
+            ? "the Swift target adapter contract is compiled"
+            : "the Swift target adapter contract is not compiled"
+        return "\(requestedModel)\(kind) uses Gemma4 MTP assistant architecture. Native Swift Gemma4Assistant loading now succeeds (\(report.loadedTensorCount) tensors), the Python mlx-vlm MTP accept/rollback session loop has been ported into Swift Core, \(targetAdapter), and a Swift Gemma4 target text runtime now exports pre-norm hidden states plus shared K/V. The server still needs to route --draft-kind mtp requests through that Swift target runtime instead of the upstream private Gemma4 container before Gemma4 MTP can replace Python mlx-vlm generation end-to-end."
     }
 
     private static func readDraftConfig(from directory: URL) -> [String: Any]? {

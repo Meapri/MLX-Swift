@@ -69,7 +69,7 @@ public struct Gemma4AssistantDraftPlanner {
         if !criticalUnexpected.isEmpty {
             blockingReasons.append("Draft checkpoint contains generic Gemma4 text attention tensors that are not part of kv-shared assistant decoding: \(criticalUnexpected.joined(separator: ","))")
         }
-        blockingReasons.append("Native Swift Gemma4 MTP still requires target Gemma4 hidden-state capture, shared K/V export, assistant draft_block, and an MTP verification/rollback loop; generic mlx-swift-lm speculative decoding is insufficient.")
+        blockingReasons.append("Native Swift Gemma4 MTP still requires the server to route --draft-kind mtp generation through the Swift target verifier with hidden-state capture, shared K/V export, rollback, and target embedding binding; generic mlx-swift-lm speculative decoding is insufficient.")
 
         return Gemma4AssistantDraftPlan(
             modelType: modelType,

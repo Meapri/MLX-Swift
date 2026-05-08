@@ -3,6 +3,11 @@ import MLXVLMCore
 import MLXVLMMLXBackend
 import Darwin
 
+private struct MTPSessionInspection: Codable, Equatable, Sendable {
+    let session: MTPSpeculativeSession
+    let rounds: [MTPSpeculativeRoundEmission]
+}
+
 @main
 struct MLXVLMCli {
     static func main() {
@@ -63,6 +68,92 @@ struct MLXVLMCli {
             let descriptor = try ModelStore().loadDescriptor(pathOrIdentifier: path)
             let weightCatalog = WeightCatalogBuilder().catalog(for: descriptor)
             printJSON(Gemma4AssistantDraftPlanner().plan(descriptor: descriptor, weightCatalog: weightCatalog))
+        case "inspect-gemma4-mtp-target-plan":
+            let path = try value(for: "--model", in: arguments)
+            let descriptor = try ModelStore().loadDescriptor(pathOrIdentifier: path)
+            let draftDescriptor = try optionalValue(for: "--draft-model", in: arguments).map {
+                try ModelStore().loadDescriptor(pathOrIdentifier: $0)
+            }
+            printJSON(
+                Gemma4MTPTargetPlanner().plan(
+                    targetDescriptor: descriptor,
+                    draftDescriptor: draftDescriptor
+                )
+            )
+        case "load-gemma4-assistant-draft":
+            let path = try value(for: "--model", in: arguments)
+            printJSON(Gemma4AssistantDraftLoading.loadReport(pathOrIdentifier: path))
+        case "smoke-gemma4-assistant-draft":
+            let path = try value(for: "--model", in: arguments)
+            let blockSize = Int(optionalValue(for: "--draft-block-size", in: arguments) ?? "4") ?? 4
+            printJSON(
+                Gemma4AssistantDraftLoading.smokeDraftBlockReport(
+                    pathOrIdentifier: path,
+                    blockSize: blockSize
+                )
+            )
+        case "load-gemma4-mtp-target-text":
+            let path = try value(for: "--model", in: arguments)
+            printJSON(Gemma4MTPTargetTextLoading.loadReport(pathOrIdentifier: path))
+        case "smoke-gemma4-mtp-target-text":
+            let path = try value(for: "--model", in: arguments)
+            let tokenIDs = try optionalValue(for: "--tokens", in: arguments).map(parseIntCSV) ?? [2, 106, 107]
+            printJSON(
+                Gemma4MTPTargetTextLoading.smokeReport(
+                    pathOrIdentifier: path,
+                    tokenIDs: tokenIDs
+                )
+            )
+        case "inspect-gemma4-mtp-target-adapter":
+            printJSON(Gemma4MTPTargetRuntime.adapterReport)
+        case "smoke-gemma4-mtp-target-adapter":
+            printJSON(Gemma4MTPTargetRuntime.smokeAdapterReport())
+        case "inspect-mtp-round-plan":
+            let draftTokens = try parseIntCSV(try value(for: "--draft-tokens", in: arguments))
+            let targetTokens = try parseIntCSV(try value(for: "--target-tokens", in: arguments))
+            let emitted = Int(optionalValue(for: "--emitted", in: arguments) ?? "1") ?? 1
+            let maxTokens = Int(optionalValue(for: "--max-tokens", in: arguments) ?? "8") ?? 8
+            let blockSize = Int(optionalValue(for: "--draft-block-size", in: arguments) ?? "\(draftTokens.count + 1)") ?? (draftTokens.count + 1)
+            let position = Int(optionalValue(for: "--position", in: arguments) ?? "0") ?? 0
+            let sharedKVLength = Int(optionalValue(for: "--shared-kv-length", in: arguments) ?? "\(position + blockSize)") ?? (position + blockSize)
+            printJSON(
+                SpeculativeDecoding.mtpRoundPlan(
+                    draftTokens: draftTokens,
+                    targetTokens: targetTokens,
+                    emittedBeforeRound: emitted,
+                    maxTokens: maxTokens,
+                    blockSize: blockSize,
+                    positionBeforeRound: position,
+                    sharedKVSequenceLength: sharedKVLength
+                )
+            )
+        case "inspect-mtp-session":
+            let firstBonus = Int(optionalValue(for: "--first-bonus", in: arguments) ?? "0") ?? 0
+            let maxTokens = Int(optionalValue(for: "--max-tokens", in: arguments) ?? "8") ?? 8
+            let blockSize = Int(optionalValue(for: "--draft-block-size", in: arguments) ?? "4") ?? 4
+            let position = Int(optionalValue(for: "--position", in: arguments) ?? "0") ?? 0
+            let sharedKVLength = Int(optionalValue(for: "--shared-kv-length", in: arguments) ?? "\(position)") ?? position
+            let draftRounds = try values(for: "--draft-round", in: arguments).map(parseIntCSV)
+            let targetRounds = try values(for: "--target-round", in: arguments).map(parseIntCSV)
+            let roundCount = min(draftRounds.count, targetRounds.count)
+            var session = MTPSpeculativeSession(
+                firstBonusToken: firstBonus,
+                maxTokens: maxTokens,
+                draftBlockSize: blockSize,
+                initialPosition: position,
+                initialSharedKVSequenceLength: sharedKVLength
+            )
+            var emissions: [MTPSpeculativeRoundEmission] = []
+            for index in 0 ..< roundCount {
+                guard let emission = session.nextRound(
+                    draftTokens: draftRounds[index],
+                    targetTokens: targetRounds[index]
+                ) else {
+                    break
+                }
+                emissions.append(emission)
+            }
+            printJSON(MTPSessionInspection(session: session, rounds: emissions))
         case "inspect-weight-catalog":
             let path = try value(for: "--model", in: arguments)
             let descriptor = try ModelStore().loadDescriptor(pathOrIdentifier: path)
@@ -928,6 +1019,15 @@ struct MLXVLMCli {
           mlx-vlm-swift inspect-mlx-pipeline --model /path/to/mlx-model --api openai-chat --json '{"model":"m","messages":[...]}' [--max-tensors 16] [--max-total-bytes 67108864] [--skip-weight-payloads]
           mlx-vlm-swift inspect-backend-context --model /path/to/mlx-model
           mlx-vlm-swift inspect-gemma4-assistant-draft-plan --model /path/to/gemma4-assistant-draft
+          mlx-vlm-swift inspect-gemma4-mtp-target-plan --model /path/to/gemma4-target [--draft-model /path/to/gemma4-assistant-draft]
+          mlx-vlm-swift load-gemma4-assistant-draft --model /path/to/gemma4-assistant-draft
+          mlx-vlm-swift smoke-gemma4-assistant-draft --model /path/to/gemma4-assistant-draft [--draft-block-size 4]
+          mlx-vlm-swift load-gemma4-mtp-target-text --model /path/to/gemma4-target
+          mlx-vlm-swift smoke-gemma4-mtp-target-text --model /path/to/gemma4-target [--tokens 2,106,107]
+          mlx-vlm-swift inspect-gemma4-mtp-target-adapter
+          mlx-vlm-swift smoke-gemma4-mtp-target-adapter
+          mlx-vlm-swift inspect-mtp-round-plan --draft-tokens 10,11,12 --target-tokens 10,99,98,97 [--emitted 1] [--max-tokens 8] [--draft-block-size 4] [--position 42] [--shared-kv-length 46]
+          mlx-vlm-swift inspect-mtp-session --first-bonus 9 --draft-round 10,11,12 --target-round 10,99,98,97 [--draft-round ... --target-round ...] [--max-tokens 8] [--draft-block-size 4] [--position 42]
           mlx-vlm-swift inspect-ollama-show --model /path/to/mlx-model
           mlx-vlm-swift preflight-ollama-show --json '{"model":"m","verbose":true}'
           mlx-vlm-swift validate-model --model /path/to/mlx-model
@@ -5221,6 +5321,195 @@ enum SelfTest {
                 $0.path.hasSuffix("/snapshots/abc123") &&
                 $0.created >= 0
         })
+
+        let gemma4Target = root.appendingPathComponent("gemma4-target")
+        try FileManager.default.createDirectory(at: gemma4Target, withIntermediateDirectories: true)
+        try Data("""
+        {
+          "model_type": "gemma4",
+          "architectures": ["Gemma4ForConditionalGeneration"],
+          "vocab_size": 262144,
+          "hidden_size": 2560,
+          "text_config": {
+            "model_type": "gemma4_text",
+            "hidden_size": 2560,
+            "num_hidden_layers": 10,
+            "num_kv_shared_layers": 4,
+            "sliding_window_pattern": 5,
+            "layer_types": [
+              "sliding_attention",
+              "sliding_attention",
+              "sliding_attention",
+              "sliding_attention",
+              "full_attention",
+              "sliding_attention",
+              "sliding_attention",
+              "sliding_attention",
+              "sliding_attention",
+              "full_attention"
+            ]
+          },
+          "vision_config": {
+            "model_type": "gemma4_vision"
+          }
+        }
+        """.utf8).write(to: gemma4Target.appendingPathComponent("config.json"))
+        let gemma4Draft = root.appendingPathComponent("gemma4-assistant")
+        try FileManager.default.createDirectory(at: gemma4Draft, withIntermediateDirectories: true)
+        try Data("""
+        {
+          "model_type": "gemma4_assistant",
+          "architectures": ["Gemma4AssistantForCausalLM"],
+          "backbone_hidden_size": 2560,
+          "block_size": 4,
+          "text_config": {
+            "model_type": "gemma4_assistant_text",
+            "hidden_size": 256,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "vocab_size": 262144,
+            "sliding_window": 512,
+            "tie_word_embeddings": true
+          }
+        }
+        """.utf8).write(to: gemma4Draft.appendingPathComponent("config.json"))
+        let gemma4TargetDescriptor = try ModelStore().loadDescriptor(pathOrIdentifier: gemma4Target.path)
+        let gemma4DraftDescriptor = try ModelStore().loadDescriptor(pathOrIdentifier: gemma4Draft.path)
+        let gemma4MTPPlan = Gemma4MTPTargetPlanner().plan(
+            targetDescriptor: gemma4TargetDescriptor,
+            draftDescriptor: gemma4DraftDescriptor
+        )
+        precondition(gemma4MTPPlan.isGemma4Target)
+        precondition(gemma4MTPPlan.isGemma4AssistantDraft)
+        precondition(gemma4MTPPlan.hiddenSizeMatches)
+        precondition(gemma4MTPPlan.requiredSharedLayerTypes == ["full_attention", "sliding_attention"])
+        precondition(gemma4MTPPlan.kvProducerLayers.contains {
+            $0.layerType == "full_attention" && $0.producerLayerIndex == 4
+        })
+        precondition(gemma4MTPPlan.kvProducerLayers.contains {
+            $0.layerType == "sliding_attention" && $0.producerLayerIndex == 5
+        })
+        precondition(gemma4MTPPlan.metadataReady)
+
+        let mtpAllAccepted = SpeculativeDecoding.walk(
+            draftTokens: [10, 11, 12],
+            targetTokens: [10, 11, 12, 13],
+            budget: 4
+        )
+        precondition(mtpAllAccepted.acceptedCount == 3)
+        precondition(mtpAllAccepted.newTokens == [10, 11, 12, 13])
+        let mtpMismatch = SpeculativeDecoding.walk(
+            draftTokens: [20, 21, 22],
+            targetTokens: [20, 99, 88, 77],
+            budget: 4
+        )
+        precondition(mtpMismatch.acceptedCount == 1)
+        precondition(mtpMismatch.newTokens == [20, 99])
+        let mtpBudgeted = SpeculativeDecoding.walk(
+            draftTokens: [30, 31, 32],
+            targetTokens: [30, 31, 99, 100],
+            budget: 2
+        )
+        precondition(mtpBudgeted.acceptedCount == 2)
+        precondition(mtpBudgeted.newTokens == [30, 31])
+        let mtpBatch = SpeculativeDecoding.walkBatch(
+            draftTokens: [[1, 2], [3, 4]],
+            targetTokens: [[1, 9, 8], [3, 4, 5]],
+            budgets: [4, 2]
+        )
+        precondition(mtpBatch == [
+            SpeculativeWalkResult(acceptedCount: 1, newTokens: [1, 9]),
+            SpeculativeWalkResult(acceptedCount: 2, newTokens: [3, 4])
+        ])
+        let mtpRound = SpeculativeDecoding.mtpRoundPlan(
+            draftTokens: [10, 11, 12, 13, 14],
+            targetTokens: [10, 11, 99, 98, 97, 96],
+            emittedBeforeRound: 1,
+            maxTokens: 8,
+            blockSize: 6,
+            positionBeforeRound: 42,
+            sharedKVSequenceLength: 48
+        )
+        precondition(mtpRound.walk.acceptedCount == 2)
+        precondition(mtpRound.walk.newTokens == [10, 11, 99])
+        precondition(mtpRound.emittedAfterRound == 4)
+        precondition(mtpRound.positionAfterRound == 45)
+        precondition(mtpRound.hiddenSlotIndex == 2)
+        precondition(mtpRound.rejectedTokenCount == 3)
+        precondition(mtpRound.rollbackRequired)
+        precondition(mtpRound.sharedKVValidLength == 45)
+        precondition(mtpRound.nextBonusToken == 99)
+        precondition(!mtpRound.finished)
+        let mtpBatchRound = SpeculativeDecoding.mtpBatchRoundPlan(
+            draftTokens: [[1, 2, 3], [4, 5, 6]],
+            targetTokens: [[1, 9, 8, 7], [4, 5, 6, 10]],
+            emittedBeforeRound: [1, 3],
+            maxTokens: 6,
+            blockSize: 4,
+            positionsBeforeRound: [20, 30],
+            sharedKVSequenceLength: 34,
+            activeRowIndexes: [7, 8]
+        )
+        precondition(mtpBatchRound.rows.map(\.walk.acceptedCount) == [1, 3])
+        precondition(mtpBatchRound.rows[0].positionAfterRound == 22)
+        precondition(mtpBatchRound.rows[1].positionAfterRound == 34)
+        precondition(mtpBatchRound.maxAcceptedCount == 3)
+        precondition(mtpBatchRound.globalRejectedTokenCount == 0)
+        precondition(!mtpBatchRound.rollbackRequired)
+        precondition(mtpBatchRound.activeRowIndexesAfterRound == [7])
+        var mtpSession = MTPSpeculativeSession(
+            firstBonusToken: 9,
+            maxTokens: 6,
+            draftBlockSize: 4,
+            initialPosition: 40
+        )
+        let mtpSessionRound0 = mtpSession.nextRound(
+            draftTokens: [10, 11, 12],
+            targetTokens: [10, 99, 98, 97]
+        )
+        precondition(mtpSessionRound0?.inputBonusToken == 9)
+        precondition(mtpSessionRound0?.emittedTokens == [10, 99])
+        precondition(mtpSession.bonusToken == 99)
+        precondition(mtpSession.emittedTokenCount == 3)
+        precondition(mtpSession.position == 42)
+        precondition(mtpSession.sharedKVSequenceLength == 42)
+        let mtpSessionRound1 = mtpSession.nextRound(
+            draftTokens: [100, 101, 102],
+            targetTokens: [100, 101, 102, 103]
+        )
+        precondition(mtpSessionRound1?.emittedTokens == [100, 101, 102])
+        precondition(mtpSession.finished)
+        precondition(mtpSession.bonusToken == 102)
+        var mtpBatchSession = MTPBatchSpeculativeSession(
+            firstBonusTokens: [7, 8],
+            maxTokens: 6,
+            draftBlockSize: 4,
+            initialPositions: [20, 30]
+        )
+        let mtpBatchSessionRound0 = mtpBatchSession.nextRound(
+            draftTokens: [[1, 2, 3], [4, 5, 6]],
+            targetTokens: [[1, 9, 8, 7], [4, 5, 6, 10]],
+            eosTokenIDs: [9]
+        )
+        precondition(mtpBatchSessionRound0?.inputBonusTokens == [7, 8])
+        precondition(mtpBatchSessionRound0?.emittedTokenColumns == [[1, 4], [9, 5], [nil, 6], [nil, 10]])
+        precondition(mtpBatchSession.finished == [true, false])
+        precondition(mtpBatchSession.activeRowIndexes == [1])
+        precondition(mtpBatchSession.bonusTokens == [9, 10])
+        let mtpTargetAdapter = Gemma4MTPTargetRuntime.adapterReport
+        if mtpTargetAdapter.targetAdapterCompiled {
+            precondition(mtpTargetAdapter.supportsHiddenSlotSelection)
+            precondition(mtpTargetAdapter.supportsSharedKVSnapshot)
+            precondition(mtpTargetAdapter.supportsScalarCacheRollback)
+            precondition(mtpTargetAdapter.supportsDraftBinding)
+        } else {
+            precondition(mtpTargetAdapter.missingRuntimeHooks.contains {
+                $0.contains("MLXVLM_ENABLE_GEMMA4_ASSISTANT_RUNTIME=1")
+            })
+            precondition(!Gemma4MTPTargetRuntime.smokeAdapterReport().passed)
+        }
 
         print("self-test passed")
     }

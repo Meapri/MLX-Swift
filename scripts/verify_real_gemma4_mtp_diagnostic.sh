@@ -46,6 +46,7 @@ cd "$BUILD_DIR"
 export MLXVLM_ENABLE_MLX_BACKEND=1
 export MLXVLM_ENABLE_TOKENIZER_INTEGRATIONS=1
 export MLXVLM_ENABLE_REAL_MLX_API=1
+export MLXVLM_ENABLE_GEMMA4_ASSISTANT_RUNTIME=1
 export CLANG_MODULE_CACHE_PATH="$BUILD_DIR/.build/clang-module-cache"
 
 swift build --disable-sandbox --jobs "$SWIFT_BUILD_JOBS" --scratch-path "$SCRATCH_DIR" --product mlx-vlm-swift
@@ -61,6 +62,89 @@ echo "$PLAN" | grep -q '"missingTensorKeys" : \['
 echo "$PLAN" | grep -q '"unexpectedCriticalTensorKeys" : \['
 echo "$PLAN" | grep -q '"nativeSwiftMTPReady" : false'
 echo "$PLAN" | grep -q 'target Gemma4 prefill must return the last pre-norm hidden state'
+
+TARGET_PLAN="$("$BIN" inspect-gemma4-mtp-target-plan --model "$MODEL" --draft-model "$DRAFT_MODEL")"
+echo "$TARGET_PLAN" | grep -q '"targetModelType" : "gemma4"'
+echo "$TARGET_PLAN" | grep -q '"draftModelType" : "gemma4_assistant"'
+echo "$TARGET_PLAN" | grep -q '"isGemma4Target" : true'
+echo "$TARGET_PLAN" | grep -q '"isGemma4AssistantDraft" : true'
+echo "$TARGET_PLAN" | grep -q '"hiddenSizeMatches" : true'
+echo "$TARGET_PLAN" | grep -q '"targetHiddenSize" : 2560'
+echo "$TARGET_PLAN" | grep -q '"draftBackboneHiddenSize" : 2560'
+echo "$TARGET_PLAN" | grep -q '"firstKVSharedLayerIndex" : 24'
+echo "$TARGET_PLAN" | grep -q '"targetKVSharedLayerCount" : 18'
+echo "$TARGET_PLAN" | grep -q '"producerLayerIndex" : 23'
+echo "$TARGET_PLAN" | grep -q '"producerLayerIndex" : 22'
+echo "$TARGET_PLAN" | grep -q 'target forward must export K\\\/V pairs from the latest non-shared producer layer'
+
+LOAD="$("$BIN" load-gemma4-assistant-draft --model "$DRAFT_MODEL")"
+echo "$LOAD" | grep -q '"assistantRuntimeCompiled" : true'
+echo "$LOAD" | grep -q '"realMLXAPIImplementationCompiled" : true'
+echo "$LOAD" | grep -q '"rawModelType" : "gemma4_assistant"'
+echo "$LOAD" | grep -q '"loadedTensorCount" : 50'
+
+SMOKE="$("$BIN" smoke-gemma4-assistant-draft --model "$DRAFT_MODEL" --draft-block-size 4)"
+echo "$SMOKE" | grep -q '"assistantRuntimeCompiled" : true'
+echo "$SMOKE" | grep -q '"realMLXAPIImplementationCompiled" : true'
+echo "$SMOKE" | grep -q '"loadedTensorCount" : 50'
+echo "$SMOKE" | grep -q '"outputDType" : "int32"'
+echo "$SMOKE" | grep -A3 '"outputShape" : \[' | grep -q '1,'
+echo "$SMOKE" | grep -A3 '"outputShape" : \[' | grep -q '3'
+
+TARGET_TEXT_LOAD="$("$BIN" load-gemma4-mtp-target-text --model "$MODEL")"
+echo "$TARGET_TEXT_LOAD" | grep -q '"targetTextRuntimeCompiled" : true'
+echo "$TARGET_TEXT_LOAD" | grep -q '"loaded" : true'
+echo "$TARGET_TEXT_LOAD" | grep -q '"quantized" : true'
+echo "$TARGET_TEXT_LOAD" | grep -q '"hiddenSize" : 2560'
+echo "$TARGET_TEXT_LOAD" | grep -q '"hiddenLayers" : 42'
+echo "$TARGET_TEXT_LOAD" | grep -q '"kvSharedLayers" : 18'
+echo "$TARGET_TEXT_LOAD" | grep -q '"firstKVSharedLayerIndex" : 24'
+
+TARGET_TEXT_SMOKE="$("$BIN" smoke-gemma4-mtp-target-text --model "$MODEL" --tokens 2,106)"
+echo "$TARGET_TEXT_SMOKE" | grep -q '"targetTextRuntimeCompiled" : true'
+echo "$TARGET_TEXT_SMOKE" | grep -q '"passed" : true'
+echo "$TARGET_TEXT_SMOKE" | grep -q '"full_attention"'
+echo "$TARGET_TEXT_SMOKE" | grep -q '"sliding_attention"'
+echo "$TARGET_TEXT_SMOKE" | grep -A5 '"hiddenShape" : \[' | grep -q '2560'
+
+TARGET_ADAPTER="$("$BIN" inspect-gemma4-mtp-target-adapter)"
+echo "$TARGET_ADAPTER" | grep -q '"targetAdapterCompiled" : true'
+echo "$TARGET_ADAPTER" | grep -q '"supportsHiddenSlotSelection" : true'
+echo "$TARGET_ADAPTER" | grep -q '"supportsSharedKVSnapshot" : true'
+echo "$TARGET_ADAPTER" | grep -q '"supportsScalarCacheRollback" : true'
+echo "$TARGET_ADAPTER" | grep -q '"supportsDraftBinding" : true'
+echo "$TARGET_ADAPTER" | grep -q 'route requests through the Swift target text runtime'
+
+TARGET_ADAPTER_SMOKE="$("$BIN" smoke-gemma4-mtp-target-adapter)"
+echo "$TARGET_ADAPTER_SMOKE" | grep -q '"targetAdapterCompiled" : true'
+echo "$TARGET_ADAPTER_SMOKE" | grep -q '"passed" : true'
+echo "$TARGET_ADAPTER_SMOKE" | grep -q '"cacheOffsetBeforeRollback" : 6'
+echo "$TARGET_ADAPTER_SMOKE" | grep -q '"cacheOffsetAfterRollback" : 4'
+echo "$TARGET_ADAPTER_SMOKE" | grep -q '"trimmedCacheTokenCount" : 2'
+echo "$TARGET_ADAPTER_SMOKE" | grep -q '"fullAttentionKVLength" : 4'
+echo "$TARGET_ADAPTER_SMOKE" | grep -q '"slidingAttentionKVLength" : 4'
+echo "$TARGET_ADAPTER_SMOKE" | grep -A4 '"hiddenShape" : \[' | grep -q '1,'
+echo "$TARGET_ADAPTER_SMOKE" | grep -A4 '"hiddenShape" : \[' | grep -q '8'
+
+ROUND_PLAN="$("$BIN" inspect-mtp-round-plan --draft-tokens 10,11,12 --target-tokens 10,99,98,97 --emitted 1 --max-tokens 8 --draft-block-size 4 --position 42 --shared-kv-length 46)"
+echo "$ROUND_PLAN" | grep -q '"acceptedCount" : 1'
+echo "$ROUND_PLAN" | grep -q '"newTokens" : \['
+echo "$ROUND_PLAN" | grep -q '10,'
+echo "$ROUND_PLAN" | grep -q '99'
+echo "$ROUND_PLAN" | grep -q '"hiddenSlotIndex" : 1'
+echo "$ROUND_PLAN" | grep -q '"positionAfterRound" : 44'
+echo "$ROUND_PLAN" | grep -q '"rollbackRequired" : true'
+echo "$ROUND_PLAN" | grep -q '"rejectedTokenCount" : 2'
+echo "$ROUND_PLAN" | grep -q '"sharedKVValidLength" : 44'
+
+SESSION_PLAN="$("$BIN" inspect-mtp-session --first-bonus 9 --draft-round 10,11,12 --target-round 10,99,98,97 --draft-round 100,101,102 --target-round 100,101,102,103 --max-tokens 6 --draft-block-size 4 --position 40)"
+echo "$SESSION_PLAN" | grep -q '"inputBonusToken" : 9'
+echo "$SESSION_PLAN" | grep -q '"inputBonusToken" : 99'
+echo "$SESSION_PLAN" | grep -q '"roundIndex" : 2'
+echo "$SESSION_PLAN" | grep -q '"bonusToken" : 102'
+echo "$SESSION_PLAN" | grep -q '"emittedTokenCount" : 6'
+echo "$SESSION_PLAN" | grep -q '"finished" : true'
+echo "$SESSION_PLAN" | grep -q '"sharedKVSequenceLength" : 46'
 
 "$BIN" serve \
   --model "$MODEL" \
@@ -95,6 +179,9 @@ RESPONSE="$(
 )"
 
 echo "$RESPONSE" | grep -q 'HTTP/1.1 500 Internal Server Error'
-echo "$RESPONSE" | grep -q 'gemma4_assistant'
-echo "$RESPONSE" | grep -q 'Gemma4AssistantForCausalLM'
-echo "$RESPONSE" | grep -q 'native Swift Gemma4Assistant draft-model support is required'
+echo "$RESPONSE" | grep -q 'Gemma4 MTP assistant architecture'
+echo "$RESPONSE" | grep -q 'Native Swift Gemma4Assistant loading now succeeds'
+echo "$RESPONSE" | grep -q 'MTP accept.*rollback session loop has been ported into Swift Core'
+echo "$RESPONSE" | grep -q 'Swift target adapter contract is compiled'
+echo "$RESPONSE" | grep -q 'Swift Gemma4 target text runtime now exports pre-norm hidden states plus shared K\\\/V'
+echo "$RESPONSE" | grep -q 'still needs to route --draft-kind mtp requests'

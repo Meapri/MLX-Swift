@@ -27,6 +27,25 @@ MLXVLM_ENABLE_TOKENIZER_INTEGRATIONS=1 \
 swift build --disable-sandbox --jobs 18
 ```
 
+To compile the native Gemma4 MTP assistant loader/smoke path as well, add:
+
+```bash
+MLXVLM_ENABLE_GEMMA4_ASSISTANT_RUNTIME=1
+```
+
+The Gemma4 MTP helper commands now cover the native assistant load/smoke path, the Swift target text verifier load/smoke path, and the Swift port of Python `mlx-vlm`'s MTP accept/rollback round state:
+
+```bash
+.build/debug/mlx-vlm-swift load-gemma4-assistant-draft --model /path/to/gemma4-assistant
+.build/debug/mlx-vlm-swift smoke-gemma4-assistant-draft --model /path/to/gemma4-assistant --draft-block-size 4
+.build/debug/mlx-vlm-swift inspect-gemma4-mtp-target-plan --model /path/to/gemma4-target --draft-model /path/to/gemma4-assistant
+.build/debug/mlx-vlm-swift load-gemma4-mtp-target-text --model /path/to/gemma4-target
+.build/debug/mlx-vlm-swift smoke-gemma4-mtp-target-text --model /path/to/gemma4-target --tokens 2,106
+.build/debug/mlx-vlm-swift inspect-gemma4-mtp-target-adapter
+.build/debug/mlx-vlm-swift smoke-gemma4-mtp-target-adapter
+.build/debug/mlx-vlm-swift inspect-mtp-session --first-bonus 9 --draft-round 10,11,12 --target-round 10,99,98,97
+```
+
 ## Run
 
 Inspect a local MLX model directory:
