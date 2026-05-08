@@ -4336,6 +4336,26 @@ enum SelfTest {
         precondition(finiteSchemaPlan.schemaConstraints?.deterministicLiteral == "{\"answer\":\"\",\"confidence\":\"low\"}")
         precondition(finiteSchemaPlan.schemaConstraints?.grammarPlan?.finiteTokenDFAAlternativeCount == 2)
         precondition(finiteSchemaPlan.schemaConstraints?.grammarPlan?.canCompileFiniteTokenDFA == true)
+        precondition(finiteSchemaPlan.schemaConstraints?.grammarPlan?.openStringPaths == ["$.answer"])
+        precondition(finiteSchemaPlan.schemaConstraints?.grammarPlan?.openNumberPaths == [])
+        precondition(finiteSchemaPlan.schemaConstraints?.grammarPlan?.finiteTokenDFAUsesScalarDefaults == true)
+        precondition(finiteSchemaPlan.schemaConstraints?.grammarPlan?.canCompileOpenScalarGrammar == true)
+        precondition(finiteSchemaPlan.schemaConstraints?.grammarPlan?.requiresTokenizerPrefixFiltering == true)
+        let numberSchemaMetadata = GenerationRequestMetadata(responseFormat: .object([
+            "type": .string("json_schema"),
+            "schema": .object([
+                "type": .string("object"),
+                "required": .array([.string("score")]),
+                "properties": .object([
+                    "score": .object(["type": .string("number")]),
+                ]),
+                "additionalProperties": .bool(false),
+            ]),
+        ]))
+        let numberSchemaPlan = ResponseFormatPlanner().plan(metadata: numberSchemaMetadata, stream: false)
+        precondition(numberSchemaPlan.schemaConstraints?.grammarPlan?.openStringPaths == [])
+        precondition(numberSchemaPlan.schemaConstraints?.grammarPlan?.openNumberPaths == ["$.score"])
+        precondition(numberSchemaPlan.schemaConstraints?.grammarPlan?.canCompileOpenScalarGrammar == true)
         let responsesToolCallPlan = ToolCallPlanner().plan(
             metadata: normalizedResponses.metadata,
             descriptor: descriptor

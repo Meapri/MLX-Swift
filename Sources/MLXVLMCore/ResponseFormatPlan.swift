@@ -99,10 +99,15 @@ public struct JSONSchemaGrammarPlan: Codable, Equatable, Sendable {
     public let constrainedObjectPaths: [String]
     public let enumLiteralPaths: [String]
     public let additionalPropertiesFalsePaths: [String]
+    public let openStringPaths: [String]
+    public let openNumberPaths: [String]
     public let finiteTokenDFAAlternativeCount: Int
     public let canCompileFiniteTokenDFA: Bool
+    public let finiteTokenDFAUsesScalarDefaults: Bool
     public let unsupportedReasons: [String]
     public let canCompileStructuralGrammar: Bool
+    public let canCompileOpenScalarGrammar: Bool
+    public let requiresTokenizerPrefixFiltering: Bool
     public let requiresBackendTokenDFA: Bool
 
     public init(
@@ -118,10 +123,15 @@ public struct JSONSchemaGrammarPlan: Codable, Equatable, Sendable {
         constrainedObjectPaths: [String],
         enumLiteralPaths: [String],
         additionalPropertiesFalsePaths: [String],
+        openStringPaths: [String],
+        openNumberPaths: [String],
         finiteTokenDFAAlternativeCount: Int,
         canCompileFiniteTokenDFA: Bool,
+        finiteTokenDFAUsesScalarDefaults: Bool,
         unsupportedReasons: [String],
         canCompileStructuralGrammar: Bool,
+        canCompileOpenScalarGrammar: Bool,
+        requiresTokenizerPrefixFiltering: Bool,
         requiresBackendTokenDFA: Bool
     ) {
         self.rootSymbol = rootSymbol
@@ -136,10 +146,15 @@ public struct JSONSchemaGrammarPlan: Codable, Equatable, Sendable {
         self.constrainedObjectPaths = constrainedObjectPaths
         self.enumLiteralPaths = enumLiteralPaths
         self.additionalPropertiesFalsePaths = additionalPropertiesFalsePaths
+        self.openStringPaths = openStringPaths
+        self.openNumberPaths = openNumberPaths
         self.finiteTokenDFAAlternativeCount = finiteTokenDFAAlternativeCount
         self.canCompileFiniteTokenDFA = canCompileFiniteTokenDFA
+        self.finiteTokenDFAUsesScalarDefaults = finiteTokenDFAUsesScalarDefaults
         self.unsupportedReasons = unsupportedReasons
         self.canCompileStructuralGrammar = canCompileStructuralGrammar
+        self.canCompileOpenScalarGrammar = canCompileOpenScalarGrammar
+        self.requiresTokenizerPrefixFiltering = requiresTokenizerPrefixFiltering
         self.requiresBackendTokenDFA = requiresBackendTokenDFA
     }
 }
@@ -620,6 +635,8 @@ public struct JSONSchemaGrammarPlanner {
         var constrainedObjectPaths: Set<String> = []
         var enumLiteralPaths: Set<String> = []
         var additionalPropertiesFalsePaths: Set<String> = []
+        var openStringPaths: Set<String> = []
+        var openNumberPaths: Set<String> = []
         var unsupportedReasons: Set<String> = []
     }
 
@@ -632,6 +649,7 @@ public struct JSONSchemaGrammarPlanner {
         var accumulator = Accumulator()
         walk(object, path: "$", depth: 0, accumulator: &accumulator)
         let finiteAlternatives = JSONSchemaFiniteLiteralBuilder(maxAlternatives: 128).literals(schema: .object(object)) ?? []
+        let hasOpenScalars = !accumulator.openStringPaths.isEmpty || !accumulator.openNumberPaths.isEmpty
         let rootTypes = types(from: object)
         let rootSymbol: String
         if rootTypes.contains("object") || object["properties"] != nil {
@@ -657,10 +675,15 @@ public struct JSONSchemaGrammarPlanner {
             constrainedObjectPaths: Array(accumulator.constrainedObjectPaths).sorted(),
             enumLiteralPaths: Array(accumulator.enumLiteralPaths).sorted(),
             additionalPropertiesFalsePaths: Array(accumulator.additionalPropertiesFalsePaths).sorted(),
+            openStringPaths: Array(accumulator.openStringPaths).sorted(),
+            openNumberPaths: Array(accumulator.openNumberPaths).sorted(),
             finiteTokenDFAAlternativeCount: finiteAlternatives.count,
             canCompileFiniteTokenDFA: !finiteAlternatives.isEmpty,
+            finiteTokenDFAUsesScalarDefaults: hasOpenScalars && !finiteAlternatives.isEmpty,
             unsupportedReasons: Array(accumulator.unsupportedReasons).sorted(),
             canCompileStructuralGrammar: accumulator.unsupportedReasons.isEmpty,
+            canCompileOpenScalarGrammar: accumulator.unsupportedReasons.isEmpty && hasOpenScalars,
+            requiresTokenizerPrefixFiltering: hasOpenScalars,
             requiresBackendTokenDFA: true
         )
     }
@@ -691,8 +714,14 @@ public struct JSONSchemaGrammarPlanner {
                 accumulator.constrainedArrayPaths.insert(path)
             case "string":
                 accumulator.constrainedStringPaths.insert(path)
+                if isOpenScalar(object) {
+                    accumulator.openStringPaths.insert(path)
+                }
             case "integer", "number":
                 accumulator.constrainedNumberPaths.insert(path)
+                if isOpenScalar(object) {
+                    accumulator.openNumberPaths.insert(path)
+                }
             case "boolean":
                 accumulator.constrainedBooleanPaths.insert(path)
             case "null":
@@ -719,6 +748,10 @@ public struct JSONSchemaGrammarPlanner {
         } else if currentTypes.contains("array") {
             accumulator.unsupportedReasons.insert("\(path) array schema is missing an object items schema.")
         }
+    }
+
+    private func isOpenScalar(_ object: [String: JSONValue]) -> Bool {
+        object["const"] == nil && object["enum"] == nil && object["default"] == nil
     }
 
     private func types(from object: [String: JSONValue]) -> [String] {
