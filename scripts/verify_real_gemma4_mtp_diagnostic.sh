@@ -51,6 +51,17 @@ export CLANG_MODULE_CACHE_PATH="$BUILD_DIR/.build/clang-module-cache"
 swift build --disable-sandbox --jobs "$SWIFT_BUILD_JOBS" --scratch-path "$SCRATCH_DIR" --product mlx-vlm-swift
 BIN="$SCRATCH_DIR/arm64-apple-macosx/debug/mlx-vlm-swift"
 
+PLAN="$("$BIN" inspect-gemma4-assistant-draft-plan --model "$DRAFT_MODEL")"
+echo "$PLAN" | grep -q '"modelType" : "gemma4_assistant"'
+echo "$PLAN" | grep -q '"requiredDraftKind" : "mtp"'
+echo "$PLAN" | grep -q '"draftLayerCount" : 4'
+echo "$PLAN" | grep -q '"backboneHiddenSize" : 2560'
+echo "$PLAN" | grep -q '"useOrderedEmbeddings" : true'
+echo "$PLAN" | grep -q '"missingTensorKeys" : \['
+echo "$PLAN" | grep -q '"unexpectedCriticalTensorKeys" : \['
+echo "$PLAN" | grep -q '"nativeSwiftMTPReady" : false'
+echo "$PLAN" | grep -q 'target Gemma4 prefill must return the last pre-norm hidden state'
+
 "$BIN" serve \
   --model "$MODEL" \
   --draft-model "$DRAFT_MODEL" \

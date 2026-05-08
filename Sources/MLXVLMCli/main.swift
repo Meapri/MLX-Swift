@@ -58,6 +58,11 @@ struct MLXVLMCli {
             let config = try QwenVLModelConfig.load(fromModelDirectory: descriptor.path)
             let weightCatalog = WeightCatalogBuilder().catalog(for: descriptor)
             printJSON(QwenVLArchitecturePlanner().plan(config: config, weightCatalog: weightCatalog))
+        case "inspect-gemma4-assistant-draft-plan":
+            let path = try value(for: "--model", in: arguments)
+            let descriptor = try ModelStore().loadDescriptor(pathOrIdentifier: path)
+            let weightCatalog = WeightCatalogBuilder().catalog(for: descriptor)
+            printJSON(Gemma4AssistantDraftPlanner().plan(descriptor: descriptor, weightCatalog: weightCatalog))
         case "inspect-weight-catalog":
             let path = try value(for: "--model", in: arguments)
             let descriptor = try ModelStore().loadDescriptor(pathOrIdentifier: path)
@@ -922,6 +927,7 @@ struct MLXVLMCli {
           mlx-vlm-swift inspect-mlx-model-factory-bridge --model /path/to/mlx-model
           mlx-vlm-swift inspect-mlx-pipeline --model /path/to/mlx-model --api openai-chat --json '{"model":"m","messages":[...]}' [--max-tensors 16] [--max-total-bytes 67108864] [--skip-weight-payloads]
           mlx-vlm-swift inspect-backend-context --model /path/to/mlx-model
+          mlx-vlm-swift inspect-gemma4-assistant-draft-plan --model /path/to/gemma4-assistant-draft
           mlx-vlm-swift inspect-ollama-show --model /path/to/mlx-model
           mlx-vlm-swift preflight-ollama-show --json '{"model":"m","verbose":true}'
           mlx-vlm-swift validate-model --model /path/to/mlx-model
