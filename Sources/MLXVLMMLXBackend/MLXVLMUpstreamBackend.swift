@@ -556,6 +556,17 @@ struct MLXVLMStructuredLogitProcessorFactory {
         }
         let tokenizer = await container.tokenizer
         let guidance = JSONSchemaGuidance(responseFormat: request.metadata.responseFormat)
+        if let tokenSequences = guidance.finiteDFATokenSequences(tokenizer: tokenizer),
+           tokenSequences.count > 1
+        {
+            return CompositeLogitProcessor(
+                first: parameters.processor(),
+                second: JSONTokenTrieProcessor(
+                    tokenSequences: tokenSequences,
+                    terminalTokenID: tokenizer.eosTokenId
+                )
+            )
+        }
         if let literal = guidance.forcedJSONLiteral(),
            let forcedTokenIDs = guidance.forcedLiteralTokenIDs(tokenizer: tokenizer, literal: literal),
            !forcedTokenIDs.isEmpty
@@ -649,6 +660,25 @@ struct JSONSchemaGuidance {
               let literal = JSONSchemaDeterministicValueBuilder().literal(schema: .object(schema))
         else { return nil }
         return literal
+    }
+
+    func finiteDFATokenSequences(tokenizer: Tokenizer) -> [[Int]]? {
+        guard let schema,
+              let literals = JSONSchemaFiniteLiteralBuilder(maxAlternatives: 128).literals(schema: .object(schema))
+        else { return nil }
+
+        var seen: Set<[Int]> = []
+        let sequences = literals.compactMap { literal -> [Int]? in
+            let tokenIDs = tokenizer.encode(text: literal, addSpecialTokens: false)
+            guard !tokenIDs.isEmpty,
+                  tokenizer.decode(tokenIds: tokenIDs, skipSpecialTokens: true) == literal,
+                  seen.insert(tokenIDs).inserted
+            else {
+                return nil
+            }
+            return tokenIDs
+        }
+        return sequences.isEmpty ? nil : sequences
     }
 
     func forcedLiteralTokenIDs(tokenizer: Tokenizer, literal: String) -> [Int]? {
@@ -817,6 +847,72 @@ struct JSONPrefixTokenProcessor: LogitProcessor {
 
     mutating func didSample(token: MLXArray) {
         generatedTokenCount += token.size
+    }
+}
+
+private final class JSONTokenTrieNode {
+    var children: [Int: JSONTokenTrieNode] = [:]
+    var terminal = false
+}
+
+struct JSONTokenTrieProcessor: LogitProcessor {
+    private let root: JSONTokenTrieNode
+    private let terminalTokenID: Int?
+    private var current: JSONTokenTrieNode?
+
+    init(tokenSequences: [[Int]], terminalTokenID: Int?) {
+        let root = JSONTokenTrieNode()
+        for sequence in tokenSequences where !sequence.isEmpty {
+            var node = root
+            for tokenID in sequence {
+                if let child = node.children[tokenID] {
+                    node = child
+                } else {
+                    let child = JSONTokenTrieNode()
+                    node.children[tokenID] = child
+                    node = child
+                }
+            }
+            node.terminal = true
+        }
+        self.root = root
+        self.terminalTokenID = terminalTokenID
+        self.current = root
+    }
+
+    mutating func prompt(_ prompt: MLXArray) {}
+
+    func process(logits: MLXArray) -> MLXArray {
+        guard let current else {
+            return logits
+        }
+        var allowedTokenIDs = Array(current.children.keys)
+        if current.terminal, let terminalTokenID {
+            allowedTokenIDs.append(terminalTokenID)
+        }
+        guard !allowedTokenIDs.isEmpty else {
+            return logits
+        }
+        let masked = MLXArray.zeros(logits.shape, dtype: logits.dtype) + MLXArray(-Float.infinity)
+        let indices = MLXArray(allowedTokenIDs).asType(.uint32)
+        masked[0..., indices] = logits[0..., indices]
+        return masked
+    }
+
+    mutating func didSample(token: MLXArray) {
+        guard let tokenID = token.asArray(Int.self).last,
+              let current
+        else {
+            self.current = nil
+            return
+        }
+        if let next = current.children[tokenID] {
+            self.current = next
+        } else if current.terminal, tokenID == terminalTokenID {
+            self.current = nil
+        } else {
+            self.current = nil
+        }
     }
 }
 

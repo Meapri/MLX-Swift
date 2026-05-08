@@ -99,6 +99,8 @@ public struct JSONSchemaGrammarPlan: Codable, Equatable, Sendable {
     public let constrainedObjectPaths: [String]
     public let enumLiteralPaths: [String]
     public let additionalPropertiesFalsePaths: [String]
+    public let finiteTokenDFAAlternativeCount: Int
+    public let canCompileFiniteTokenDFA: Bool
     public let unsupportedReasons: [String]
     public let canCompileStructuralGrammar: Bool
     public let requiresBackendTokenDFA: Bool
@@ -116,6 +118,8 @@ public struct JSONSchemaGrammarPlan: Codable, Equatable, Sendable {
         constrainedObjectPaths: [String],
         enumLiteralPaths: [String],
         additionalPropertiesFalsePaths: [String],
+        finiteTokenDFAAlternativeCount: Int,
+        canCompileFiniteTokenDFA: Bool,
         unsupportedReasons: [String],
         canCompileStructuralGrammar: Bool,
         requiresBackendTokenDFA: Bool
@@ -132,6 +136,8 @@ public struct JSONSchemaGrammarPlan: Codable, Equatable, Sendable {
         self.constrainedObjectPaths = constrainedObjectPaths
         self.enumLiteralPaths = enumLiteralPaths
         self.additionalPropertiesFalsePaths = additionalPropertiesFalsePaths
+        self.finiteTokenDFAAlternativeCount = finiteTokenDFAAlternativeCount
+        self.canCompileFiniteTokenDFA = canCompileFiniteTokenDFA
         self.unsupportedReasons = unsupportedReasons
         self.canCompileStructuralGrammar = canCompileStructuralGrammar
         self.requiresBackendTokenDFA = requiresBackendTokenDFA
@@ -625,6 +631,7 @@ public struct JSONSchemaGrammarPlanner {
         }
         var accumulator = Accumulator()
         walk(object, path: "$", depth: 0, accumulator: &accumulator)
+        let finiteAlternatives = JSONSchemaFiniteLiteralBuilder(maxAlternatives: 128).literals(schema: .object(object)) ?? []
         let rootTypes = types(from: object)
         let rootSymbol: String
         if rootTypes.contains("object") || object["properties"] != nil {
@@ -650,6 +657,8 @@ public struct JSONSchemaGrammarPlanner {
             constrainedObjectPaths: Array(accumulator.constrainedObjectPaths).sorted(),
             enumLiteralPaths: Array(accumulator.enumLiteralPaths).sorted(),
             additionalPropertiesFalsePaths: Array(accumulator.additionalPropertiesFalsePaths).sorted(),
+            finiteTokenDFAAlternativeCount: finiteAlternatives.count,
+            canCompileFiniteTokenDFA: !finiteAlternatives.isEmpty,
             unsupportedReasons: Array(accumulator.unsupportedReasons).sorted(),
             canCompileStructuralGrammar: accumulator.unsupportedReasons.isEmpty,
             requiresBackendTokenDFA: true
@@ -733,6 +742,153 @@ public struct JSONSchemaGrammarPlanner {
         let properties = object["properties"]?.objectValue ?? [:]
         let optional = properties.keys.filter { !required.contains($0) }.sorted()
         return required + optional
+    }
+}
+
+public struct JSONSchemaFiniteLiteralBuilder: Sendable {
+    private let maxAlternatives: Int
+
+    public init(maxAlternatives: Int = 128) {
+        self.maxAlternatives = max(1, maxAlternatives)
+    }
+
+    public func literals(schema: JSONValue) -> [String]? {
+        values(schema: schema)?.map(JSONSchemaDeterministicValueBuilder.literal)
+    }
+
+    public func values(schema: JSONValue) -> [JSONValue]? {
+        guard let object = schema.objectValue else {
+            return nil
+        }
+        return values(object)
+    }
+
+    private func values(_ schema: [String: JSONValue]) -> [JSONValue]? {
+        if let value = schema["const"] {
+            return [value]
+        }
+        if let values = schema["enum"]?.arrayValue, !values.isEmpty {
+            return capped(unique(values))
+        }
+        if let value = schema["default"] {
+            return [value]
+        }
+
+        let currentTypes = types(from: schema)
+        if currentTypes.contains("object") || schema["properties"] != nil {
+            return objectValues(schema)
+        }
+        if currentTypes.contains("array") || schema["items"] != nil {
+            return arrayValues(schema)
+        }
+        if currentTypes.contains("string") {
+            return JSONSchemaDeterministicValueBuilder().value(schema: .object(schema)).map { [$0] }
+        }
+        if currentTypes.contains("integer") || currentTypes.contains("number") {
+            return JSONSchemaDeterministicValueBuilder().value(schema: .object(schema)).map { [$0] }
+        }
+        if currentTypes.contains("boolean") {
+            return [.bool(false), .bool(true)]
+        }
+        if currentTypes.contains("null") {
+            return [.null]
+        }
+        return nil
+    }
+
+    private func objectValues(_ schema: [String: JSONValue]) -> [JSONValue]? {
+        let required = schema["required"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        let properties = schema["properties"]?.objectValue ?? [:]
+        var keys = required
+        let optionalDefaultKeys = properties.keys
+            .filter { !required.contains($0) }
+            .filter { properties[$0]?.objectValue?["default"] != nil }
+            .sorted()
+        keys.append(contentsOf: optionalDefaultKeys)
+
+        var rows: [[(String, JSONValue)]] = [[]]
+        for key in keys {
+            guard let propertySchema = properties[key]?.objectValue,
+                  let propertyValues = values(propertySchema),
+                  !propertyValues.isEmpty
+            else {
+                return nil
+            }
+            rows = product(rows, key: key, values: propertyValues)
+            if rows.count > maxAlternatives {
+                return nil
+            }
+        }
+        return rows.map { row in
+            var object: [String: JSONValue] = [:]
+            for (key, value) in row {
+                object[key] = value
+            }
+            return .object(object)
+        }
+    }
+
+    private func arrayValues(_ schema: [String: JSONValue]) -> [JSONValue]? {
+        let minItems = max(0, schema["minItems"]?.intValue ?? 0)
+        guard minItems > 0 else {
+            return [.array([])]
+        }
+        guard let itemSchema = schema["items"]?.objectValue,
+              let itemValues = values(itemSchema),
+              !itemValues.isEmpty
+        else {
+            return nil
+        }
+        var arrays: [[JSONValue]] = [[]]
+        for _ in 0..<minItems {
+            arrays = arrays.flatMap { prefix in
+                itemValues.map { prefix + [$0] }
+            }
+            if arrays.count > maxAlternatives {
+                return nil
+            }
+        }
+        return arrays.map(JSONValue.array)
+    }
+
+    private func product(
+        _ rows: [[(String, JSONValue)]],
+        key: String,
+        values: [JSONValue]
+    ) -> [[(String, JSONValue)]] {
+        rows.flatMap { row in
+            values.map { value in
+                row + [(key, value)]
+            }
+        }
+    }
+
+    private func capped(_ values: [JSONValue]) -> [JSONValue]? {
+        values.count <= maxAlternatives ? values : nil
+    }
+
+    private func unique(_ values: [JSONValue]) -> [JSONValue] {
+        var result: [JSONValue] = []
+        for value in values where !result.contains(value) {
+            result.append(value)
+        }
+        return result
+    }
+
+    private func types(from object: [String: JSONValue]) -> [String] {
+        if let type = object["type"]?.stringValue?.lowercased() {
+            return [type]
+        }
+        if let types = object["type"]?.arrayValue?.compactMap({ $0.stringValue?.lowercased() }), !types.isEmpty {
+            return types
+        }
+        if object["properties"] != nil {
+            return ["object"]
+        }
+        if object["items"] != nil {
+            return ["array"]
+        }
+        return []
     }
 }
 

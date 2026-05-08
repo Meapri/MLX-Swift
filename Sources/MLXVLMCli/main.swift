@@ -4317,6 +4317,25 @@ enum SelfTest {
         precondition(responsesResponseFormatPlan.streamFraming == "api-native-stream")
         precondition(responsesResponseFormatPlan.backendMinimumFeatures.contains("json-schema-logits-processor"))
         precondition(!responsesResponseFormatPlan.warnings.isEmpty)
+        let finiteSchemaMetadata = GenerationRequestMetadata(responseFormat: .object([
+            "type": .string("json_schema"),
+            "schema": .object([
+                "type": .string("object"),
+                "required": .array([.string("answer"), .string("confidence")]),
+                "properties": .object([
+                    "answer": .object(["type": .string("string")]),
+                    "confidence": .object([
+                        "type": .string("string"),
+                        "enum": .array([.string("low"), .string("high")]),
+                    ]),
+                ]),
+                "additionalProperties": .bool(false),
+            ]),
+        ]))
+        let finiteSchemaPlan = ResponseFormatPlanner().plan(metadata: finiteSchemaMetadata, stream: true)
+        precondition(finiteSchemaPlan.schemaConstraints?.deterministicLiteral == "{\"answer\":\"\",\"confidence\":\"low\"}")
+        precondition(finiteSchemaPlan.schemaConstraints?.grammarPlan?.finiteTokenDFAAlternativeCount == 2)
+        precondition(finiteSchemaPlan.schemaConstraints?.grammarPlan?.canCompileFiniteTokenDFA == true)
         let responsesToolCallPlan = ToolCallPlanner().plan(
             metadata: normalizedResponses.metadata,
             descriptor: descriptor
